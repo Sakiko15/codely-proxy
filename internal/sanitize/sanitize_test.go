@@ -266,3 +266,25 @@ func TestStringsImported(t *testing.T) {
 		t.Fatal("unreachable")
 	}
 }
+
+func TestKeepThinkingHistoryPreservesBlocks(t *testing.T) {
+	// KEEP_THINKING_HISTORY 开启（RemoveThinkingHistory=false）时：
+	// assistant 历史 thinking 块保留（与最新 Messages 格式"thinking 原样回传"语义兼容）
+	old := RemoveThinkingHistory
+	RemoveThinkingHistory = false
+	t.Cleanup(func() { RemoveThinkingHistory = old })
+
+	in := `{"model":"codely-flash","messages":[{"role":"assistant","content":[{"type":"thinking","text":"t1"},{"type":"text","text":"hi"}]}]}`
+	payload, _, _ := TransformBody("/v1/messages", []byte(in), "sid")
+	// 会话注入仍会置 changed=true，故断言看内容而非 changed
+	j := mustObj(t, payload)
+	msgs := j["messages"].([]any)
+	content, ok := msgs[0].(map[string]any)["content"].([]any)
+	if !ok {
+		t.Fatalf("开关开启时 thinking 块应保留，content = %T", msgs[0].(map[string]any)["content"])
+	}
+	first, _ := content[0].(map[string]any)
+	if first["type"] != "thinking" {
+		t.Fatalf("首块应为 thinking，got %v", first["type"])
+	}
+}

@@ -6,6 +6,7 @@
 //	CODELY_PROXY_BIND   监听地址（默认 127.0.0.1）
 //	CODELY_DATA_DIR     数据目录（Docker 下 /app/data；默认二进制旁 ./data）
 //	CODELY_PROXY_API_KEY  客户端 API Key（优先于 proxy-key.txt）
+//	KEEP_THINKING_HISTORY  "1"/"true" 时保留 assistant 历史 thinking 块（默认剔除）
 //
 // 本包被 internal/oauth、internal/account、internal/balancer 等共享。
 package config
@@ -14,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // DefaultPort 默认监听端口（与 node 版一致）。
@@ -35,6 +37,9 @@ type Config struct {
 	// WebUIUser / WebUIPass WebUI 登录账密（WEBUI_USER/WEBUI_PASS；未设则随机生成，A2b）。
 	WebUIUser string
 	WebUIPass string
+	// KeepThinkingHistory 为 true 时保留 assistant 历史 thinking 块
+	//（KEEP_THINKING_HISTORY="1"/"true"；默认 false = 剔除，与 JS 一致，§19.3 [增强] 开关）。
+	KeepThinkingHistory bool
 }
 
 // Load 从环境变量加载配置（CLI flag 由 cmd 层覆盖，此处只做默认 + env）。
@@ -60,6 +65,13 @@ func Load() Config {
 	}
 	cfg.WebUIUser = os.Getenv("WEBUI_USER")
 	cfg.WebUIPass = os.Getenv("WEBUI_PASS")
+	// KEEP_THINKING_HISTORY：仅 "1"/"true"（大小写不敏感）视为开启，
+	// 其余值（含垃圾值/空串）回退默认剔除行为（§19.3）。
+	if v := os.Getenv("KEEP_THINKING_HISTORY"); v != "" {
+		if strings.EqualFold(v, "1") || strings.EqualFold(v, "true") {
+			cfg.KeepThinkingHistory = true
+		}
+	}
 	return cfg
 }
 

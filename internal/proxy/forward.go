@@ -134,6 +134,16 @@ func (p *Proxy) AttemptForward(ctx context.Context, method, upPath string, reqHe
 		acc = "application/json"
 	}
 	req.Header.Set("Accept", acc)
+	// [增强] 透传客户端 Anthropic 头（JS 原版重建上游头集合时不透传，见 GO_PORT §19.3 偏离清单）：
+	// anthropic-beta 承载官方 beta-only 特性开关（如 context management / fine-grained tool streaming），
+	// anthropic-version 为协议版本协商；上游 LiteLLM 对未知头安全忽略，不影响伪造 CLI 身份。
+	// Get/Values 按 CanonicalMIMEHeaderKey 规范化，客户端大小写写法无关。
+	for _, v := range reqHeaders.Values("Anthropic-Beta") {
+		req.Header.Add("Anthropic-Beta", v)
+	}
+	if v := reqHeaders.Get("Anthropic-Version"); v != "" {
+		req.Header.Set("Anthropic-Version", v)
+	}
 
 	resp, err := p.Client.Do(req)
 	if err != nil {

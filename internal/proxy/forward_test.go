@@ -148,3 +148,56 @@ func TestAttemptForwardSessionInjected(t *testing.T) {
 func containsStr(s, sub string) bool {
 	return strings.Contains(s, sub)
 }
+
+func TestAttemptForwardAnthropicHeadersForwarded(t *testing.T) {
+	// [增强] 客户端的 anthropic-beta / anthropic-version 应透传上游（多值全透、大小写规范化）
+	var betaCount int
+	var firstBeta, gotVersion string
+	p, _, cleanup := newUpstreamMock(t, func(w http.ResponseWriter, r *http.Request) {
+		betaCount = len(r.Header.Values("Anthropic-Beta"))
+		firstBeta = r.Header.Get("Anthropic-Beta")
+		gotVersion = r.Header.Get("Anthropic-Version")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	defer cleanup()
+
+	hdr := http.Header{}
+	hdr.Set("anthropic-beta", "context-management-2025-06-27") // 客户端小写写法也应规范化
+	hdr.Add("Anthropic-Beta", "fine-grained-tool-streaming-2025-05-14")
+	hdr.Set("Anthropic-Version", "2023-06-01")
+	r := p.AttemptForward(context.Background(), "POST", "/v1/messages",
+		hdr, []byte(`{"model":"codely-core","messages":[{"role":"user","content":"hi"}]}`),
+		"sid", "sk-test")
+	if r.Kind != KindOK {
+		t.Fatalf("kind = %v (err=%v)", r.Kind, r.Err)
+	}
+	if betaCount != 2 {
+		t.Fatalf("anthropic-beta 多值应全部透传，got %d 个", betaCount)
+	}
+	if firstBeta != "context-management-2025-06-27" {
+		t.Fatalf("Anthropic-Beta 首值 = %q", firstBeta)
+	}
+	if gotVersion != "2023-06-01" {
+		t.Fatalf("Anthropic-Version = %q", gotVersion)
+	}
+}
+
+func TestAttemptForwardNoAnthropicHeadersByDefault(t *testing.T) {
+	// 客户端未提供 Anthropic 头 → 上游请求不得凭空出现（防误合成）
+	p, _, cleanup := newUpstreamMock(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Anthropic-Beta") != "" || r.Header.Get("Anthropic-Version") != "" {
+			t.Errorf("上游不应收到 Anthropic 头: beta=%q version=%q",
+				r.Header.Get("Anthropic-Beta"), r.Header.Get("Anthropic-Version"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	defer cleanup()
+
+	r := p.AttemptForward(context.Background(), "POST", "/v1/chat/completions",
+		nil, []byte(`{"model":"x","messages":[]}`), "sid", "sk")
+	if r.Kind != KindOK {
+		t.Fatalf("kind = %v", r.Kind)
+	}
+}

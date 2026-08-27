@@ -17,7 +17,8 @@ import (
 )
 
 // RemoveThinkingHistory 控制是否剔除 assistant 历史中的 thinking 块。
-// 默认剔除（与 JS 一致）；可设置 KEEP_THINKING_HISTORY=1 保留（保留 signature_delta 等块）[增强，见 §19.3]。
+// 默认剔除（与 JS 一致）；运行期由 cmd 层在启动时按 KEEP_THINKING_HISTORY 环境变量设置
+//（config.Load 解析 → main 应用；设 "1"/"true" 保留历史块，§19.3）[增强]。
 var RemoveThinkingHistory = true
 
 // ---- 违禁文本清洗 ----

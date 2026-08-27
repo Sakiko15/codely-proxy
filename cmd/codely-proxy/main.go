@@ -27,6 +27,7 @@ import (
 	"codely-proxy/internal/oauth"
 	"codely-proxy/internal/proxy"
 	"codely-proxy/internal/quota"
+	"codely-proxy/internal/sanitize"
 	"codely-proxy/internal/security"
 	"codely-proxy/internal/webui"
 )
@@ -60,6 +61,12 @@ func main() {
 	balancer.SetDataDir(cfg.DataDir)
 	security.SetDataDir(cfg.DataDir)
 	logger.Printf("[init] 数据目录: %s", cfg.DataDir)
+
+	// ---- sanitize 开关（KEEP_THINKING_HISTORY，§19.3 [增强]）----
+	sanitize.RemoveThinkingHistory = !cfg.KeepThinkingHistory
+	if cfg.KeepThinkingHistory {
+		logger.Printf("[init] KEEP_THINKING_HISTORY=1：保留 assistant 历史 thinking 块")
+	}
 
 	// ---- 装配全部包 ----
 	reg := account.NewRegistry()

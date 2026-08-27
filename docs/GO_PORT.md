@@ -419,12 +419,14 @@ func WriteError(rw http.ResponseWriter, req *http.Request, status int, msg, code
     isAnthropic := strings.Contains(req.URL.Path, "/messages") || req.Header.Get("x-api-key") != ""
     if isAnthropic {
         // Anthropic 格式：{type:"error", error:{type, message}}
+        // type 按状态映射官方集合（anthropicErrType，§19.3 [增强]）
         writeJSON(rw, status, map[string]any{"type": "error",
-            "error": map[string]any{"type": errType(status), "message": msg}})
+            "error": map[string]any{"type": anthropicErrType(status), "message": msg}})
     } else {
-        // OpenAI 格式：{error:{message, type:"invalid_request_error", param:null, code}}
+        // OpenAI 格式：{error:{message, type, param:null, code}}
+        // type 按 openAIErrType(status) 映射；code 调用方值优先、为空时按状态派生 [增强]
         writeJSON(rw, status, map[string]any{"error": map[string]any{
-            "message": msg, "type": "invalid_request_error", "param": nil, "code": code}})
+            "message": msg, "type": openAIErrType(status), "param": nil, "code": code}})
     }
 }
 ```
@@ -647,6 +649,7 @@ dsh 场景下它写 `~/.dsh/settings.yaml` + 插件装配——**VPS 网关不�
 | `CODELY_DATA_DIR` | 同 | 数据目录（Docker /app/data） |
 | `CODELY_PROXY_API_KEY` | 同 | 客户端鉴权（优先于 proxy-key.txt） |
 | `WEBUI_USER` / `WEBUI_PASS` | 新增 | WebUI 登录账密（管理端鉴权） |
+| `KEEP_THINKING_HISTORY` | 增强 | `"1"`/`"true"` 保留 assistant 历史 thinking 块（默认剔除，§19.3） |
 | ~~`DSH_HOME`~~ | 删 | 不再写客户端 dsh 配置 |
 | ~~`DSH_CHECKOUT`~~ | 删 | 插件 TS 构建用，插件子工程不移植 |
 | ~~`CODELY_ALLOW_REMOTE`~~ | 删 | WebUI 登录替代 loopback 守卫 |
@@ -863,10 +866,10 @@ dsh 场景下它写 `~/.dsh/settings.yaml` + 插件装配——**VPS 网关不�
    - 非 `/chat/completions`、`/messages` → **零解析直通**（现状）；
    - chat/messages → 解析一次；**若 body 已含合法 `litellm_session_id` + `metadata.session_id` 且无 thinking 块、无违禁文本 → 原样转发原始字节** `[增强]`（省掉 parse+stringify 的 CPU/GC）；
    - 仅当确实改动才重序列化。
-2. **未知字段用 `json.RawMessage` 保留原字节** `[增强]`：JS 的 `JSON.parse→stringify` 会重排 key 且对 >2^53 大整数丢精度；Go 对不认识的字段一律 RawMessage 透传，只对需要注入/清洗的字段做手术。
-3. **响应侧全链路流式**：读上游 → 逐块写客户端，绝不整响应缓冲。
+2. **请求体未知字段语义透传** `[增强]`：body 解析为 `map[string]any` 后重序列化会按字母序重排 key、数字经 float64（>2^53 大整数失真）——因此**仅在确实改动时才重序列化**，无改动场景一律零拷贝返回原始字节（字节级保真）。仅 `system` 值用 `json.RawMessage` 保留原字节；其余未知字段语义保留、不保证字节序（实现现状；早期"全部 RawMessage 保留"的设想未落地）。
+3. **响应侧全链路流式**：读上游 → 逐块写客户端，绝不整响应缓冲；SSE 路径每次写入后立即 Flush（`flushWriter`），避免 Go http ~4KB 缓冲攒批小事件 `[增强]`。
 4. **连接池**：keep-alive（`MaxIdleConnsPerHost` ≥ 8）、TCP_NODELAY、SSE 头 `x-accel-buffering:no`。
-5. **错误体只读前 ~64KB** 即可分类（401/402/429），不通读全量。
+5. **错误体只读前 ~64KB** 即可分类（401/402/429），不通读全量（`errBodyCap`，已实现）。
 
 ### 19.3 格式全支持（最新 OpenAI Chat Completions + Anthropic Messages）
 
@@ -874,14 +877,18 @@ dsh 场景下它写 `~/.dsh/settings.yaml` + 插件装配——**VPS 网关不�
 
 | 端点 | 请求 | 响应（流式） | 响应（非流式） |
 |---|---|---|---|
-| `/v1/chat/completions` | 透传全部字段（`stream_options`/`reasoning_effort`/`max_completion_tokens`/`response_format`/`tools`/`modalities`/`audio`…）；仅注入 session + system 清洗 | 逐块透传；**上游结束未带 `data: [DONE]` 时合成补全** `[增强]`（幂等；防客户端挂起；记日志，不做 failover） | 全透传 |
-| `/v1/messages` | `?beta=1` 注入；透传 `thinking` 配置/`tools`/`system` 多形态/`metadata`；历史 `thinking`/`redacted_thinking` 块剔除（默认开；提供 `KEEP_THINKING_HISTORY=1` 开关保留签名块 `[增强]`） | `sseguard` 行缓冲状态机 + 缺终止事件合成（§4） | 全透传 |
+| `/v1/chat/completions` | 透传全部字段（`stream_options`/`reasoning_effort`/`max_completion_tokens`/`response_format`/`tools`/`modalities`/`audio`…）；仅注入 session + system 清洗 | 逐块透传；**上游结束未带 `data: [DONE]` 时合成补全** `[增强]`（幂等；防客户端挂起；不做 failover；`data:[DONE]` 无空格形态也识别 `[增强]`） | 全透传 |
+| `/v1/messages` | `?beta=1` 注入（仅路径恰为 `/v1/messages`，精确匹配 `[增强·偏离 JS 子串匹配]`）；透传 `anthropic-beta`（多值）/`anthropic-version` 头 `[增强·偏离 JS]`；透传 `thinking` 配置/`tools`/`system` 多形态/`metadata`；历史 `thinking`/`redacted_thinking` 块剔除（默认开；`KEEP_THINKING_HISTORY=1` 开关已接线，保留签名块 `[增强]`） | `sseguard` 行缓冲状态机 + 缺终止事件合成（§4；宽松匹配 spaced JSON/`data:` 无空格、多开放块升序闭合 `[增强]`；上游 `error` 事件后仅补 `message_stop`，不合成假 end_turn `[增强·有意偏离 JS]`） | 全透传 |
 
 补充说明：
 - **Anthropic 历史 thinking 剔除 ≠ thinking 配置透传**：剔除只作用于上一轮 **assistant 历史**里已固化的 `thinking`/`redacted_thinking`/`signature_delta` 块；`thinking: {type: enabled, budget_tokens}` 是**本轮请求参数**，原样透传，二者不冲突。
 - **OpenAI `[DONE]` 合成**：仅当上游返回 `text/event-stream` 且流结束但没发 `data: [DONE]` 时补发；若客户端已断连则跳过。这是纯幂等增强，不会发重复内容。
-- **双协议错误格式对齐最新**：Anthropic `{type:"error", error:{type, message}}`（`error.type ∈ authentication_error|api_error|invalid_request_error`）；OpenAI `{error:{message, type, param, code}}`。
+- **双协议错误格式对齐最新**：Anthropic `{type:"error", error:{type, message}}`，`error.type` 按状态映射官方集合（`anthropicErrType`：400 invalid_request_error / 401 authentication_error / 402 billing_error / 403 permission_error / 404 not_found_error / 413 request_too_large / 429 rate_limit_error / 503·529 overloaded_error / 其余 api_error）`[增强]`；OpenAI `{error:{message, type, param, code}}`，type 按状态映射（429 rate_limit_error / ≥500 server_error / 其余 invalid_request_error），code 调用方值优先、为空时按状态派生 `[增强]`。
 - **非流式两条路径**：OpenAI completion 与 Anthropic messages 非流式响应都是纯透传，不 parse、不合成。
+- **`anthropic-beta` / `anthropic-version` 头透传** `[增强·偏离 JS]`：JS 重建上游头集合时丢弃客户端 Anthropic 头，beta-only 新特性无法激活；Go 版原样透传（多值全透、大小写规范化）。
+- **`?beta=1` 精确路径** `[增强·偏离 JS]`：JS `includes("/messages")` 子串匹配会误伤 `/v1/messages/*` 子路径（如 count_tokens）；Go 版仅对路径恰为 `/v1/messages` 时注入。
+- **sseguard 宽松匹配与多块闭合** `[增强]`：事件 type 容忍 JSON 冒号后空白（上游 LiteLLM 为 Python，`json.dumps` 默认带空格，精确子串匹配会漏判而误合成）、`data:` 后空格可选；开放块按集合跟踪，断流时升序全部闭合（合成字节不变，`TestAnthropicSynthesizedBytesGolden` 字节级钉死）。上游 `error` 事件后仅补 `message_stop`，不再合成假 `end_turn`/`output_tokens:0`（有意偏离 JS：失败不应被美化成正常结束）。
+- **SSE 逐事件 Flush** `[增强]`：`flushWriter` 每次写入后立即 Flush，避免 Go http ~4KB 缓冲攒批小事件（§19.2-3）。
 
 ### 19.4 WebUI（美观 + 实用）
 

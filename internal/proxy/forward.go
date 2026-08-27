@@ -19,6 +19,11 @@ import (
 // 与 JS 一致（PROTOCOL.md §4）。
 var teamModelDeniedRE = regexp.MustCompile(`(?i)team_model_access_denied|not allowed to access model|model_access_denied`)
 
+// errBodyCap 错误体分类读取上限（GO_PORT §19.2-5：只读前 ~64KB 即可分类，不通读全量）。
+// 注意：截断后的错误体仍是 KindModelDenied/KindQuotaRateLimit 的透传材料——>64KB 的错误体
+// 实际不存在，可接受该取舍。
+const errBodyCap = 64 << 10
+
 // ForwardKind 是单次转发的分类结果。
 type ForwardKind int
 
@@ -95,7 +100,13 @@ func (p *Proxy) AttemptForward(ctx context.Context, method, upPath string, reqHe
 	payload, model, _ := sanitize.TransformBody(upPath, body, sessionID)
 
 	// 2. /messages 自动追加 ?beta=1（适配 LiteLLM 对 Anthropic 接口的 beta 要求）
-	if strings.Contains(upPath, "/messages") && !strings.Contains(upPath, "beta=") {
+	// [增强·有意偏离 JS] JS 用 includes("/messages") 子串匹配，会误伤 /v1/messages/* 子路径
+	//（如 count_tokens）；这里收紧为精确路径匹配，见 GO_PORT §19.3 偏离清单。
+	pathOnly := upPath
+	if i := strings.IndexByte(upPath, '?'); i >= 0 {
+		pathOnly = upPath[:i]
+	}
+	if pathOnly == "/v1/messages" && !strings.Contains(upPath, "beta=") {
 		if strings.Contains(upPath, "?") {
 			upPath += "&beta=1"
 		} else {
@@ -153,8 +164,8 @@ func (p *Proxy) AttemptForward(ctx context.Context, method, upPath string, reqHe
 	// 5. 响应分类
 	switch resp.StatusCode {
 	case http.StatusUnauthorized, http.StatusForbidden:
-		// 读完 body：区分模型权限拒 vs 密钥失效
-		errBody, _ := io.ReadAll(resp.Body)
+		// 读 body（上限 64KB，§19.2-5）：区分模型权限拒 vs 密钥失效
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyCap))
 		resp.Body.Close()
 		if teamModelDeniedRE.Match(errBody) {
 			// 模型被团队权限拒绝：透传（换 key 无济于事），带上游真实头
@@ -163,8 +174,8 @@ func (p *Proxy) AttemptForward(ctx context.Context, method, upPath string, reqHe
 		// 密钥类：刷新后重试
 		return ForwardResult{Kind: KindRetryKey, Status: resp.StatusCode, Body: errBody, Model: model}
 	case http.StatusPaymentRequired, http.StatusTooManyRequests:
-		// 402/429：额度耗尽/限流
-		errBody, _ := io.ReadAll(resp.Body)
+		// 402/429：额度耗尽/限流（读 body 上限同 64KB，§19.2-5）
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyCap))
 		resp.Body.Close()
 		return ForwardResult{Kind: KindQuotaRateLimit, Status: resp.StatusCode, Body: errBody, Header: resp.Header.Clone(), Model: model}
 	default:

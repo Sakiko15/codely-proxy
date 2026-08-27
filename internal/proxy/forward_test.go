@@ -201,3 +201,63 @@ func TestAttemptForwardNoAnthropicHeadersByDefault(t *testing.T) {
 		t.Fatalf("kind = %v", r.Kind)
 	}
 }
+
+func TestAttemptForwardLargeErrorBodyCapped(t *testing.T) {
+	// [增强] 错误体分类读取上限 64KB（GO_PORT §19.2-5）：大错误体不全量读入内存，分类不变
+	p, _, cleanup := newUpstreamMock(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(401)
+		big := strings.Repeat("x", 100<<10)
+		_, _ = w.Write([]byte(`{"error":{"message":"` + big + `"}}`))
+	})
+	defer cleanup()
+
+	r := p.AttemptForward(context.Background(), "POST", "/v1/chat/completions",
+		nil, []byte(`{"model":"x","messages":[]}`), "sid", "sk-old")
+	if r.Kind != KindRetryKey {
+		t.Fatalf("应分类 KindRetryKey，got %v", r.Kind)
+	}
+	if len(r.Body) > 64<<10 {
+		t.Fatalf("错误体应截断至 64KB，got %d", len(r.Body))
+	}
+}
+
+func TestAttemptForwardCountTokensNoBeta(t *testing.T) {
+	// [增强·有意偏离 JS] /v1/messages 子路径不再误追加 ?beta=1（精确路径匹配）
+	gotQuery := ""
+	p, _, cleanup := newUpstreamMock(t, func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"input_tokens":1}`))
+	})
+	defer cleanup()
+
+	r := p.AttemptForward(context.Background(), "POST", "/v1/messages/count_tokens",
+		nil, []byte(`{"model":"codely-core","messages":[]}`), "sid", "sk")
+	if r.Kind != KindOK {
+		t.Fatalf("kind = %v", r.Kind)
+	}
+	if strings.Contains(gotQuery, "beta=") {
+		t.Fatalf("count_tokens 不应追加 beta=1，query = %q", gotQuery)
+	}
+}
+
+func TestAttemptForwardMessagesWithQueryStillBeta(t *testing.T) {
+	// /v1/messages?x=1 → 在既有 query 上追加 &beta=1（防重守卫保持）
+	gotRaw := ""
+	p, _, cleanup := newUpstreamMock(t, func(w http.ResponseWriter, r *http.Request) {
+		gotRaw = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	})
+	defer cleanup()
+
+	r := p.AttemptForward(context.Background(), "POST", "/v1/messages?x=1",
+		nil, []byte(`{"messages":[]}`), "sid", "sk")
+	if r.Kind != KindOK {
+		t.Fatalf("kind = %v", r.Kind)
+	}
+	if gotRaw != "x=1&beta=1" {
+		t.Fatalf("应在既有 query 上追加 beta=1，got %q", gotRaw)
+	}
+}

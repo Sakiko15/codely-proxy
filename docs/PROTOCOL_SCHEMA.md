@@ -287,16 +287,21 @@ type MessageStop struct {
 ### 8.1 代理自身错误（formatErrorResponse，GO_PORT.md §5.3）
 
 ```go
-// OpenAI 协议（/v1/chat/completions 等）→ status 401 默认 code "invalid_api_key"
+// OpenAI 协议（/v1/chat/completions 等）→ type 按状态映射（openAIErrType：429 rate_limit_error /
+// ≥500 server_error / 其余 invalid_request_error）[增强]；code 调用方值优先、为空时按状态派生
+//（401 invalid_api_key、429 rate_limit_exceeded）
 type OpenAIStyleError struct {
     Error struct {
         Message string `json:"message"`
-        Type    string `json:"type"`  // 固定 "invalid_request_error"
+        Type    string `json:"type"`  // 按状态映射，见 openAIErrType
         Param   any    `json:"param"` // null
         Code    string `json:"code"`
     } `json:"error"`
 }
-// Anthropic 协议（/v1/messages 或带 x-api-key）→ 401 时 type "authentication_error"，否则 "api_error"
+// Anthropic 协议（/v1/messages 或带 x-api-key）→ type 按状态映射官方集合（anthropicErrType，
+// GO_PORT §19.3 [增强]）：400→invalid_request_error、401→authentication_error、402→billing_error、
+// 403→permission_error、404→not_found_error、413→request_too_large、429→rate_limit_error、
+// 503/529→overloaded_error、其余→api_error
 type AnthropicStyleError struct {
     Type  string `json:"type"` // 固定 "error"
     Error struct {

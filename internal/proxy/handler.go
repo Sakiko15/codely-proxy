@@ -118,14 +118,16 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 	excluded := map[string]bool{}
 	var lastErr error
 
-	// 单请求最多尝试池中可用账号（上限 3 次）
-	totalAccounts := len(h.Registry.ListSlugs())
-	if totalAccounts < 1 {
-		totalAccounts = 1
+	// 单请求最多尝试池中不同账号（上限 3 次，与 JS 一致以控延迟）。
+	// ⚠️ code-review #3 修正点：上限应是"不同的账号"——每次 Pick 带上 excluded，
+	// 已失败的账号不会再被选中，因此 N>3 时第 4 个健康账号理论上轮不到（3 次上限内），
+	// 与 JS 行为一致（JS 也 cap 3）。真正要修的是"末次 402 不冷却"的不自洽（见下）。
+	maxTries := 3
+	if totalAccounts := len(h.Registry.ListSlugs()); totalAccounts < maxTries {
+		maxTries = totalAccounts
 	}
-	maxTries := totalAccounts
-	if maxTries > 3 {
-		maxTries = 3
+	if maxTries < 1 {
+		maxTries = 1
 	}
 
 	for acctTry := 0; acctTry < maxTries; acctTry++ {
@@ -159,20 +161,23 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 				} else {
 					apiKey = newKey
 				}
+				// ⚠️ code-review #5：二次 401 后该账号已不可用，加入 excluded 防外层再选它
+				excluded[slug] = true
 				continue
 
 			case KindQuotaRateLimit:
 				status := r.Status
 				text := string(r.Body)
-				// 402/429 额度用尽/限流：若非客户端强制指定且还有备用账号 → 故障无感漂移
+				// 402/429 额度用尽/限流：无论是否还有备用账号，该账号都应冷却（#3 修正：末次 402 也冷却）
+				h.Balancer.MarkFailure(slug, status, text)
+				// 若非客户端强制指定且还有备用账号 → 故障无感漂移；否则透传
 				if preferredSlug == "" && acctTry < maxTries-1 {
-					h.logf("balancer", "[%s] 收到 HTTP %d（额度耗尽/限流），自动进入 5min 冷却并漂移...", slug, status)
-					h.Balancer.MarkFailure(slug, status, text)
+					h.logf("balancer", "[%s] 收到 HTTP %d（额度耗尽/限流），已冷却，漂移下一个...", slug, status)
 					excluded[slug] = true
 					failoverNext = true
 					break
 				}
-				// 否则透传（带 x-codely-routed-account）
+				// 否则透传（带 x-codely-routed-account；该账号已冷却）
 				if !isProbe {
 					h.logf("proxy", "[%s] %s %s -> %d (%dms%s)", slug, req.Method, req.URL.Path, status, time.Since(started).Milliseconds(), modelSuffix(r.Model))
 				}

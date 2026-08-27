@@ -72,9 +72,19 @@ func fetchAPIKeyOnce(creds *Creds) (string, error) {
 	}
 	if status == 401 || status == 403 {
 		// access_token 过期：刷新后重试一次
-		t, err := RefreshAccessToken()
-		if err != nil {
-			return "", err
+		// ⚠️ code-review #2：传了 creds（per-account）时按该账号刷新，不串全局激活账号；
+		// 未传 creds（走全局激活账号）时用全局刷新。
+		t := ""
+		if c != nil {
+			updated, err := RefreshAccessTokenFor(c)
+			if err == nil {
+				t = updated.AccessToken
+			}
+		} else {
+			t, _ = RefreshAccessToken()
+		}
+		if t == "" {
+			return "", fmt.Errorf("刷新 access_token 失败")
 		}
 		status, data, err = getJSON(u.String(), t)
 		if err != nil {

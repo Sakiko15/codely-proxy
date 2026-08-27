@@ -16,10 +16,12 @@ services:
       - CODELY_PROXY_BIND=0.0.0.0
       - CODELY_PROXY_PORT=8790
       - CODELY_DATA_DIR=/app/data
-      # WebUI 管理端账密（A2b：不设则随机生成并打印到容器日志）
-      # 强烈建议设置，否则每次重启密码变化且需查日志
+      # WebUI 管理端账密（A2b：不设则随机生成并打印到容器日志，安全默认）
+      # ⚠️ code-review #4：不要给 WEBUI_PASS 一个非空默认值——那会静默禁用 A2b 随机密码保护。
+      # 设置 WEBUI_PASS 的两种正确姿势：
+      #   1) 在 1Panel 编排的 .env 里配 WEBUI_PASS=<你的强密码>（推荐）；
+      #   2) 完全不设 → 代理生成随机密码打印到日志，登录 WebUI 后可从日志看到。
       - WEBUI_USER=admin
-      - WEBUI_PASS=${WEBUI_PASS:-change-me-strong-password}
     healthcheck:
       test: ["CMD", "wget", "-q", "--tries=1", "--spider", "http://127.0.0.1:8790/healthz"]
       interval: 30s

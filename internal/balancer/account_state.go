@@ -232,11 +232,22 @@ func (s *AccountState) GetAPIKey() (string, error) {
 
 // RefreshAPIKey 强制刷新该账号密钥（single-flight）。
 // 对标 balancer.js AccountState.refreshApiKey。
+//
+// ⚠️ code-review #2：401 时 refresh token 必须按该账号（accounts/<slug>.json）刷新，
+// 不能串到全局激活账号（oauth.RefreshAccessToken 读 codely-creds.json）。
 func (s *AccountState) RefreshAPIKey() (string, error) {
 	v, err, _ := s.keyFlight.Do("refresh", func() (any, error) {
 		creds := s.registry.LoadAccountCreds(s.Slug)
 		if creds == nil {
 			return "", fmt.Errorf("账号 [%s] 凭据不存在", s.Slug)
+		}
+		// 若 access_token 已过期，先按本账号刷新凭据，再换 key
+		if creds.IsExpiring() {
+			updated, err := oauth.RefreshAccessTokenFor(creds)
+			if err == nil {
+				creds = updated
+				s.persistCreds(creds) // 写回 accounts/<slug>.json
+			}
 		}
 		key, err := oauth.FetchAPIKey(creds)
 		if err != nil {
@@ -255,6 +266,12 @@ func (s *AccountState) RefreshAPIKey() (string, error) {
 		return "", err
 	}
 	return v.(string), nil
+}
+
+// persistCreds 把刷新后的账号凭据写回 accounts/<slug>.json（不激活、不触发 ReloadPool，避免死锁）。
+func (s *AccountState) persistCreds(creds *oauth.Creds) {
+	// SaveAccount 会 ReloadPool → 调 syncPool → 不碰已存在 account；此处用底层写，避免持锁回调
+	_, _, _ = s.registry.SaveAccount(s.Slug, creds, false, nil)
 }
 
 // FetchQuota 抓取该账号配额快照（Stale-While-Revalidate 异步平滑刷新）。
@@ -279,8 +296,10 @@ func (s *AccountState) FetchQuota(force bool) *QuotaSnapshot {
 		}
 		if status == 401 {
 			// §17.4 修复：刷新后重试一次（JS 版只刷新不重试）
-			if tok, err := oauth.RefreshAccessToken(); err == nil {
-				status, body, _ = oauth.Get(oauth.Base+"/api/user/billing/usage/summary", tok)
+			// ⚠️ code-review #2：必须按本账号刷新，不能串到全局激活账号。
+			if updated, err := oauth.RefreshAccessTokenFor(creds); err == nil {
+				s.persistCreds(updated)
+				status, body, _ = oauth.Get(oauth.Base+"/api/user/billing/usage/summary", updated.AccessToken)
 			}
 		}
 		if status < 200 || status >= 300 {

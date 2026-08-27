@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"codely-proxy/internal/gateway"
 	"codely-proxy/internal/oauth"
@@ -60,10 +61,24 @@ type Proxy struct {
 // ⚠️ UpstreamBase 只含主机（不含 /v1 路径）：AttemptForward 收到的 upPath 是客户端完整路径
 //（如 /v1/chat/completions，本就含 /v1），两者直接拼接。若这里带 /v1 会形成双重 /v1（真实 bug，已修）。
 // JS 版语义 = hostname(UPSTREAM_HOST) + path(req.url)，path 已含 /v1。
+//
+// ⚠️ 转发客户端不能用 oauth.HTTPClient（它有 30s 全局 Timeout，会掐断 >30s 的 SSE 长流，code-review #1）。
+// 用独立的无全局 Timeout 客户端——连接超时由 per-request context（客户端断开时 cancel）与
+// Transport 的 ResponseHeaderTimeout 兜底，SSE 体读取不设上限。
 func New() *Proxy {
+	transport := &http.Transport{
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 16,
+		IdleConnTimeout:     60 * time.Second,
+		// 首字节等待上限（对标 JS httpsAgent timeout: 120s），体读取不受此限
+		ResponseHeaderTimeout: 120 * time.Second,
+	}
 	return &Proxy{
 		UpstreamBase: "https://codely-litellm.tuanjie.cn",
-		Client:       oauth.HTTPClient,
+		Client: &http.Client{
+			Transport: transport,
+			// 不设全局 Timeout：SSE 长流依赖 context 取消（客户端断开中止计费）
+		},
 	}
 }
 

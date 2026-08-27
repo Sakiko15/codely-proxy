@@ -203,6 +203,44 @@ func RefreshAccessToken() (string, error) {
 	return v.(string), nil
 }
 
+// RefreshAccessTokenFor 刷新**指定账号**的 access_token（而非全局激活账号）。
+//
+// ⚠️ code-review #2：多账号路径（balancer 每账号 key 刷新、FetchQuota 401 重试）必须刷新
+// 该账号自己的 token，不能串到 codely-creds.json（当前激活账号）。返回更新后的 creds（含新
+// access_token/refresh_token/expiry），由调用方持久化到 accounts/<slug>.json。
+//
+// 不做跨账号 single-flight（每账号并发由调用方/单飞层保证），刷新失败返回 nil+err。
+func RefreshAccessTokenFor(c *Creds) (*Creds, error) {
+	if c == nil || c.RefreshToken == "" {
+		return nil, errors.New("账号没有 refresh_token，请重新登录（WebUI 添加账号）")
+	}
+	resp, err := postJSON(Base+"/auth/refresh", map[string]string{"refresh_token": c.RefreshToken})
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token,omitempty"`
+		ExpiresIn    *int   `json:"expires_in,omitempty"`
+	}
+	if err := json.Unmarshal(resp, &r); err != nil {
+		return nil, fmt.Errorf("刷新响应解析失败: %w", err)
+	}
+	if r.AccessToken == "" {
+		return nil, errors.New("刷新响应中没有 access_token")
+	}
+	updated := *c
+	updated.AccessToken = r.AccessToken
+	if r.RefreshToken != "" {
+		updated.RefreshToken = r.RefreshToken
+	}
+	if r.ExpiresIn != nil {
+		exp := time.Now().UnixMilli() + int64(*r.ExpiresIn)*1000
+		updated.ExpiryDate = &exp
+	}
+	return &updated, nil
+}
+
 // GetAccessToken 拿一个可用的 access_token（必要时自动刷新）。对标 codely-auth.js getAccessToken。
 func GetAccessToken() (*Creds, error) {
 	c := LoadCreds()

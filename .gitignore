@@ -1,0 +1,11 @@
+# 运行时数据（凭据/密钥/会话，绝不能提交）
+data/
+*.log
+
+# 构建产物
+/codely-proxy
+/codely-proxy.exe
+*.exe
+
+# 本地测试临时
+.tmp_*

@@ -1,0 +1,10 @@
+# 构建上下文排除（减少发送体积 + 防数据泄漏）
+data/
+*.log
+.git
+.gitignore
+docs/
+Dockerfile
+docker-compose.yml
+README.md
+*.exe

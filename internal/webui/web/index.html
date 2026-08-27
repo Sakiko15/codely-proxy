@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Codely Bridge 控制台</title>
+<style>
+  :root {
+    --bg: #0b0f19; --card: #151c2c; --border: #232f48; --fg: #f1f5f9;
+    --muted: #94a3b8; --primary: #3b82f6; --success: #10b981;
+    --warning: #f59e0b; --danger: #ef4444;
+  }
+  [data-theme="light"] {
+    --bg: #f8fafc; --card: #ffffff; --border: #e2e8f0; --fg: #0f172a;
+    --muted: #64748b; --primary: #2563eb; --success: #059669;
+    --warning: #d97706; --danger: #dc2626;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--fg); line-height: 1.5; min-height: 100vh;
+  }
+  .container { max-width: 1000px; margin: 0 auto; padding: 24px 16px; }
+  header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
+  .logo { font-weight: 700; font-size: 18px; display: flex; align-items: center; gap: 8px; }
+  .logo-badge { background: linear-gradient(135deg, #3b82f6, #8b5cf6); color: #fff; padding: 4px 10px; border-radius: 8px; font-size: 13px; }
+  .right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
+  .card h3 { font-size: 14px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; }
+  .stat-row { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px; }
+  .stat-label { color: var(--muted); }
+  .stat-val { font-weight: 600; }
+  button { background: var(--primary); color: #fff; border: none; padding: 7px 14px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+  button.secondary { background: #33415536; color: var(--fg); border: 1px solid var(--border); }
+  button.danger { background: rgba(239,68,68,.15); color: var(--danger); border: 1px solid rgba(239,68,68,.4); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  input, select { background: var(--bg); border: 1px solid var(--border); color: var(--fg); padding: 7px 10px; border-radius: 6px; font-size: 13px; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; margin-left: 6px; }
+  .tag-green { background: rgba(16,185,129,.15); color: var(--success); }
+  .tag-amber { background: rgba(245,158,11,.15); color: var(--warning); }
+  .tag-gray { background: #33415554; color: var(--muted); }
+  .tag-red { background: rgba(239,68,68,.15); color: var(--danger); }
+  .progress { height: 6px; background: var(--border); border-radius: 4px; overflow: hidden; margin: 4px 0 10px; }
+  .progress-fill { height: 100%; transition: width .3s; }
+  .account-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); gap: 8px; flex-wrap: wrap; }
+  .account-item:last-child { border-bottom: none; }
+  .account-name { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .account-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7); align-items: center; justify-content: center; z-index: 99; padding: 16px; }
+  .modal { background: var(--card); border: 1px solid var(--border); border-radius: 12px; width: 100%; max-width: 480px; padding: 22px; }
+  .modal h3 { margin-bottom: 14px; }
+  .login-code { font-size: 24px; font-weight: 700; color: var(--primary); text-align: center; padding: 10px; border: 1px dashed var(--primary); border-radius: 8px; margin: 12px 0; cursor: pointer; }
+  .toast { position: fixed; bottom: 20px; right: 20px; background: var(--card); border: 1px solid var(--border); color: var(--fg); padding: 10px 18px; border-radius: 8px; display: none; z-index: 999; box-shadow: 0 8px 24px rgba(0,0,0,.3); }
+  .muted { color: var(--muted); font-size: 12px; }
+  .code-box { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; font-family: monospace; font-size: 12px; overflow-x: auto; white-space: pre-wrap; }
+  .hidden { display: none; }
+  .tab-bar { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+  .tab { padding: 6px 14px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--muted); cursor: pointer; font-size: 13px; }
+  .tab.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+  @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) { --bg: #f8fafc; --card: #fff; --border: #e2e8f0; --fg: #0f172a; --muted: #64748b; } }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="logo"><span class="logo-badge">Codely</span> Bridge 控制台</div>
+    <div class="right">
+      <span class="muted" id="clock"></span>
+      <button class="secondary" id="theme-btn" onclick="toggleTheme()">🌓</button>
+      <span id="login-status"></span>
+    </div>
+  </header>
+
+  <!-- 登录遮罩 -->
+  <div class="modal-overlay" id="login-modal" style="display:none">
+    <div class="modal" style="max-width:360px">
+      <h3>管理台登录</h3>
+      <input id="login-user" placeholder="用户名"><br><br>
+      <input id="login-pass" type="password" placeholder="密码"><br><br>
+      <div id="login-hint" class="muted" style="margin-bottom:10px"></div>
+      <button onclick="doLogin()">登录</button>
+    </div>
+  </div>
+
+  <!-- 设备码登录弹窗 -->
+  <div class="modal-overlay" id="dev-login-modal" style="display:none">
+    <div class="modal">
+      <h3>添加账号（设备码授权）</h3>
+      <p class="muted" style="margin-bottom:10px">复制链接到无痕/另一浏览器，登录目标 Unity 账号后授权。</p>
+      <div id="dev-step1">
+        <input id="dev-alias" placeholder="账号备注名（可选）"><br><br>
+        <button onclick="startDevLogin()">发起授权</button>
+        <button class="secondary" onclick="closeDevLogin()">取消</button>
+      </div>
+      <div id="dev-step2" class="hidden">
+        <div class="login-code" id="dev-user-code" onclick="copyCode()" title="点击复制">------</div>
+        <a id="dev-url" href="#" target="_blank"><button style="width:100%">打开授权页面</button></a>
+        <div class="muted" id="dev-status" style="margin-top:10px">等待授权中...</div>
+        <button class="secondary" style="margin-top:8px;width:100%" onclick="cancelDevLogin()">取消本次登录</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="tab-bar" id="tabs">
+    <button class="tab active" data-tab="overview" onclick="switchTab('overview')">总览</button>
+    <button class="tab" data-tab="accounts" onclick="switchTab('accounts')">账号</button>
+    <button class="tab" data-tab="balancer" onclick="switchTab('balancer')">负载均衡</button>
+    <button class="tab" data-tab="keys" onclick="switchTab('keys')">API Keys</button>
+    <button class="tab" data-tab="quota" onclick="switchTab('quota')">配额</button>
+  </div>
+
+  <!-- 总览 -->
+  <section id="tab-overview">
+    <div class="grid">
+      <div class="card"><h3>⚖️ 负载均衡池</h3><div id="ov-balancer"><span class="muted">加载中...</span></div></div>
+      <div class="card"><h3>📊 当前账号</h3><div id="ov-account"><span class="muted">加载中...</span></div></div>
+    </div>
+  </section>
+
+  <!-- 账号 -->
+  <section id="tab-accounts" class="hidden">
+    <div class="card">
+      <h3>👥 多账号 <button class="secondary" style="padding:3px 10px" onclick="openDevLogin()">➕ 添加账号</button></h3>
+      <div id="accounts-list"><span class="muted">加载中...</span></div>
+    </div>
+  </section>
+
+  <!-- 负载均衡 -->
+  <section id="tab-balancer" class="hidden">
+    <div class="card">
+      <h3>调度配置</h3>
+      <div class="stat-row"><span class="stat-label">启用负载均衡</span>
+        <label><input type="checkbox" id="lb-enabled" onchange="setBalancer({enabled:this.checked})"> 开启</label></div>
+      <div class="stat-row"><span class="stat-label">调度模式</span>
+        <select id="lb-mode" onchange="setBalancer({mode:this.value})">
+          <option value="quota-first">智能额度优先</option>
+          <option value="round-robin">纯轮询</option>
+        </select></div>
+      <div id="balancer-status"></div>
+    </div>
+  </section>
+
+  <!-- API Keys -->
+  <section id="tab-keys" class="hidden">
+    <div class="card">
+      <h3>🔑 客户端 API Key 保护</h3>
+      <p class="muted" style="margin-bottom:10px">配置后外部调用 /v1/* 必须带 Authorization: Bearer &lt;Key&gt;。逗号分隔多 Key，留空保存恢复免密。</p>
+      <input id="apikey-input" style="width:100%" placeholder="sk-key1,sk-key2（留空清空）">
+      <br><br>
+      <button onclick="saveKeys()">💾 保存</button>
+      <div id="apikey-status" style="margin-top:10px"></div>
+    </div>
+  </section>
+
+  <!-- 配额 -->
+  <section id="tab-quota" class="hidden">
+    <div class="card">
+      <h3>积分额度 <button class="secondary" style="padding:3px 10px" onclick="loadQuota(true)">🔄 刷新</button></h3>
+      <div id="quota-content"><span class="muted">加载中...</span></div>
+    </div>
+  </section>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+let session = { authed: false, username: 'admin' };
+let currentTab = 'overview';
+let pollTimer = null;
+
+/* ---- 工具 ---- */
+function showToast(msg, isErr) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.borderColor = isErr ? 'var(--danger)' : 'var(--primary)';
+  t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 3000);
+}
+async function api(path, opts = {}) {
+  const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401 && path !== '/api/auth-status') { showLogin(); throw new Error('未登录'); }
+  if (!r.ok && !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+function copyText(t) { navigator.clipboard.writeText(t).then(() => showToast('已复制')); }
+function copyCode() { copyText(document.getElementById('dev-user-code').textContent); }
+function formatNum(n) { if (n == null) return '-'; return Number(n).toLocaleString('zh-CN'); }
+
+/* ---- 主题 ---- */
+function currentTheme() {
+  if (document.documentElement.getAttribute('data-theme')) return document.documentElement.getAttribute('data-theme');
+  return (window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+}
+function applyTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  try { localStorage.setItem('codely-theme', t); } catch (e) {}
+}
+function toggleTheme() { applyTheme(currentTheme() === 'dark' ? 'light' : 'dark'); }
+(function initTheme() {
+  let saved = null; try { saved = localStorage.getItem('codely-theme'); } catch (e) {}
+  applyTheme(saved || (window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'));
+})();
+
+/* ---- 时钟 ---- */
+setInterval(() => {
+  document.getElementById('clock').textContent = new Date().toLocaleTimeString('zh-CN');
+}, 1000);
+
+/* ---- 登录 ---- */
+async function checkAuth() {
+  try {
+    session = await api('/api/auth-status');
+  } catch (e) { session = { authed: false }; }
+  if (!session.authed) { showLogin(); return false; }
+  hideLogin();
+  if (session.generatedPassword) {
+    showToast('管理密码：' + session.password + '（仅显示一次，请妥善保存）');
+    session.generatedPassword = false;
+  }
+  document.getElementById('login-status').textContent = session.username;
+  refreshAll();
+  return true;
+}
+function showLogin() { document.getElementById('login-modal').style.display = 'flex'; }
+function hideLogin() { document.getElementById('login-modal').style.display = 'none'; }
+async function doLogin() {
+  const u = document.getElementById('login-user').value.trim();
+  const p = document.getElementById('login-pass').value;
+  try {
+    await api('/api/login', { method: 'POST', body: JSON.stringify({ username: u, password: p }) });
+    await checkAuth();
+  } catch (e) { showToast('登录失败: ' + e.message, true); }
+}
+
+/* ---- Tab 切换 ---- */
+function switchTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+  ['overview','accounts','balancer','keys','quota'].forEach(id =>
+    document.getElementById('tab-' + id).classList.toggle('hidden', id !== tab));
+  refreshAll();
+}
+
+/* ---- 数据加载 ---- */
+async function refreshAll() {
+  try {
+    await Promise.all([loadOverview(), loadAccounts(), loadBalancer(), loadKeys(), loadQuota()]);
+  } catch (e) { /* 已 toast */ }
+}
+async function loadOverview() {
+  const [b, q] = await Promise.all([
+    api('/api/balancer/status').catch(() => null),
+    api('/api/quota').catch(() => null),
+  ]);
+  const el = document.getElementById('ov-balancer');
+  if (b) {
+    let html = `<div class="stat-row"><span class="stat-label">模式</span><span class="stat-val">${b.mode === 'round-robin' ? '纯轮询' : '额度优先'}</span></div>`;
+    html += `<div class="stat-row"><span class="stat-label">活跃 / 冷却</span><span class="stat-val">${b.activeAccounts} / ${b.coolingAccounts}</span></div>`;
+    html += `<div class="stat-row"><span class="stat-label">每日剩余</span><span class="stat-val">${formatNum(b.aggregatedQuota.dailyRemaining)}</span></div>`;
+    html += `<div class="stat-row"><span class="stat-label">充值剩余</span><span class="stat-val">${formatNum(b.aggregatedQuota.billingRemaining)}</span></div>`;
+    el.innerHTML = html;
+  } else { el.innerHTML = '<span class="muted">未加载</span>'; }
+  const ael = document.getElementById('ov-account');
+  if (q && q.data && q.data.account) {
+    const a = q.data.account;
+    ael.innerHTML = `<div class="stat-row"><span class="stat-label">账号</span><span class="stat-val">${esc(a.name)}</span></div>` +
+      (a.teamName ? `<div class="stat-row"><span class="stat-label">组织</span><span class="stat-val">${esc(a.teamName)}</span></div>` : '') +
+      `<div class="stat-row"><span class="stat-label">更新</span><span class="stat-val muted">${esc(q.data.fetchedAt || '')}</span></div>`;
+  } else { ael.innerHTML = '<span class="muted">未登录账号</span>'; }
+}
+async function loadAccounts() {
+  const r = await api('/api/accounts');
+  const el = document.getElementById('accounts-list');
+  if (!r.list || !r.list.length) { el.innerHTML = '<span class="muted">暂无账号，点击「添加账号」。</span>'; return; }
+  el.innerHTML = r.list.map(a => {
+    const tags = [];
+    if (a.isCurrent) tags.push('<span class="tag tag-green">主激活</span>');
+    return `<div class="account-item">
+      <div><div class="account-name">${esc(a.name)}${tags.join('')}</div>
+      <div class="account-sub">${a.teamName ? esc(a.teamName) : ''}${a.userId ? ' · UID ' + esc(a.userId) : ''}</div></div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        ${!a.isCurrent ? `<button class="secondary" style="padding:3px 10px" onclick="switchAccount('${esc(a.name)}')">设为主</button>` : ''}
+        ${!a.isCurrent ? `<button class="danger" style="padding:3px 10px" onclick="deleteAccount('${esc(a.name)}')">删除</button>` : ''}
+      </div></div>`;
+  }).join('');
+}
+async function loadBalancer() {
+  const b = await api('/api/balancer/status');
+  document.getElementById('lb-enabled').checked = !!b.enabled;
+  document.getElementById('lb-mode').value = b.mode || 'quota-first';
+  const el = document.getElementById('balancer-status');
+  el.innerHTML = (b.accounts && b.accounts.length) ? b.accounts.map(a =>
+    `<div class="account-item"><div><div class="account-name">${esc(a.slug)} ${statusTag(a)}</div>
+     <div class="account-sub">每日 ${formatNum(a.dailyRemaining)} · 充值 ${formatNum(a.billingRemaining)} · 请求 ${a.metrics.total}（成功 ${a.metrics.success}）</div></div></div>`
+  ).join('') : '<span class="muted">无账号</span>';
+}
+function statusTag(a) {
+  if (a.status === 'disabled') return '<span class="tag tag-gray">未入池</span>';
+  if (a.status === 'cooling') return `<span class="tag tag-red">冷却 ${Math.round((a.cooldownRemainingMs||0)/1000)}s</span>`;
+  return '<span class="tag tag-green">池化活跃</span>';
+}
+async function loadKeys() {
+  try {
+    const s = await api('/api/security/status');
+    document.getElementById('apikey-status').innerHTML =
+      `<div class="stat-row"><span class="stat-label">状态</span><span class="stat-val">${s.authRequired ? '🟢 已保护（' + s.configuredKeysCount + ' 个 Key）' : '⚪ 免密模式'}</span></div>` +
+      (s.maskedKeys && s.maskedKeys.length ? `<div class="stat-row"><span class="stat-label">已配置</span><span class="stat-val muted">${esc(s.maskedKeys.join('，'))}</span></div>` : '');
+    document.getElementById('apikey-input').placeholder = s.source === 'env' ? '当前由环境变量 CODELY_PROXY_API_KEY 管理' : 'sk-key1,sk-key2（留空清空）';
+  } catch (e) {}
+}
+async function loadQuota(force) {
+  try {
+    const q = await api('/api/quota' + (force ? '?force=1' : ''));
+    const d = q.data; if (!d) return;
+    let html = '';
+    if (d.dailyAllowance && d.dailyAllowance.remaining_points != null) {
+      const total = Number(d.dailyAllowance.quota_points) || 1;
+      const used = Number(d.dailyAllowance.used_points) || 0;
+      const rem = Number(d.dailyAllowance.remaining_points);
+      const pct = Math.min(100, Math.round(used / total * 100));
+      html += `<div class="stat-row"><span class="stat-label">今日赠送</span><span class="stat-val">${formatNum(rem)} / ${formatNum(total)}</span></div>`;
+      html += `<div class="progress"><div class="progress-fill" style="width:${pct}%;background:${pct > 90 ? 'var(--danger)' : 'var(--primary)'}"></div></div>`;
+    }
+    if (d.billing && d.billing.effective_available_points != null) {
+      html += `<div class="stat-row"><span class="stat-label">充值余额</span><span class="stat-val" style="color:var(--success)">${formatNum(d.billing.effective_available_points)}</span></div>`;
+    }
+    if (d.codingPlan && d.codingPlan.windows && d.codingPlan.windows.length) {
+      html += `<div style="margin-top:6px;font-size:12px;color:var(--muted)">套餐窗口</div>`;
+      d.codingPlan.windows.forEach(w => {
+        html += `<div class="stat-row"><span class="stat-label">${esc(w.window_type)}</span><span class="stat-val">${formatNum(w.remaining_points)} / ${formatNum(w.quota_points)}</span></div>`;
+      });
+    }
+    if (d.rateLimit) html += `<div class="stat-row" style="margin-top:8px"><span class="stat-label">速率限制</span><span class="stat-val muted">${d.rateLimit.rpm_limit ? d.rateLimit.rpm_limit + ' RPM' : '-'}</span></div>`;
+    document.getElementById('quota-content').innerHTML = html || '<span class="muted">暂无配额数据</span>';
+  } catch (e) { document.getElementById('quota-content').innerHTML = '<span class="muted">加载失败</span>'; }
+}
+
+/* ---- 操作 ---- */
+async function switchAccount(name) {
+  try { await api('/api/account/switch', { method: 'POST', body: JSON.stringify({ name }) }); showToast('已切换到 ' + name); refreshAll(); }
+  catch (e) { showToast(e.message, true); }
+}
+async function deleteAccount(name) {
+  if (!confirm('确定删除账号 ' + name + ' ？')) return;
+  try { await api('/api/account/delete', { method: 'POST', body: JSON.stringify({ name }) }); showToast('已删除'); refreshAll(); }
+  catch (e) { showToast(e.message, true); }
+}
+async function setBalancer(patch) {
+  try { await api('/api/balancer/config', { method: 'POST', body: JSON.stringify(patch) }); showToast('已更新'); refreshAll(); }
+  catch (e) { showToast(e.message, true); }
+}
+async function saveKeys() {
+  const key = document.getElementById('apikey-input').value.trim();
+  try { const s = await api('/api/security/config', { method: 'POST', body: JSON.stringify({ apiKey: key }) }); showToast(s.authRequired ? '已启用鉴权保护' : '已恢复免密'); loadKeys(); }
+  catch (e) { showToast(e.message, true); }
+}
+function openDevLogin() { document.getElementById('dev-login-modal').style.display = 'flex'; document.getElementById('dev-step1').style.display = 'block'; document.getElementById('dev-step2').classList.add('hidden'); document.getElementById('dev-alias').value = ''; }
+function closeDevLogin() { if (pollTimer) clearInterval(pollTimer); document.getElementById('dev-login-modal').style.display = 'none'; }
+async function startDevLogin() {
+  const name = document.getElementById('dev-alias').value.trim();
+  try {
+    const r = await api('/api/account/login/start', { method: 'POST', body: JSON.stringify({ name: name || undefined }) });
+    document.getElementById('dev-step1').style.display = 'none';
+    document.getElementById('dev-step2').classList.remove('hidden');
+    document.getElementById('dev-user-code').textContent = r.login.user_code;
+    document.getElementById('dev-url').href = r.login.verification_uri_complete;
+    document.getElementById('dev-status').textContent = '等待授权中...';
+    pollTimer = setInterval(pollDevLogin, 2500);
+  } catch (e) { showToast(e.message, true); }
+}
+async function pollDevLogin() {
+  try {
+    const r = await api('/api/account/login/status');
+    if (r.status === 'authorized') {
+      clearInterval(pollTimer);
+      showToast('🎉 授权成功：' + (r.account ? r.account.name : ''));
+      closeDevLogin(); refreshAll();
+    } else if (r.status === 'denied' || r.status === 'expired') {
+      clearInterval(pollTimer);
+      document.getElementById('dev-status').textContent = '❌ ' + (r.message || r.status);
+    } else {
+      document.getElementById('dev-status').textContent = '⏳ 等待授权中...';
+    }
+  } catch (e) { /* 轮询失败重试 */ }
+}
+async function cancelDevLogin() {
+  if (pollTimer) clearInterval(pollTimer);
+  try { await api('/api/account/login/cancel', { method: 'POST' }); } catch (e) {}
+  closeDevLogin();
+}
+
+/* ---- 15s 自动刷新（聚焦页） ---- */
+setInterval(() => { if (!document.hidden) refreshAll(); }, 15000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshAll(); });
+
+checkAuth();
+</script>
+</body>
+</html>

@@ -1,0 +1,289 @@
+// proxy 的请求处理器（对标 codely-proxy.js handle）。
+package proxy
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	"codely-proxy/internal/account"
+	"codely-proxy/internal/balancer"
+	"codely-proxy/internal/security"
+	"codely-proxy/internal/sseguard"
+)
+
+// Handler 是转发编排器（鉴权 → 选号 → 重试循环 → SSE 透传 → 错误分类）。
+type Handler struct {
+	Proxy    *Proxy
+	Balancer *balancer.Balancer
+	Registry *account.Registry
+	Security *security.Security
+	// Logger 输出标签日志（nil 用标准 log）。
+	Logger *log.Logger
+}
+
+// ServeHTTP 实现 http.Handler（/v1/* 入口）：读 body → Handle。
+// 客户端断开时 context 取消 → 上游请求中止（§19.1 中止计费）。
+func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	// 只处理 /v1/*；管理端点由 webui 路由。
+	if !strings.HasPrefix(req.URL.Path, "/v1/") {
+		http.NotFound(rw, req)
+		return
+	}
+	ct := req.Header.Get("Content-Type")
+	// 读 body（限制大小，防 OOM；模型推理一般 < 16MB）
+	req.Body = http.MaxBytesReader(rw, req.Body, 32<<20)
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		WriteError(rw, req, http.StatusRequestEntityTooLarge, "request body too large", "request_too_large")
+		return
+	}
+	_ = ct
+	// GET /v1/models 等可能无 body
+	h.Handle(req.Context(), rw, req, body)
+}
+
+// NewHandler 组装 handler。
+func NewHandler(p *Proxy, b *balancer.Balancer, reg *account.Registry, sec *security.Security) *Handler {
+	return &Handler{Proxy: p, Balancer: b, Registry: reg, Security: sec, Logger: log.Default()}
+}
+
+func (h *Handler) logf(tag, format string, args ...any) {
+	if h.Logger == nil {
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	h.Logger.Printf("[%s] %s", tag, msg)
+}
+
+// rwTracker 包装 ResponseWriter，跟踪 headers 是否已写出（§17.1 headersWritten 状态机）。
+type rwTracker struct {
+	http.ResponseWriter
+	written bool
+}
+
+func (t *rwTracker) WriteHeader(code int) {
+	if !t.written {
+		t.written = true
+	}
+	t.ResponseWriter.WriteHeader(code)
+}
+
+func (t *rwTracker) Write(p []byte) (int, error) {
+	if !t.written {
+		t.written = true
+	}
+	return t.ResponseWriter.Write(p)
+}
+
+func (t *rwTracker) Flush() {
+	if f, ok := t.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Written 是否已写出响应头。
+func (t *rwTracker) Written() bool { return t.written }
+
+// Handle 处理一个 /v1/* 推理请求。
+//
+// 对标 codely-proxy.js handle，并按 §17.1 修复：转发模型分两段——
+//   - headers 未发出（读上游响应头之前）：可安全 retry / failover / 透传错误；
+//   - headers 已发出（开始转发 body）：只能收尾，绝不 failover、不 markAccountFailure。
+//
+// ctx 为客户端请求上下文（断开时 cancel，中止上游计费）。
+func (h *Handler) Handle(ctx context.Context, rw http.ResponseWriter, req *http.Request, body []byte) {
+	tw := &rwTracker{ResponseWriter: rw}
+	h.handle(ctx, tw, req, body)
+}
+
+func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, body []byte) {
+	started := time.Now()
+	isProbe := req.Header.Get("x-codely-probe") == "1"
+
+	// 1. 客户端 API Key 鉴权（仅保护 /v1/* 推理接口，未设置 Key 免密放行）
+	if !h.Security.Validate(req) {
+		if !isProbe {
+			h.logf("proxy", "%s %s -> 401 (API Key 鉴权未通过)", req.Method, req.URL.Path)
+		}
+		WriteError(rw, req, http.StatusUnauthorized, "Incorrect API key provided.", "invalid_api_key")
+		return
+	}
+
+	preferredSlug := req.Header.Get("x-codely-account")
+	excluded := map[string]bool{}
+	var lastErr error
+
+	// 单请求最多尝试池中可用账号（上限 3 次）
+	totalAccounts := len(h.Registry.ListSlugs())
+	if totalAccounts < 1 {
+		totalAccounts = 1
+	}
+	maxTries := totalAccounts
+	if maxTries > 3 {
+		maxTries = 3
+	}
+
+	for acctTry := 0; acctTry < maxTries; acctTry++ {
+		state, err := h.Balancer.Pick(preferredSlug, excluded)
+		if err != nil {
+			WriteError(rw, req, http.StatusBadGateway, "codely-proxy: 调度账号失败 ("+err.Error()+")", "bad_gateway")
+			return
+		}
+		slug := state.Slug
+
+		// 获取账号 sk- 密钥（失败 → 标记 + 漂移下一个）
+		apiKey, err := state.GetAPIKey()
+		if err != nil {
+			h.logf("balancer", "账号 [%s] 获取密钥失败 (%s)，漂移重试下一个可用账号...", slug, err.Error())
+			h.Balancer.MarkFailure(slug, 500, err.Error())
+			excluded[slug] = true
+			continue
+		}
+
+		failoverNext := false
+		for attempt := 0; attempt < 2; attempt++ {
+			r := h.Proxy.AttemptForward(ctx, req.Method, req.URL.RequestURI(), req.Header, body, state.SessionID(), apiKey)
+
+			switch r.Kind {
+			case KindRetryKey:
+				// 密钥类 401/403：刷新后重试一次
+				h.logf("key", "[%s] 上游返回 %d，刷新密钥后重试", slug, r.Status)
+				lastErr = fmt.Errorf("%d: %s", r.Status, string(r.Body))
+				if newKey, err := state.RefreshAPIKey(); err != nil {
+					h.logf("key", "[%s] 刷新失败: %s", slug, err.Error())
+				} else {
+					apiKey = newKey
+				}
+				continue
+
+			case KindQuotaRateLimit:
+				status := r.Status
+				text := string(r.Body)
+				// 402/429 额度用尽/限流：若非客户端强制指定且还有备用账号 → 故障无感漂移
+				if preferredSlug == "" && acctTry < maxTries-1 {
+					h.logf("balancer", "[%s] 收到 HTTP %d（额度耗尽/限流），自动进入 5min 冷却并漂移...", slug, status)
+					h.Balancer.MarkFailure(slug, status, text)
+					excluded[slug] = true
+					failoverNext = true
+					break
+				}
+				// 否则透传（带 x-codely-routed-account）
+				if !isProbe {
+					h.logf("proxy", "[%s] %s %s -> %d (%dms%s)", slug, req.Method, req.URL.Path, status, time.Since(started).Milliseconds(), modelSuffix(r.Model))
+				}
+				writePassthrough(rw, r, slug)
+				return
+
+			case KindModelDenied:
+				// 模型被团队权限拒绝：原样透传（换 key 无济于事）
+				if !isProbe {
+					h.logf("proxy", "[%s] %s %s -> %d (%dms, 模型被拒透传%s)", slug, req.Method, req.URL.Path, r.Status, time.Since(started).Milliseconds(), modelSuffix(r.Model))
+				}
+				writePassthrough(rw, r, slug)
+				return
+
+			case KindOK:
+				// 正常 200：标记成功 + 透传
+				h.Balancer.MarkSuccess(slug)
+				if !isProbe {
+					h.logf("proxy", "[%s] %s %s -> %d (%dms%s)", slug, req.Method, req.URL.Path, r.Status, time.Since(started).Milliseconds(), modelSuffix(r.Model))
+				}
+				h.pipeResponse(rw, req, r, slug)
+				return
+
+			case KindError:
+				// 网络/上游错误：只在 headers 未发出时可 failover
+				lastErr = r.Err
+				if !isProbe {
+					h.logf("proxy", "[%s] 上游连接异常: %s", slug, r.Err.Error())
+				}
+				h.Balancer.MarkFailure(slug, http.StatusBadGateway, r.Err.Error())
+				excluded[slug] = true
+				failoverNext = true
+				break
+			}
+		}
+		if failoverNext {
+			continue
+		}
+	}
+
+	// 全部账号失败 → 502
+	if !rw.Written() {
+		reason := ""
+		if lastErr != nil {
+			reason = lastErr.Error()
+		}
+		WriteError(rw, req, http.StatusBadGateway, "codely-proxy: 上游请求失败 ("+reason+")", "bad_gateway")
+	}
+}
+
+// pipeResponse 把上游 200 响应透传给客户端（SSE 加头 + 可选流式守护；非 SSE 完整透传）。
+func (h *Handler) pipeResponse(rw http.ResponseWriter, req *http.Request, r ForwardResult, slug string) {
+	resp := r.Resp
+	// 复制响应头
+	copyHeaders(rw, resp.Header)
+	rw.Header().Set("x-codely-routed-account", slug)
+	rw.Header().Set("Connection", "keep-alive")
+
+	contentType := resp.Header.Get("Content-Type")
+	isSSE := strings.Contains(contentType, "text/event-stream")
+
+	if isSSE {
+		// 流式直通优化：防反代缓冲 + TCP_NODELAY（对标 proxy.js:389-394）
+		rw.Header().Set("x-accel-buffering", "no")
+		rw.Header().Set("cache-control", "no-cache, no-transform")
+		rw.WriteHeader(resp.StatusCode)
+		if f, ok := rw.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		if strings.Contains(req.URL.Path, "/messages") {
+			// Anthropic：行缓冲状态机守护闭环（§4，防 Claude Code 挂死）
+			_ = sseguard.PipeAnthropic(rw, resp.Body)
+		} else {
+			// OpenAI：逐块透传 + [DONE] 合成（§19.3 增强）
+			_ = sseguard.PipeOpenAI(rw, resp.Body)
+		}
+		resp.Body.Close()
+		return
+	}
+
+	// 非 SSE：完整透传
+	rw.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(rw, resp.Body)
+	resp.Body.Close()
+}
+
+// writePassthrough 透传上游错误体（复制上游真实头，删 content-length，加 routed-account）。
+// 对标 JS 版 `{...r.passthrough.headers}` + delete content-length + x-codely-routed-account。
+func writePassthrough(rw http.ResponseWriter, r ForwardResult, slug string) {
+	copyHeaders(rw, r.Header)
+	rw.Header().Set("x-codely-routed-account", slug)
+	rw.WriteHeader(r.Status)
+	_, _ = rw.Write(r.Body)
+}
+
+// copyHeaders 复制响应头（删除 content-length，因会话注入可能改写请求体，上游长度无意义）。
+func copyHeaders(rw http.ResponseWriter, src http.Header) {
+	for k, vs := range src {
+		if strings.EqualFold(k, "Content-Length") {
+			continue
+		}
+		for _, v := range vs {
+			rw.Header().Add(k, v)
+		}
+	}
+}
+
+func modelSuffix(model string) string {
+	if model == "" {
+		return ""
+	}
+	return ", model=" + model
+}

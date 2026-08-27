@@ -154,3 +154,92 @@ func TestOpenAIDoneResidualLineBuffer(t *testing.T) {
 		t.Fatalf("残留行缓冲中的 [DONE] 应识别，不重复补发: %s", out.String())
 	}
 }
+
+// ---- [增强] 宽松匹配 / 多块闭合 / golden 字节 ----
+
+func TestAnthropicSynthesizedBytesGolden(t *testing.T) {
+	// 字节级钉死合成后缀（勿改契约：与 JS 版逐字节一致）——匹配逻辑再怎么改，合成字节不能动
+	in := "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":3}\n\n"
+	out := runAnthropic(t, in)
+	want := "\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	if !strings.HasSuffix(out, want) {
+		t.Fatalf("合成后缀必须与 golden 字节完全一致:\n got: %q\nwant: %q", out, want)
+	}
+}
+
+func TestAnthropicSpacedJSONRecognized(t *testing.T) {
+	// [增强] 上游（Python/LiteLLM json.dumps）可能输出冒号带空格的 JSON，事件必须被识别：
+	// 完整流不再误合成终止事件（修复精确子串 `"type":"x"` 漏判导致的假合成）
+	in := "event: content_block_start\ndata: {\"type\": \"content_block_start\", \"index\": 0, \"content_block\": {\"type\": \"text\"}}\n\n" +
+		"event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": 0}\n\n" +
+		"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n"
+	out := runAnthropic(t, in)
+	// 上游事件是带空格形态，合成事件是紧凑形态——紧凑形态计数为 0 = 无任何合成
+	if strings.Count(out, `"type":"content_block_stop"`) != 0 {
+		t.Fatalf("spaced JSON 应被识别，完整流不应合成 block_stop: %s", out)
+	}
+	if strings.Count(out, `"type":"message_stop"`) != 0 {
+		t.Fatalf("spaced JSON 应被识别，完整流不应合成 message_stop: %s", out)
+	}
+	if strings.Count(out, `"type":"message_delta"`) != 0 {
+		t.Fatalf("完整流不应合成 message_delta: %s", out)
+	}
+}
+
+func TestAnthropicDataNoSpaceRecognized(t *testing.T) {
+	// SSE 规范允许 `data:` 后无空格——也应被识别（完整流不重复合成）
+	in := "event: message_stop\ndata:{\"type\":\"message_stop\"}\n\n"
+	out := runAnthropic(t, in)
+	if strings.Count(out, `"type":"message_stop"`) != 1 {
+		t.Fatalf("data: 无空格应被识别，不应重复合成: %s", out)
+	}
+}
+
+func TestAnthropicMultipleOpenBlocksClosedAscending(t *testing.T) {
+	// 多个块同时开放（如 server_tool_use + text）中途断流 → 全部闭合，升序
+	in := "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2}\n\n"
+	out := runAnthropic(t, in)
+	i0 := strings.Index(out, `"type":"content_block_stop","index":0`)
+	i2 := strings.Index(out, `"type":"content_block_stop","index":2`)
+	if i0 < 0 || i2 < 0 {
+		t.Fatalf("两个开放块都应被闭合: %s", out)
+	}
+	if i0 > i2 {
+		t.Fatalf("闭合应升序（index 0 在 2 前）: %s", out)
+	}
+}
+
+func TestAnthropicUpstreamErrorEventNoFakeEndTurn(t *testing.T) {
+	// [增强，有意偏离 JS] 上游发 error 事件后断流：只补 message_stop 收尾，
+	// 不再合成 stop_reason=end_turn/output_tokens=0 的假 message_delta（失败不被美化）
+	in := "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n" +
+		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"
+	out := runAnthropic(t, in)
+	if strings.Contains(out, `"type":"message_delta"`) || strings.Contains(out, "end_turn") {
+		t.Fatalf("error 事件后不应合成假 message_delta/end_turn: %s", out)
+	}
+	if strings.Count(out, `"type":"message_stop"`) != 1 {
+		t.Fatalf("仍应恰好补一个 message_stop: %s", out)
+	}
+	if !strings.Contains(out, `"type":"content_block_stop","index":0`) {
+		t.Fatalf("开放块仍应被闭合: %s", out)
+	}
+}
+
+func TestOpenAIDoneNoSpace(t *testing.T) {
+	// [增强] `data:[DONE]`（无空格）应被识别，不重复补发
+	var out bytes.Buffer
+	g := &OpenAIGuard{}
+	if err := g.Write([]byte("data: {\"a\":1}\n\ndata:[DONE]\n\n"), &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Finish(&out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(out.String(), "[DONE]") != 1 {
+		t.Fatalf("data:[DONE] 应被识别，不重复补发: %s", out.String())
+	}
+}

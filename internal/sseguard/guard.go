@@ -3,18 +3,25 @@
 // 背景（GO_PORT.md §17.1 / §19.3）：上游在流中途断开（RST / 提前 EOF）时，客户端（Claude Code /
 // OpenAI SDK）可能收不到终止事件而挂死。本包提供两个幂等增强：
 //
-//  1. Anthropic /messages 行缓冲状态机：跟踪 content_block_start/stop、message_stop，
-//     上游提前断开时合成缺失的 content_block_stop + message_delta + message_stop。
+//  1. Anthropic /messages 行缓冲状态机：跟踪 content_block_start/stop、message_stop、error，
+//     上游提前断开时合成缺失的 content_block_stop（支持多开放块，升序闭合）+ message_delta +
+//     message_stop；已观测到上游 error 事件时仅补 message_stop（不再合成假 end_turn）。
 //  2. OpenAI /chat/completions [DONE] 合成：上游返回 text/event-stream 但结束未带
 //     `data: [DONE]` 时补发（幂等，不重复）。
 //
-// 移植自 codely-proxy.js:400-449（行缓冲状态机），OpenAI [DONE] 合成为新增增强（§19.3）。
+// 事件匹配对 `data:` 后空格与 JSON 冒号后空白容忍（上游 LiteLLM 为 Python，json.dumps
+// 默认输出 `"type": "x"` 带空格，精确子串会漏判）[增强，见 §19.3 偏离清单]。
+//
+// 移植自 codely-proxy.js:400-449（行缓冲状态机），宽松匹配 / 多块闭合 / error 事件分支为
+// Go 侧新增增强（§19.3）。
 package sseguard
 
 import (
 	"bytes"
 	"fmt"
 	"io"
+	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -27,37 +34,77 @@ const (
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	// openAIDone 上游缺 [DONE] 时补发（OpenAI 端点幂等增强）
 	openAIDone = "data: [DONE]\n\n"
+	// messageStopOnly 上游已发 error 事件时的收尾（仅闭合流，不带假 end_turn）。
+	// ⚠️ 非 golden 三件套成员：此为 Go 侧增强（有意偏离 JS：JS 无条件合成 end_turn delta），
+	// 见 §19.3 偏离清单——失败不应被美化成正常结束。
+	messageStopOnly = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 )
+
+// sseTypeRE 从 data 载荷提取事件 type（容忍冒号后空白）。
+// 无误触发问题：合法 JSON 里字符串值内的引号必被转义（\"type\":），
+// 故 `"type"\s*:\s*"` 不会命中字符串内容，无需更多机制 [增强]。
+var sseTypeRE = regexp.MustCompile(`"type"\s*:\s*"([a-z_]+)"`)
+
+// eventType 提取 data 行的事件 type；无匹配返回空串。
+func eventType(data string) string {
+	if m := sseTypeRE.FindStringSubmatch(data); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// parseBlockIndex 从 content_block_start 事件提取 index。
+// Anthropic 恒带 index；解析失败回退 0（保证防挂死的闭合语义不失效）。
+func parseBlockIndex(data string) int {
+	idx, _ := parseBlockIndexOK(data)
+	return idx
+}
+
+// parseBlockIndexOK 解析 index；`%d` 跳过前导空白，天然兼容 `"index": 1` 带空格形态。
+func parseBlockIndexOK(data string) (int, bool) {
+	if m := strings.Index(data, `"index":`); m >= 0 {
+		var idx int
+		if _, err := fmt.Sscanf(data[m+len(`"index":`):], "%d", &idx); err == nil {
+			return idx, true
+		}
+	}
+	return 0, false
+}
 
 // AnthropicGuard 是 /messages 流的行缓冲状态机。
 type AnthropicGuard struct {
-	blockIndex     int  // 当前 content_block index（content_block_start 时记录）
-	blockActive    bool // 块开始后、stop 前为 true
+	openBlocks     map[int]bool // 开放中的 content_block index 集合（start 增 / stop 删）
 	sawMessageStop bool
+	sawError       bool   // 观测到上游 error 事件（Finish 时不再合成假 end_turn）
 	lineBuffer     []byte // 未成行的尾部
 }
 
 // scan 逐行扫描 data: 事件，更新状态。
-// 与 JS 一致用子串匹配（strings.Contains），不解析整行 JSON（协议可能演进，保持松耦合）。
+// 仍不解析整行 JSON（协议可能演进，保持松耦合），但事件 type 用容忍空白的正则提取；
+// `data:` 后空格可选（SSE 规范允许）[增强]。
 func (g *AnthropicGuard) scan(line []byte) {
 	trimmed := strings.TrimSpace(string(line))
-	if !strings.HasPrefix(trimmed, "data: ") {
+	if !strings.HasPrefix(trimmed, "data:") {
 		return
 	}
-	data := strings.TrimSpace(trimmed[len("data: "):])
-	switch {
-	case strings.Contains(data, `"type":"content_block_start"`):
-		if m := strings.Index(data, `"index":`); m >= 0 {
-			var idx int
-			if _, err := fmt.Sscanf(data[m+len(`"index":`):], "%d", &idx); err == nil {
-				g.blockIndex = idx
-			}
+	data := strings.TrimSpace(trimmed[len("data:"):])
+	switch eventType(data) {
+	case "content_block_start":
+		if g.openBlocks == nil {
+			g.openBlocks = map[int]bool{}
 		}
-		g.blockActive = true
-	case strings.Contains(data, `"type":"content_block_stop"`):
-		g.blockActive = false
-	case strings.Contains(data, `"type":"message_stop"`):
+		g.openBlocks[parseBlockIndex(data)] = true
+	case "content_block_stop":
+		if idx, ok := parseBlockIndexOK(data); ok {
+			delete(g.openBlocks, idx)
+		} else {
+			// 无 index 的 stop（罕见）：防御性清空，避免泄漏未闭合块
+			g.openBlocks = map[int]bool{}
+		}
+	case "message_stop":
 		g.sawMessageStop = true
+	case "error":
+		g.sawError = true
 	}
 }
 
@@ -87,12 +134,25 @@ func (g *AnthropicGuard) Finish(w io.Writer) error {
 		g.scan(g.lineBuffer)
 		g.lineBuffer = nil
 	}
-	if g.blockActive && g.blockIndex >= 0 {
-		if _, err := fmt.Fprintf(w, contentBlockStopFmt, g.blockIndex); err != nil {
+	// 闭合全部开放块（升序；单块场景与 JS 版字节一致）
+	idxs := make([]int, 0, len(g.openBlocks))
+	for idx := range g.openBlocks {
+		idxs = append(idxs, idx)
+	}
+	sort.Ints(idxs)
+	for _, idx := range idxs {
+		if _, err := fmt.Fprintf(w, contentBlockStopFmt, idx); err != nil {
 			return err
 		}
 	}
 	if !g.sawMessageStop {
+		// 上游已发 error 事件 → 失败已被客户端感知，仅补 message_stop 收尾，
+		// 不再合成 stop_reason:"end_turn"/output_tokens:0 的假 message_delta
+		//（那会把失败美化成正常结束）[增强，有意偏离 JS]。
+		if g.sawError {
+			_, err := io.WriteString(w, messageStopOnly)
+			return err
+		}
 		if _, err := io.WriteString(w, messageDeltaStop); err != nil {
 			return err
 		}
@@ -119,19 +179,29 @@ func (g *OpenAIGuard) Write(p []byte, w io.Writer) error {
 		}
 		line := bytes.TrimSpace(g.buf[:idx])
 		g.buf = g.buf[idx+1:]
-		if bytes.Equal(line, []byte("data: [DONE]")) {
+		if isDoneLine(line) {
 			g.sawDone = true
 		}
 	}
 	return nil
 }
 
+// isDoneLine 判断一行（可含首尾空白）是否为 [DONE] 标记。
+// `data:` 后空格可选——精确匹配 `data: [DONE]` 会漏判 `data:[DONE]` 而补发第二个 DONE [增强]。
+func isDoneLine(line []byte) bool {
+	line = bytes.TrimSpace(line)
+	rest, ok := bytes.CutPrefix(line, []byte("data:"))
+	if !ok {
+		return false
+	}
+	return bytes.Equal(bytes.TrimSpace(rest), []byte("[DONE]"))
+}
+
 // Finish 上游结束时调用：若缺 [DONE] 则补发（幂等）。
 func (g *OpenAIGuard) Finish(w io.Writer) error {
 	// 残留行缓冲里也可能有 [DONE]
 	if len(g.buf) > 0 {
-		line := bytes.TrimSpace(g.buf)
-		if bytes.Equal(line, []byte("data: [DONE]")) {
+		if isDoneLine(g.buf) {
 			g.sawDone = true
 		}
 		g.buf = nil
@@ -147,7 +217,7 @@ func (g *OpenAIGuard) Finish(w io.Writer) error {
 // Pipe 用 AnthropicGuard 把上游 body 透传到 w，结束后收尾（合成终止事件）。
 // 用于 /messages 端点。
 func PipeAnthropic(w io.Writer, r io.Reader) error {
-	g := &AnthropicGuard{}
+	g := &AnthropicGuard{openBlocks: map[int]bool{}}
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := r.Read(buf)

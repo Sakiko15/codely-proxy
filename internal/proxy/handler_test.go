@@ -199,3 +199,71 @@ func TestHandlerModelDeniedPassthrough(t *testing.T) {
 		t.Fatalf("应原样透传上游错误: %s", rw.Body.String())
 	}
 }
+
+// ---- [增强] SSE 逐事件刷新 ----
+
+// fakeFlusher 最小 ResponseWriter + Flusher，带计数。
+type fakeFlusher struct {
+	writes  int
+	flushes int
+}
+
+func (f *fakeFlusher) Header() http.Header         { return http.Header{} }
+func (f *fakeFlusher) Write(p []byte) (int, error) { f.writes++; return len(p), nil }
+func (f *fakeFlusher) WriteHeader(int)             {}
+func (f *fakeFlusher) Flush()                      { f.flushes++ }
+
+func TestFlushWriterFlushesPerWrite(t *testing.T) {
+	// flushWriter 每次 Write 后都应 Flush；显式 Flush 也透传
+	inner := &fakeFlusher{}
+	w := flushWriter{ResponseWriter: inner}
+	_, _ = w.Write([]byte("a"))
+	_, _ = w.Write([]byte("b"))
+	if inner.flushes != 2 {
+		t.Fatalf("每次 Write 后应 Flush，got %d", inner.flushes)
+	}
+	w.Flush()
+	if inner.flushes != 3 {
+		t.Fatalf("显式 Flush 应透传，got %d", inner.flushes)
+	}
+}
+
+// flushCountWriter 包装 ResponseRecorder，统计 Flush 次数（验证逐事件刷新）。
+type flushCountWriter struct {
+	*httptest.ResponseRecorder
+	flushes int
+}
+
+func (w *flushCountWriter) Flush() {
+	w.flushes++
+	w.ResponseRecorder.Flush()
+}
+
+func TestHandlerSSEFlushPerEvent(t *testing.T) {
+	// SSE 每个事件（每次上游读取）都应触发一次客户端 Flush（1 次头部 + N 次事件）；
+	// 修复前仅流开始 Flush 一次，小事件被 Go http ~4KB 缓冲攒批
+	h, _, _, cleanup := buildHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		for i := 0; i < 3; i++ {
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(30 * time.Millisecond) // 拉开写入间隔，避免客户端读合并
+		}
+	})
+	defer cleanup()
+
+	body := `{"model":"codely-flash","messages":[],"stream":true}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", io.NopCloser(strings.NewReader(body)))
+	rw := &flushCountWriter{ResponseRecorder: httptest.NewRecorder()}
+	h.Handle(context.Background(), rw, req, []byte(body))
+
+	if rw.Code != 200 {
+		t.Fatalf("SSE 应 200，got %d", rw.Code)
+	}
+	if rw.flushes < 4 {
+		t.Fatalf("SSE 应逐事件 Flush（≥4：1 头部 + 3 事件），got %d", rw.flushes)
+	}
+}

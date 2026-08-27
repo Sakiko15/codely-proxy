@@ -89,6 +89,28 @@ func (t *rwTracker) Flush() {
 // Written 是否已写出响应头。
 func (t *rwTracker) Written() bool { return t.written }
 
+// flushWriter 在每次 Write 后立即 Flush（仅 SSE 路径使用）。
+// Go http 服务端对响应有 ~4KB bufio 缓冲：若只在流开始 Flush 一次，后续小 SSE 事件会
+// 攒批到缓冲满才发出，逐 token 时延明显劣化（§19.2 全链路流式 [增强]）。
+// 必须显式实现 Flush 并向内断言 http.Flusher——嵌入接口不含该方法，漏写会让包裹层丢失可 flush 性。
+type flushWriter struct {
+	http.ResponseWriter
+}
+
+func (w flushWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	if err == nil {
+		w.Flush()
+	}
+	return n, err
+}
+
+func (w flushWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // Handle 处理一个 /v1/* 推理请求。
 //
 // 对标 codely-proxy.js handle，并按 §17.1 修复：转发模型分两段——
@@ -248,12 +270,14 @@ func (h *Handler) pipeResponse(rw http.ResponseWriter, req *http.Request, r Forw
 			f.Flush()
 		}
 
+		// 逐事件刷新：后续每次写入立即 Flush，避免小 SSE 事件被 Go http 4KB 缓冲攒批（§19.2 [增强]）
+		fw := flushWriter{ResponseWriter: rw}
 		if strings.Contains(req.URL.Path, "/messages") {
 			// Anthropic：行缓冲状态机守护闭环（§4，防 Claude Code 挂死）
-			_ = sseguard.PipeAnthropic(rw, resp.Body)
+			_ = sseguard.PipeAnthropic(fw, resp.Body)
 		} else {
 			// OpenAI：逐块透传 + [DONE] 合成（§19.3 增强）
-			_ = sseguard.PipeOpenAI(rw, resp.Body)
+			_ = sseguard.PipeOpenAI(fw, resp.Body)
 		}
 		resp.Body.Close()
 		return

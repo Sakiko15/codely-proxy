@@ -107,8 +107,10 @@ func main() {
 		Handler: mux,
 		// 稳定性（§19.1）：读/写超时 + 空闲超时，防慢连接拖垮。
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      0, // SSE 长连接不设写超时
+		// 120s：32MB 大 body 慢链路不再被 30s 掐断（性能审计 P7b）；头部阶段仍由
+		// ReadHeaderTimeout=10s 约束，body 总量由 MaxBytesReader 限制
+		ReadTimeout:  120 * time.Second,
+		WriteTimeout: 0, // SSE 长连接不设写超时
 		IdleTimeout:       90 * time.Second,
 	}
 

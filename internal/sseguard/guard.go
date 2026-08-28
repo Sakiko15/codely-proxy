@@ -22,7 +22,7 @@ import (
 	"io"
 	"regexp"
 	"sort"
-	"strings"
+	"sync"
 )
 
 // 合成事件（字节与 JS 版完全一致，勿改）
@@ -40,35 +40,58 @@ const (
 	messageStopOnly = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 )
 
+// pumpBufPool 复用 Pipe* 的 32KB 读缓冲（性能审计 P6：每流一次分配 → 池化；
+// 缓冲仅在单次 Pipe 调用栈内使用、g.Write 内部拷贝到 lineBuffer，无跨调用别名）。
+var pumpBufPool = sync.Pool{
+	New: func() any { return make([]byte, 32*1024) },
+}
+
 // sseTypeRE 从 data 载荷提取事件 type（容忍冒号后空白）。
 // 无误触发问题：合法 JSON 里字符串值内的引号必被转义（\"type\":），
 // 故 `"type"\s*:\s*"` 不会命中字符串内容，无需更多机制 [增强]。
 var sseTypeRE = regexp.MustCompile(`"type"\s*:\s*"([a-z_]+)"`)
 
+// dataPrefix SSE data 行前缀（`data:` 后空格可选）。
+var dataPrefix = []byte("data:")
+
 // eventType 提取 data 行的事件 type；无匹配返回空串。
-func eventType(data string) string {
-	if m := sseTypeRE.FindStringSubmatch(data); m != nil {
-		return m[1]
+// []byte 扫描（性能审计 P6）：避免每 data 行的整行 string 分配，仅类型 token 拷贝；
+// 匹配语义与 string 版完全一致。
+func eventType(data []byte) string {
+	if m := sseTypeRE.FindSubmatch(data); m != nil {
+		return string(m[1])
 	}
 	return ""
 }
 
 // parseBlockIndex 从 content_block_start 事件提取 index。
 // Anthropic 恒带 index；解析失败回退 0（保证防挂死的闭合语义不失效）。
-func parseBlockIndex(data string) int {
+func parseBlockIndex(data []byte) int {
 	idx, _ := parseBlockIndexOK(data)
 	return idx
 }
 
-// parseBlockIndexOK 解析 index；`%d` 跳过前导空白，天然兼容 `"index": 1` 带空格形态。
-func parseBlockIndexOK(data string) (int, bool) {
-	if m := strings.Index(data, `"index":`); m >= 0 {
-		var idx int
-		if _, err := fmt.Sscanf(data[m+len(`"index":`):], "%d", &idx); err == nil {
-			return idx, true
-		}
+// parseBlockIndexOK 解析 index（[]byte 零分配手写解析，跳过前导空白，
+// 兼容 `"index": 1` 带空格形态；index 恒为非负十进制）。
+func parseBlockIndexOK(data []byte) (int, bool) {
+	m := bytes.Index(data, []byte(`"index":`))
+	if m < 0 {
+		return 0, false
 	}
-	return 0, false
+	rest := data[m+len(`"index":`):]
+	i := 0
+	for i < len(rest) && (rest[i] == ' ' || rest[i] == '\t') {
+		i++
+	}
+	if i >= len(rest) || rest[i] < '0' || rest[i] > '9' {
+		return 0, false
+	}
+	idx := 0
+	for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
+		idx = idx*10 + int(rest[i]-'0')
+		i++
+	}
+	return idx, true
 }
 
 // AnthropicGuard 是 /messages 流的行缓冲状态机。
@@ -83,11 +106,11 @@ type AnthropicGuard struct {
 // 仍不解析整行 JSON（协议可能演进，保持松耦合），但事件 type 用容忍空白的正则提取；
 // `data:` 后空格可选（SSE 规范允许）[增强]。
 func (g *AnthropicGuard) scan(line []byte) {
-	trimmed := strings.TrimSpace(string(line))
-	if !strings.HasPrefix(trimmed, "data:") {
+	line = bytes.TrimSpace(line)
+	if !bytes.HasPrefix(line, dataPrefix) {
 		return
 	}
-	data := strings.TrimSpace(trimmed[len("data:"):])
+	data := bytes.TrimSpace(line[len(dataPrefix):])
 	switch eventType(data) {
 	case "content_block_start":
 		if g.openBlocks == nil {
@@ -218,7 +241,8 @@ func (g *OpenAIGuard) Finish(w io.Writer) error {
 // 用于 /messages 端点。
 func PipeAnthropic(w io.Writer, r io.Reader) error {
 	g := &AnthropicGuard{openBlocks: map[int]bool{}}
-	buf := make([]byte, 32*1024)
+	buf := pumpBufPool.Get().([]byte)
+	defer pumpBufPool.Put(buf)
 	for {
 		n, err := r.Read(buf)
 		if n > 0 {
@@ -242,7 +266,8 @@ func PipeAnthropic(w io.Writer, r io.Reader) error {
 // 用于 /chat/completions 端点。
 func PipeOpenAI(w io.Writer, r io.Reader) error {
 	g := &OpenAIGuard{}
-	buf := make([]byte, 32*1024)
+	buf := pumpBufPool.Get().([]byte)
+	defer pumpBufPool.Put(buf)
 	for {
 		n, err := r.Read(buf)
 		if n > 0 {

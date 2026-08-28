@@ -2,6 +2,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -41,15 +42,18 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		http.NotFound(rw, req)
 		return
 	}
-	ct := req.Header.Get("Content-Type")
 	// 读 body（限制大小，防 OOM；模型推理一般 < 16MB）
 	req.Body = http.MaxBytesReader(rw, req.Body, 32<<20)
-	body, err := io.ReadAll(req.Body)
+	var buf bytes.Buffer
+	if req.ContentLength > 0 && req.ContentLength <= 32<<20 {
+		buf.Grow(int(req.ContentLength)) // 按 ContentLength 预分配，避免 ReadAll 倍增扩容的拷贝浪费（性能审计 P7b）
+	}
+	_, err := buf.ReadFrom(req.Body)
+	body := buf.Bytes()
 	if err != nil {
 		WriteError(rw, req, http.StatusRequestEntityTooLarge, "request body too large", "request_too_large")
 		return
 	}
-	_ = ct
 	// GET /v1/models 等可能无 body
 	h.Handle(req.Context(), rw, req, body)
 }
@@ -273,7 +277,6 @@ func (h *Handler) pipeResponse(rw http.ResponseWriter, req *http.Request, r Forw
 	// 复制响应头
 	copyHeaders(rw, resp.Header)
 	rw.Header().Set("x-codely-routed-account", slug)
-	rw.Header().Set("Connection", "keep-alive")
 
 	contentType := resp.Header.Get("Content-Type")
 	isSSE := strings.Contains(contentType, "text/event-stream")

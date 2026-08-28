@@ -870,6 +870,7 @@ dsh 场景下它写 `~/.dsh/settings.yaml` + 插件装配——**VPS 网关不�
 3. **响应侧全链路流式**：读上游 → 逐块写客户端，绝不整响应缓冲；SSE 路径每次写入后立即 Flush（`flushWriter`），避免 Go http ~4KB 缓冲攒批小事件 `[增强]`。
 4. **连接池**：keep-alive（`MaxIdleConnsPerHost` ≥ 8）、TCP_NODELAY、SSE 头 `x-accel-buffering:no`。
 5. **错误体只读前 ~64KB** 即可分类（401/402/429），不通读全量（`errBodyCap`，已实现）。
+6. **热路径与连接池落地**（性能审计 P2-P4/P6）：`ListSlugs` 以目录 mtime + 应用内显式失效缓存文件集合（缓存用独立 `slugsMu`——`SaveAccount` 持 `r.mu` 经 `ReloadPool→syncPool→ListSlugs` 再入，用 `r.mu` 会自死锁）；`Slugify` 正则包级预编译；启动 `Balancer.Preheat` 有界预热 key 与 quota 快照（仅 LB 开启且 quota-first）；oauth 控制面统一 `HTTPClient` + 专用 Transport（`MaxIdleConnsPerHost=16`）；`MarkFailure` 关键词判定限前 2KB、冷却原因截断 256 字节、502 reason 截断 512 字节；sseguard 泵缓冲 `sync.Pool` 池化 + `eventType` []byte 化。**明确不做**：sseguard lineBuffer 原地扫描重构——golden 契约文件上收益/风险比不划算，双拷贝内存开销可接受。
 
 ### 19.3 格式全支持（最新 OpenAI Chat Completions + Anthropic Messages）
 

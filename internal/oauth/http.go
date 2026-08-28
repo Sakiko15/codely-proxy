@@ -10,8 +10,20 @@ import (
 	"time"
 )
 
-// HTTPClient 是全局复用连接池的客户端（keep-alive 加速；超时 30s）。
-var HTTPClient = &http.Client{Timeout: 30 * time.Second}
+// upstreamTransport 控制面出站共享 Transport（性能审计 P4）：不设则落到 http.DefaultTransport
+//（每 host 仅保 2 条空闲连接），Pick 按候选并发拉额度会反复 TLS 握手。
+var upstreamTransport = &http.Transport{
+	MaxIdleConns:        64,
+	MaxIdleConnsPerHost: 16, // ≥ Pick 的每候选并发拉取宽度
+	IdleConnTimeout:     60 * time.Second,
+}
+
+// HTTPClient 是控制面出站的统一客户端（keep-alive 复用；超时 30s）。
+// 仅用于凭据/计费/设备码等短请求——转发/SSE 勿用（全局超时会掐断长流）。
+var HTTPClient = &http.Client{
+	Timeout:   30 * time.Second,
+	Transport: upstreamTransport,
+}
 
 // PostJSON 发 POST JSON 请求并读取响应体。非 2xx 返回错误（含状态码）。
 func PostJSON(url string, body any) ([]byte, error) {

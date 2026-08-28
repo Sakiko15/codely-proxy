@@ -106,12 +106,7 @@ func (c *Creds) IsExpiring() bool {
 }
 
 // oauthClient 复用连接池，对标 codely-auth.js 用全局 fetch（复用 keep-alive）。
-var httpClient = newUpstreamClient()
-
-// newUpstreamClient 创建带 keep-alive 的 HTTP 客户端（连接池复用，加速后续请求）。
-func newUpstreamClient() *http.Client {
-	return &http.Client{Timeout: 30 * time.Second}
-}
+// 性能审计 P4：原 httpClient/newUpstreamClient 已并入 http.go 的 HTTPClient（单一客户端 + 专用 Transport）。
 
 // postJSON 发 POST JSON 请求并解析 JSON 响应。ok 返回响应体字节，非 2xx 返回错误。
 // 对标 JS 的 jsonFetch（captures status + first 300 chars）。
@@ -120,7 +115,7 @@ func postJSON(url string, body any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(payload))
+	resp, err := HTTPClient.Post(url, "application/json", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +140,7 @@ func getJSON(url, bearer string) (int, []byte, error) {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := httpClient.Do(req)
+	resp, err := HTTPClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}

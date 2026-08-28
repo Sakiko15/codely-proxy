@@ -267,7 +267,13 @@ func (b *Balancer) MarkFailure(slug string, statusCode int, errorMsg string) {
 	s.metrics.Fail++
 	s.mu.Unlock()
 
-	msg := strings.ToLower(errorMsg)
+	// 性能审计 P5：关键词判定只对前 2KB 做（错误体 ≤64KB，全量 ToLower 是纯拷贝开销；
+	// 额度类关键词实践中都出现在错误体开头），冷却原因同样只用该片段。
+	snippet := errorMsg
+	if len(snippet) > 2048 {
+		snippet = snippet[:2048]
+	}
+	msg := strings.ToLower(snippet)
 	isQuotaOrRateLimit := statusCode == 402 ||
 		statusCode == 429 ||
 		strings.Contains(msg, "exhausted") ||
@@ -276,7 +282,7 @@ func (b *Balancer) MarkFailure(slug string, statusCode int, errorMsg string) {
 		strings.Contains(msg, "rate limit")
 
 	if isQuotaOrRateLimit {
-		s.SetCooldown(fmt.Sprintf("HTTP %d: %s", statusCode, errorMsg))
+		s.SetCooldown(fmt.Sprintf("HTTP %d: %s", statusCode, snippet))
 	}
 }
 
@@ -287,11 +293,13 @@ func (b *Balancer) GetConfig() Config {
 	return b.config
 }
 
+// saveMu 串行化配置落盘（性能审计 P7a：写盘已移出 b.mu，用它保持并发 UpdateConfig 的落盘先后序）。
+var saveMu sync.Mutex
+
 // UpdateConfig 更新负载均衡配置（WebUI /balancer/config）。对标 updateBalancerConfig。
 // patch 支持：enabled / mode / disabledSlugs / toggleSlug。
 func (b *Balancer) UpdateConfig(patch map[string]any) Config {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if v, ok := patch["enabled"].(bool); ok {
 		b.config.Enabled = v
 	}
@@ -317,8 +325,14 @@ func (b *Balancer) UpdateConfig(patch map[string]any) Config {
 			}
 		}
 	}
-	saveConfig(b.config)
-	return b.config
+	snap := b.config // 配置快照（结构体拷贝，Pick 侧读快照的既有模式）
+	b.mu.Unlock()
+
+	// 写盘移出锁（性能审计 P7a）：balancer.json 写入不再阻塞并发 Pick 的 b.mu 关键区
+	saveMu.Lock()
+	saveConfig(snap)
+	saveMu.Unlock()
+	return snap
 }
 
 func containsStr(list []string, s string) bool {

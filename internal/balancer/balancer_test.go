@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -459,5 +460,40 @@ func TestBalancerPreheatQuota(t *testing.T) {
 	st.mu.Unlock()
 	if !warmed {
 		t.Fatalf("Preheat 后 quota 缓存应已填充")
+	}
+}
+
+func TestMarkFailureTruncatesReason(t *testing.T) {
+	// 性能审计 P5：大错误体只在前 2KB 做关键词判定；冷却原因截断至 256 字节——
+	// 64KB 错误体不再整段驻留内存态/进状态轮询
+	reg := setup(t)
+	addAccount(t, reg, "a", "1", "A", 0, 0, false)
+	bal := NewBalancer(reg)
+
+	big := `{"error":{"message":"insufficient quota ` + strings.Repeat("x", 100<<10) + `"}}`
+	bal.MarkFailure("a", 500, big) // 非 402/429 → 冷却由关键词触发
+	st := bal.state("a")
+	if st == nil {
+		t.Fatalf("state(a) nil")
+	}
+	if !st.IsCooling() {
+		t.Fatalf("前 2KB 内的关键词应触发冷却")
+	}
+	st.mu.Lock()
+	reason := st.cooldownReason
+	st.mu.Unlock()
+	if len(reason) > 300 {
+		t.Fatalf("冷却原因应截断至 ~256 字节, got %d", len(reason))
+	}
+
+	// 关键词在 2KB 之外（且非 402/429）→ 不再触发冷却（接受的取舍，注释见 MarkFailure）。
+	// 用独立账号 b——同一 AccountState 的冷却不会跨账号污染
+	addAccount(t, reg, "b", "2", "B", 0, 0, false)
+	bal2 := NewBalancer(reg)
+	past := strings.Repeat("x", 3<<10) + " insufficient quota"
+	bal2.MarkFailure("b", 500, past)
+	stb := bal2.state("b")
+	if stb == nil || stb.IsCooling() {
+		t.Fatalf("2KB 外的关键词不应触发冷却（P5 取舍）")
 	}
 }

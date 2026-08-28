@@ -254,6 +254,10 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 		if lastErr != nil {
 			reason = lastErr.Error()
 		}
+		// 性能审计 P5：错误体（≤64KB）不再整段进客户端 502 消息
+		if len(reason) > 512 {
+			reason = reason[:512]
+		}
 		WriteError(rw, req, http.StatusBadGateway, "codely-proxy: 上游请求失败 ("+reason+")", "bad_gateway")
 	}
 }

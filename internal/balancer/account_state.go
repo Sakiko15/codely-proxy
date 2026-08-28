@@ -207,6 +207,11 @@ func (s *AccountState) SetCooldown(reason string) {
 	if reason == "" {
 		reason = "额度耗尽或限流"
 	}
+	// 性能审计 P5：错误体（≤64KB）不再整段驻留内存/进状态轮询——原因截断至 256 字节。
+	// 字节截断可能切多字节字符 → JSON 序列化转 U+FFFD，仅状态展示字段可接受。
+	if len(reason) > 256 {
+		reason = reason[:256]
+	}
 	s.cooldownReason = reason
 }
 

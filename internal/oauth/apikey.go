@@ -166,7 +166,7 @@ func fetchModels(base, apiKey string) ([]ModelInfo, error) {
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Codely-Signature", gateway.SignRequest(apiKey, "/v1/models"))
-	resp, err := httpClient.Do(req)
+	resp, err := HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +352,7 @@ func probeOnce(alias, base string, direct bool, apiKey, sessionID string) (strin
 		req.Body = io.NopCloser(bytes.NewReader(payload2))
 		req.ContentLength = int64(len(payload2))
 	}
-	resp, err := httpClient.Do(req)
+	resp, err := HTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}

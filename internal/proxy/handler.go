@@ -198,13 +198,20 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 
 			switch r.Kind {
 			case KindRetryKey:
-				// 密钥类 401/403：刷新后重试一次
-				h.logf("key", "[%s] 上游返回 %d，刷新密钥后重试", slug, r.Status)
 				lastErr = fmt.Errorf("%d: %s", r.Status, string(r.Body))
-				if newKey, err := state.RefreshAPIKey(); err != nil {
-					h.logf("key", "[%s] 刷新失败: %s", slug, err.Error())
+				if attempt == 0 {
+					// 密钥类 401/403：刷新后重试一次。attempt==1（末次）不再刷新——
+					// 循环已结束，刷新结果无消费方，白发一次上游刷新+落盘轮换（审查记录 P2 #7）
+					h.logf("key", "[%s] 上游返回 %d，刷新密钥后重试", slug, r.Status)
+					if newKey, err := state.RefreshAPIKey(); err != nil {
+						h.logf("key", "[%s] 刷新失败: %s", slug, err.Error())
+					} else {
+						apiKey = newKey
+					}
 				} else {
-					apiKey = newKey
+					// 审查记录 P2 #18：末次仍密钥失效 → 计入失败指标，面板可见坏账号
+					//（此前该路径不计 metrics）；401/403 不在冷却触发集，不会误冷却
+					h.Balancer.MarkFailure(slug, r.Status, string(r.Body))
 				}
 				// ⚠️ code-review #5：二次 401 后该账号已不可用，加入 excluded 防外层再选它
 				excluded[slug] = true

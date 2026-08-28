@@ -172,7 +172,9 @@ func (f *LoginFlow) Poll() LoginStatus {
 	u := oauth.Base + "/auth/device/poll?auth_request_token=" + url.QueryEscape(token)
 	status, raw, err := oauth.Get(u, "")
 	if err != nil {
-		msg := "轮询异常（将自动重试）：" + err.Error()
+		// safeErrText：url.Error 含完整 URL（auth_request_token 在 query 上，等价于可代
+		// 完成授权的凭据，不得进 message/日志，审查记录 P2 #14）
+		msg := "轮询异常（将自动重试）：" + safeErrText(err)
 		f.setSlotMessage(slot, msg)
 		return LoginStatus{Status: "pending", Progress: 1, Message: msg}
 	}
@@ -390,17 +392,23 @@ func (f *LoginFlow) complete(authorizationCode, suggestedName string) (*Account,
 	}
 	f.mu.Unlock()
 
-	// 6. 保存 + 激活（以最终 slug 命名——Slugify 对已规范化名幂等；密钥预取失败不阻塞，代理下次请求自动换取）
+	// 6. 保存 + 激活（以最终 slug 命名——Slugify 对已规范化名幂等）。
+	// 审查记录 P2 #12：SaveAccount(activate=true) 已完成激活语义（写 codely-creds.json +
+	// 提交 current），此前再调 ActivateAccount 属双重激活（预取冗余且其失败分支文案误导
+	// ——账号此时已是主账号）；sk- 密钥由代理下次请求经 GetAPIKey 的 singleflight 按需换取
 	slug, _, err := f.registry.SaveAccount(finalSlug, creds, true, nil)
 	if err != nil {
 		return nil, err
 	}
-	acct, _, err := f.registry.ActivateAccount(slug, nil)
-	if err != nil {
-		// 修复：激活失败此前谎报成功——账号已保存但未激活（未写 codely-creds.json），
-		// 前端却弹「授权成功」。如实报错（账号已保留，可在账号页手动「设为主」）。
-		return nil, fmt.Errorf("账号 %s 已保存但激活失败（可在账号列表手动设为主账号）: %w", slug, err)
-	}
-	_ = acct
 	return &Account{Name: slug, UserID: userId, TeamName: teamName}, nil
+}
+
+// safeErrText 剥离 url.Error 的完整 URL——auth_request_token 等价于可代完成授权的凭据，
+// 不得进入 message/日志（审查记录 P2 #14）。
+func safeErrText(err error) string {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Err.Error()
+	}
+	return err.Error()
 }

@@ -57,6 +57,11 @@ func TestSlugify(t *testing.T) {
 		{"trailing-", "trailing"},   // 去首尾 '-'
 		{"a", "a"},                  // 单字符
 		{"0123456789012345678901234567890123456789012345678901234567890123X", ""}, // 超 64
+		{"con", ""},  // 审查记录 P2 #13：Windows 保留设备名
+		{"COM1", ""}, // 大小写不敏感（Slugify 已 lowercase）
+		{"lpt9", ""},
+		{"nul", ""},
+		{"con-x", "con-x"}, // 非保留名不受影响
 	}
 	for _, c := range cases {
 		if got := Slugify(c.in); got != c.want {
@@ -558,6 +563,36 @@ func TestRemoveAccountRemovesSidecarFiles(t *testing.T) {
 		if _, statErr := os.Stat(AccountsDir + "/" + f); !os.IsNotExist(statErr) {
 			t.Fatalf("伴生文件 %s 应被清理", f)
 		}
+	}
+}
+
+func TestRemoveAccountFileRemoveWarn(t *testing.T) {
+	// 审查记录 P2 #15：主文件删除失败（占用/权限）并入 warning——半删除态不得静默
+	r := setup(t)
+	if _, _, err := r.SaveAccount("a", fakeCreds("1", "A"), true, nil); err != nil {
+		t.Fatalf("SaveAccount: %v", err)
+	}
+	// accounts/a.json → 非空目录（内含文件，os.Remove 必败）
+	if err := os.Remove(AccountsDir + "/a.json"); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := os.MkdirAll(AccountsDir+"/a.json", 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(AccountsDir+"/a.json/inner", []byte("x"), 0o600); err != nil {
+		t.Fatalf("write inner: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(AccountsDir + "/a.json") })
+
+	removed, _, err := r.RemoveAccount("a", nil)
+	if !removed {
+		t.Fatalf("删除已成立，removed 不得为 false（谎报）")
+	}
+	if err == nil {
+		t.Fatalf("主文件删除失败应并入 warning")
+	}
+	if got := r.GetCurrentName(); got == "a" {
+		t.Fatalf("index 中该账号应已移除")
 	}
 }
 

@@ -185,6 +185,14 @@ func Slugify(name string) string {
 		// 预留字（稳定性审计 F5）：会与注册表文件 accounts/index.json 同名互覆
 		return ""
 	}
+	// 审查记录 P2 #13：Windows 保留设备名（con.json 等在 Win32 解析为设备，OpenFile 必败
+	// 且报错晦涩）→ 返回空走 AutoName 兜底；Slugify 已 lowercase，比较天然大小写不敏感
+	switch s {
+	case "con", "prn", "aux", "nul",
+		"com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+		"lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9":
+		return ""
+	}
 	if !slugRe.MatchString(s) {
 		return ""
 	}
@@ -621,10 +629,18 @@ func (r *Registry) RemoveAccount(name string, pool PoolReloader) (removed bool, 
 		}
 	}
 	wasCurrent := idx.Current == slug
-	_ = os.Remove(accountFilePath(slug))
+	// 审查记录 P2 #15：文件删除失败（Windows 文件被占用/权限）不得静默——index 条目
+	// 随后会被移除，残留文件成为"半删除态"，至少要随 warning 告知调用方
+	var removeWarn error
+	if err := os.Remove(accountFilePath(slug)); err != nil && !os.IsNotExist(err) {
+		removeWarn = fmt.Errorf("账号文件删除失败: %v", err)
+	}
 	// 逻辑审查 P2：伴生文件一并清理——残留的 sk- key 会被同名重建的新账号静默复用
-	_ = os.Remove(filepath.Join(AccountsDir, slug+".key"))
-	_ = os.Remove(filepath.Join(AccountsDir, slug+".session"))
+	for _, side := range []string{slug + ".key", slug + ".session"} {
+		if err := os.Remove(filepath.Join(AccountsDir, side)); err != nil && !os.IsNotExist(err) && removeWarn == nil {
+			removeWarn = fmt.Errorf("伴生文件 %s 删除失败: %v", side, err)
+		}
+	}
 	r.invalidateSlugsCache() // 文件集合变更（P2 缓存失效）
 	delete(idx.Accounts, slug)
 	rest := make([]string, 0, len(idx.Accounts))
@@ -670,6 +686,9 @@ func (r *Registry) RemoveAccount(name string, pool PoolReloader) (removed bool, 
 		pool.ReloadPool()
 	}
 	idx = r.currentIndex()
+	if warn == nil {
+		warn = removeWarn // 文件删除失败并入 warning（级联告警优先）
+	}
 	if warn != nil {
 		return true, idx.Current, warn
 	}

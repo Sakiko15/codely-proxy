@@ -39,7 +39,11 @@ func SanitizeText(s string) string {
 }
 
 // systemText 从 system 字段（string 或 block 数组）抽取全部 text，返回新值。
-// 若 system 是 block 数组：对每个含 text 的块做清洗，空文本块被剔除。
+// 若 system 是 block 数组：对每个含 text 的块做清洗；无任一块实际改写时整体原样返回。
+// 审查记录 P1-7：块数组曾用 []map[string]any 无条件重组——map 键重排使 bytes.Equal 恒不等，
+// 零拷贝对 Claude Code 的主流形态（system 块数组）恒失效，且块内数字经 float64 失真。
+// 改为 RawMessage 粗解：未改写的块保留原字节（数字文本/键序零损伤），仅真正被清洗的块付重组代价。
+// 行为变化：text 为空串的块从"恒剔除"改为"保留"（更保守的最小干预）；清洗后为空（纯空白）仍剔除。
 func sanitizeSystem(system json.RawMessage) json.RawMessage {
 	if bytes.Equal(bytes.TrimSpace(system), []byte("null")) {
 		// JSON null 原样透传（逻辑审查 P0）：null 解码进 string 得零值空串，
@@ -54,21 +58,44 @@ func sanitizeSystem(system json.RawMessage) json.RawMessage {
 		return out
 	}
 	// block 数组形态
-	var blocks []map[string]any
+	var blocks []json.RawMessage
 	if err := json.Unmarshal(system, &blocks); err != nil {
 		return system // 非 string/数组 → 原样透传
 	}
-	out := make([]map[string]any, 0, len(blocks))
-	for _, b := range blocks {
-		// 深拷贝避免改动原对象？这里 blocks 是反序列化的新对象，直接改即可
-		if txt, ok := b["text"].(string); ok {
-			cleaned := SanitizeText(txt)
-			if cleaned == "" {
-				continue // 空文本块剔除（JS 版也过滤空 text）
-			}
-			b["text"] = cleaned
+	changed := false
+	out := make([]json.RawMessage, 0, len(blocks))
+	for _, br := range blocks {
+		var probe struct {
+			Text *string `json:"text"`
 		}
-		out = append(out, b)
+		if json.Unmarshal(br, &probe) != nil || probe.Text == nil {
+			out = append(out, br) // 无 text 字段/非对象块/解析失败 → 原样保留
+			continue
+		}
+		cleaned := SanitizeText(*probe.Text)
+		if cleaned == *probe.Text {
+			out = append(out, br) // 未改动 → 原字节
+			continue
+		}
+		changed = true
+		if cleaned == "" {
+			continue // 清洗后为空的文本块剔除（JS 版也过滤空 text）
+		}
+		var m map[string]any
+		if json.Unmarshal(br, &m) != nil {
+			out = append(out, br) // 重组失败保守保留原块（回到透传语义）
+			continue
+		}
+		m["text"] = cleaned
+		nb, err := json.Marshal(m)
+		if err != nil {
+			out = append(out, br)
+			continue
+		}
+		out = append(out, nb)
+	}
+	if !changed {
+		return system // 无任一块实际改写 → 整体原样返回（零拷贝语义保持）
 	}
 	res, _ := json.Marshal(out)
 	return res

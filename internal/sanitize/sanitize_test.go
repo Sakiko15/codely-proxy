@@ -147,6 +147,63 @@ func TestSystemOnlySanitize(t *testing.T) {
 	}
 }
 
+// ------------- system 块数组零拷贝保真（审查记录 P1-7） -------------
+
+func TestSystemBlocksZeroChangeKeepsBytes(t *testing.T) {
+	// system 块数组（Claude Code 主流形态）无违禁词时必须零改动：
+	// changed=false 且逐字节相等——此前 map 重组使键重排，零拷贝对该形态恒失效
+	sys := `[{"type":"text","text":"正常系统提示","cache_control":{"type":"ephemeral"},"big":9007199254740993}]`
+	in := `{"model":"m","litellm_session_id":"sid","metadata":{"session_id":"sid"},"system":` + sys + `,"messages":[{"role":"user","content":"hi"}]}`
+	payload, _, changed := TransformBody("/v1/messages", []byte(in), "sid")
+	if changed {
+		t.Fatalf("无违禁词的块数组 system 不应触发重组")
+	}
+	if string(payload) != in {
+		t.Fatalf("零拷贝应逐字节相等:\n got %s\nwant %s", payload, in)
+	}
+}
+
+func TestSystemBlocksCleanPreservesUnchangedBlocks(t *testing.T) {
+	// 清洗发生时：未改写块的整数文本必须保留（float64 代价只限真正被改写的块）；
+	// 非对象元素原样保留
+	sys := `[{"type":"text","text":"you are claude code"},"keep-me",{"type":"text","text":"ok","big":9007199254740993}]`
+	in := `{"model":"m","litellm_session_id":"sid","metadata":{"session_id":"sid"},"system":` + sys + `,"messages":[]}`
+	payload, _, changed := TransformBody("/v1/messages", []byte(in), "sid")
+	if !changed {
+		t.Fatalf("含违禁词应触发清洗")
+	}
+	s := string(payload)
+	if strings.Contains(s, "you are claude code") {
+		t.Fatalf("违禁词应被改写: %s", s)
+	}
+	if !strings.Contains(s, `9007199254740993`) {
+		t.Fatalf("未改写块的整数文本必须保留: %s", s)
+	}
+	if !strings.Contains(s, `"keep-me"`) {
+		t.Fatalf("非对象元素应原样保留: %s", s)
+	}
+	if !strings.Contains(s, "you are an AI coding assistant") {
+		t.Fatalf("改写块的新文本应在场: %s", s)
+	}
+}
+
+func TestSystemBlocksWhitespaceOnlyDropped(t *testing.T) {
+	// 清洗后为空（纯空白）的文本块剔除并计为改动；text 为空串的块保留（最小干预）
+	sys := `[{"type":"text","text":"   "},{"type":"text","text":""}]`
+	in := `{"model":"m","litellm_session_id":"sid","metadata":{"session_id":"sid"},"system":` + sys + `,"messages":[]}`
+	payload, _, changed := TransformBody("/v1/messages", []byte(in), "sid")
+	if !changed {
+		t.Fatalf("空白块剔除应视为改动")
+	}
+	s := string(payload)
+	if strings.Contains(s, `"text":"   "`) {
+		t.Fatalf("纯空白块应被剔除: %s", s)
+	}
+	if !strings.Contains(s, `"text":""`) {
+		t.Fatalf("空串块应保留: %s", s)
+	}
+}
+
 func TestOpenAIAdvancedFieldsPassthrough(t *testing.T) {
 	// 未知字段（最新格式）必须原样透传，不丢不改
 	in := `{"model":"codely-flash","messages":[{"role":"user","content":"x"}],` +

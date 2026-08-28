@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -155,6 +156,30 @@ func getJSON(url, bearer string) (int, []byte, error) {
 // tokenRefreshFlight 单飞锁：并发只刷一次（对标 pendingRefreshTokenPromise）。
 var tokenRefreshFlight singleflight.Group
 
+// ErrActivationChanged 磁盘上的激活凭据与预期不符（网络窗口内发生了账号切换/轮换），回写被拒绝。
+var ErrActivationChanged = errors.New("激活账号已切换，跳过回写")
+
+// SaveCredsIfUnchanged 仅当磁盘上的激活凭据仍是 prevRefreshToken 对应的那份时才写回 c。
+// 防"网络窗口内切换账号 → 旧账号轮换结果覆盖新账号激活凭据"的串号
+//（审查记录 P1-2/5/6 同根；写入的 access_token 有效，被覆盖后永不触发 401 自愈）。
+// prevRefreshToken 为空（无法核验身份）或磁盘凭据缺失/已变化 → 返回 ErrActivationChanged 且不写盘。
+func SaveCredsIfUnchanged(c *Creds, prevRefreshToken string) error {
+	if prevRefreshToken == "" {
+		return ErrActivationChanged
+	}
+	cur := LoadCreds()
+	if cur == nil || cur.RefreshToken != prevRefreshToken {
+		return ErrActivationChanged
+	}
+	return c.SaveCreds()
+}
+
+// OnGlobalRefreshed 全局刷新（RefreshAccessToken）成功回写后的回调。
+// account.Registry 在 main 装配时注入 SyncCurrentFromActivation——把激活库同步回
+// accounts/<current>.json，消除"全局轮换后 per-slug 库反向陈旧"（审查记录 P1-4）。
+// oauth 不能 import account（会成环），故用 hook 倒置依赖；未注入（如单测）时无操作。
+var OnGlobalRefreshed func()
+
 // RefreshAccessToken 用当前激活账号的 refresh_token 换新 access_token（并发 Single-flight 防重）。
 // 对标 codely-auth.js refreshAccessToken。
 //
@@ -166,6 +191,7 @@ func RefreshAccessToken() (string, error) {
 		if c == nil || c.RefreshToken == "" {
 			return nil, errors.New("没有 refresh_token，请重新登录（WebUI 添加账号）")
 		}
+		prevRT := c.RefreshToken
 		resp, err := postJSON(Base+"/auth/refresh", map[string]string{"refresh_token": c.RefreshToken})
 		if err != nil {
 			return nil, err
@@ -181,7 +207,10 @@ func RefreshAccessToken() (string, error) {
 		if r.AccessToken == "" {
 			return nil, errors.New("刷新响应中没有 access_token")
 		}
-		// 写回凭据文件（JS 仅当凭据来自 LOCAL_CREDS 才写；VPS 一律本项目文件）
+		// 写回凭据文件（JS 仅当凭据来自 LOCAL_CREDS 才写；VPS 一律本项目文件）。
+		// 审查记录 P1-6：回写前以预刷新 refresh_token 核验激活库未被切换——网络窗口内
+		// 激活已切到其他账号时，旧账号的轮换结果不得覆盖新账号的激活凭据（串号且
+		// "下次 401 自愈"不成立：写入的 access_token 有效，永不触发 401）
 		c.AccessToken = r.AccessToken
 		if r.RefreshToken != "" {
 			c.RefreshToken = r.RefreshToken
@@ -190,8 +219,15 @@ func RefreshAccessToken() (string, error) {
 			exp := time.Now().UnixMilli() + int64(*r.ExpiresIn)*1000
 			c.ExpiryDate = &exp
 		}
-		if err := c.SaveCreds(); err != nil {
+		if err := SaveCredsIfUnchanged(c, prevRT); err != nil {
+			if errors.Is(err, ErrActivationChanged) {
+				log.Printf("[oauth] 激活账号已切换，跳过轮换凭据回写（防串号）")
+				return r.AccessToken, nil
+			}
 			return nil, fmt.Errorf("保存刷新后凭据失败: %w", err)
+		}
+		if OnGlobalRefreshed != nil {
+			OnGlobalRefreshed()
 		}
 		return r.AccessToken, nil
 	})

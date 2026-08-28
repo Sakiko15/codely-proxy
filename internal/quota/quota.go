@@ -12,6 +12,7 @@ package quota
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 	"sync"
@@ -206,6 +207,9 @@ func (q *Quota) FetchSnapshot(force bool) (*Snapshot, error) {
 
 // fetchFresh 拉一轮完整快照并写缓存（FetchSnapshot 的网络+组装段）。
 func (q *Quota) fetchFresh(creds *oauth.Creds, fp string) (*Snapshot, error) {
+	// 名牌与取数凭据同源捕获（审查记录 P1-5 弱同族）：网络窗口内切换账号时，
+	// 避免产出"旧账号的额度数字 + 新账号的名牌"单次混装
+	meta := q.reg.GetCurrentMeta()
 	// 并行拉 usage/summary + plan；apiKey 用于 /key/info（依赖，拆开）
 	summaryRaw, sumErr := call(q.reg, "/api/user/billing/usage/summary", creds)
 	planRaw, planErr := call(q.reg, "/api/user/plan", creds)
@@ -237,16 +241,21 @@ func (q *Quota) fetchFresh(creds *oauth.Creds, fp string) (*Snapshot, error) {
 	var rateLimit *RateLimit
 	if updated, apiKey, ferr := oauth.FetchAPIKey(creds); ferr == nil {
 		if updated != nil && updated.RefreshToken != creds.RefreshToken {
-			// 逻辑审查 P0：401 刷新轮换的凭据持久化回激活账号文件（codely-creds.json）；
-			// 与全局刷新并发的 last-writer-wins 残余由下次 401 自愈
-			_ = updated.SaveCreds()
+			// 逻辑审查 P0：401 刷新轮换的凭据必须持久化。回写激活文件前核验激活库未被
+			// 切换（审查记录 P1-5：网络窗口内切换后覆盖即串号，且"下次 401 自愈"不成立
+			// ——写入的 access_token 有效，永不触发 401）；被切换则尽力回写到凭据所属账号
+			if err := oauth.SaveCredsIfUnchanged(updated, creds.RefreshToken); err != nil {
+				if idErr := q.reg.SyncCredsByIdentity(updated); idErr != nil {
+					log.Printf("[quota] 轮换凭据回写失败（激活已切换且身份未匹配）: %v", idErr)
+				}
+			}
 		}
 		rateLimit = FetchKeyInfo(apiKey)
 	}
 
 	snap := &Snapshot{
 		FetchedAt:      time.Now().UTC().Format(time.RFC3339),
-		Account:        q.reg.GetCurrentMeta(),
+		Account:        meta,
 		Organization:   summary.Organization,
 		Plan:           plan,
 		Billing:        summary.Billing,

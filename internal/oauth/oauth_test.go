@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 )
@@ -180,6 +181,74 @@ func TestFetchAPIKeyReturnsRotatedCreds(t *testing.T) {
 }
 
 // ------------- RefreshAccessToken -------------
+
+// ------------- 激活回写守卫（审查记录 P1-2/5/6 同根） -------------
+
+func TestSaveCredsIfUnchanged(t *testing.T) {
+	_, cleanup := setup(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("守卫本身不应发起请求")
+	}))
+	defer cleanup()
+
+	t.Run("匹配则写盘", func(t *testing.T) {
+		writeCreds(t, "tok-a", "ref-a", now()+3600_000)
+		updated := &Creds{AccessToken: "tok-a2", RefreshToken: "ref-a2"}
+		if err := SaveCredsIfUnchanged(updated, "ref-a"); err != nil {
+			t.Fatalf("匹配时应写盘: %v", err)
+		}
+		if c := LoadCreds(); c == nil || c.RefreshToken != "ref-a2" {
+			t.Fatalf("应写盘成功: %+v", c)
+		}
+	})
+	t.Run("已切换则拒绝且不覆盖", func(t *testing.T) {
+		writeCreds(t, "tok-b", "ref-b", now()+3600_000) // 模拟窗口内激活已切到 B
+		updated := &Creds{AccessToken: "tok-a3", RefreshToken: "ref-a3"}
+		if err := SaveCredsIfUnchanged(updated, "ref-a"); err != ErrActivationChanged {
+			t.Fatalf("应返回 ErrActivationChanged, got %v", err)
+		}
+		if c := LoadCreds(); c == nil || c.RefreshToken != "ref-b" {
+			t.Fatalf("B 的激活凭据不得被覆盖: %+v", c)
+		}
+	})
+	t.Run("prevRT 为空拒绝", func(t *testing.T) {
+		if err := SaveCredsIfUnchanged(&Creds{AccessToken: "x"}, ""); err != ErrActivationChanged {
+			t.Fatalf("无法核验身份应拒绝, got %v", err)
+		}
+	})
+	t.Run("凭据文件缺失拒绝", func(t *testing.T) {
+		if err := os.Remove(CredsFile); err != nil {
+			t.Fatalf("remove creds: %v", err)
+		}
+		if err := SaveCredsIfUnchanged(&Creds{AccessToken: "x"}, "ref-x"); err != ErrActivationChanged {
+			t.Fatalf("凭据缺失应拒绝, got %v", err)
+		}
+	})
+}
+
+func TestOnGlobalRefreshedHook(t *testing.T) {
+	// 审查记录 P1-4：全局刷新成功回写后触发双库同步回调（main 装配注入）
+	oldHook := OnGlobalRefreshed
+	t.Cleanup(func() { OnGlobalRefreshed = oldHook })
+	fired := false
+	OnGlobalRefreshed = func() { fired = true }
+
+	base, cleanup := setup(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"tok-h","refresh_token":"ref-h2","expires_in":3600}`))
+	}))
+	defer cleanup()
+	oldBase := Base
+	defer func() { Base = oldBase }()
+	Base = base
+
+	writeCreds(t, "tok-old", "ref-h1", now()-1000)
+	if _, err := RefreshAccessToken(); err != nil {
+		t.Fatalf("刷新失败: %v", err)
+	}
+	if !fired {
+		t.Fatalf("刷新成功应触发 OnGlobalRefreshed")
+	}
+}
 
 func TestRefreshAccessToken(t *testing.T) {
 	base, cleanup := setup(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

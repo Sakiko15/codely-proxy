@@ -17,6 +17,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -299,7 +300,21 @@ func (s *AccountState) RefreshCreds(creds *oauth.Creds) (*oauth.Creds, error) {
 // persistCreds 把刷新后的账号凭据写回 accounts/<slug>.json（不激活、不触发 ReloadPool，避免死锁）。
 func (s *AccountState) persistCreds(creds *oauth.Creds) {
 	// SaveAccount 会 ReloadPool → 调 syncPool → 不碰已存在 account；此处用底层写，避免持锁回调
-	_, _, _ = s.registry.SaveAccount(s.Slug, creds, false, nil)
+	if _, _, err := s.registry.SaveAccount(s.Slug, creds, false, nil); err != nil {
+		// 审查记录 P1-3：轮换式刷新下落盘失败 = 新 refresh_token 丢失（上游已作废旧 token），
+		// 账号将永久刷废——必须可见并重试一次，不得静默丢弃
+		log.Printf("[balancer] ⚠️ 账号 [%s] 轮换凭据落盘失败（将重试一次）: %v", s.Slug, err)
+		if _, _, err2 := s.registry.SaveAccount(s.Slug, creds, false, nil); err2 != nil {
+			log.Printf("[balancer] ❌ 账号 [%s] 轮换凭据落盘重试仍失败，下次刷新将失效（需重新登录）: %v", s.Slug, err2)
+		}
+	}
+	// 审查记录 P1-4（正向）：当前激活账号的池路径轮换必须同步 codely-creds.json——
+	// 否则全局链继续持已作废的旧 refresh_token，access_token 过期即 /quota 全链失效
+	if s.registry.GetCurrentName() == s.Slug {
+		if err := s.registry.SyncActivationCreds(s.Slug, creds); err != nil {
+			log.Printf("[balancer] 激活凭据回写失败: %v", err)
+		}
+	}
 }
 
 // FetchQuota 抓取该账号配额快照（Stale-While-Revalidate 异步平滑刷新）。

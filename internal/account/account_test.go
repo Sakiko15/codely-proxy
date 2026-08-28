@@ -594,6 +594,113 @@ func TestRemoveAccountCascadeSwitchFail(t *testing.T) {
 	}
 }
 
+// ------------- 凭据一致性（审查记录 P1-1/2/4/5） -------------
+
+func TestSaveAccountActivateOrdering(t *testing.T) {
+	// P1-1：SaveAccount(activate) 必须先写激活凭据再提交 index——SaveCreds 失败时
+	// index.current 不得前移（否则 "index 指向新账号而激活凭据仍是旧账号" 且无自愈）
+	r := setup(t)
+	if _, _, err := r.SaveAccount("a", fakeCreds("1", "A"), true, nil); err != nil {
+		t.Fatalf("SaveAccount a: %v", err)
+	}
+	// 把 codely-creds.json 替换为目录 → SaveCreds 必失败（注入写盘故障）
+	if err := os.Remove(oauth.CredsFile); err != nil {
+		t.Fatalf("remove creds: %v", err)
+	}
+	if err := os.MkdirAll(oauth.CredsFile, 0o755); err != nil {
+		t.Fatalf("mkdir creds: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(oauth.CredsFile) })
+
+	if _, _, err := r.SaveAccount("b", fakeCreds("2", "B"), true, nil); err == nil {
+		t.Fatalf("SaveCreds 失败应上报错误")
+	}
+	if got := r.GetCurrentName(); got != "a" {
+		t.Fatalf("SaveCreds 失败后 index.current 不应前移，got %q", got)
+	}
+}
+
+func TestSyncActivationCreds(t *testing.T) {
+	// P1-2：回写激活文件前必须核验仍是当前账号（持锁原子），切换后拒绝（防串号）
+	r := setup(t)
+	oldBase := oauth.Base
+	oauth.Base = "http://127.0.0.1:1" // ActivateAccount 预取指向不可达地址（快速失败，不触真实上游）
+	t.Cleanup(func() { oauth.Base = oldBase })
+
+	if _, _, err := r.SaveAccount("a", fakeCreds("1", "A"), true, nil); err != nil {
+		t.Fatalf("SaveAccount a: %v", err)
+	}
+	if _, _, err := r.SaveAccount("b", fakeCreds("2", "B"), false, nil); err != nil {
+		t.Fatalf("SaveAccount b: %v", err)
+	}
+
+	rotated := fakeCreds("1", "A")
+	rotated.RefreshToken = "rotated-rt"
+	if err := r.SyncActivationCreds("a", rotated); err != nil {
+		t.Fatalf("当前账号应允许回写: %v", err)
+	}
+	if cur := oauth.LoadCreds(); cur == nil || cur.RefreshToken != "rotated-rt" {
+		t.Fatalf("回写未生效: %+v", cur)
+	}
+
+	// 切到 b → a 的回写必须被拒且不影响 b 的激活凭据
+	if _, _, err := r.ActivateAccount("b", nil); err != nil {
+		t.Fatalf("ActivateAccount b: %v", err)
+	}
+	if err := r.SyncActivationCreds("a", fakeCreds("1", "A")); err == nil {
+		t.Fatalf("已切换后应拒绝回写")
+	}
+	if cur := oauth.LoadCreds(); cur == nil || cur.UserID != "2" {
+		t.Fatalf("串号防护失效: %+v", cur)
+	}
+}
+
+func TestSyncCurrentFromActivation(t *testing.T) {
+	// P1-4 反向：全局轮换后激活库同步回 per-slug 库；已一致则不动
+	r := setup(t)
+	stale := fakeCreds("1", "A")
+	stale.RefreshToken = "stale-rt"
+	if _, _, err := r.SaveAccount("a", stale, true, nil); err != nil {
+		t.Fatalf("SaveAccount a: %v", err)
+	}
+	// 模拟全局链已轮换激活库（a.json 仍陈旧）
+	fresh := fakeCreds("1", "A")
+	fresh.RefreshToken = "fresh-rt"
+	if err := fresh.SaveCreds(); err != nil {
+		t.Fatalf("写激活库: %v", err)
+	}
+
+	r.SyncCurrentFromActivation()
+	got := r.LoadAccountCreds("a")
+	if got == nil || got.RefreshToken != "fresh-rt" {
+		t.Fatalf("反向同步失败: %+v", got)
+	}
+	// 已一致 → 不再改写（防覆盖池路径的更新）
+	r.SyncCurrentFromActivation()
+	if got := r.LoadAccountCreds("a"); got == nil || got.RefreshToken != "fresh-rt" {
+		t.Fatalf("幂等性破坏: %+v", got)
+	}
+}
+
+func TestSyncCredsByIdentity(t *testing.T) {
+	// P1-5 救援路径：激活已切换时轮换凭据按身份落到所属 per-slug 文件（防账号刷废）
+	r := setup(t)
+	if _, _, err := r.SaveAccount("a", fakeCreds("1", "A"), true, nil); err != nil {
+		t.Fatalf("SaveAccount a: %v", err)
+	}
+	rotated := fakeCreds("1", "A")
+	rotated.RefreshToken = "rotated-rt"
+	if err := r.SyncCredsByIdentity(rotated); err != nil {
+		t.Fatalf("按身份回写失败: %v", err)
+	}
+	if got := r.LoadAccountCreds("a"); got == nil || got.RefreshToken != "rotated-rt" {
+		t.Fatalf("回写未生效: %+v", got)
+	}
+	if err := r.SyncCredsByIdentity(fakeCreds("99", "X")); err == nil {
+		t.Fatalf("未匹配应报错")
+	}
+}
+
 func TestSlugifyReserveIndex(t *testing.T) {
 	// 稳定性审计 F5：slug "index" 会与注册表文件 accounts/index.json 同名互覆 → 预留拒绝
 	if got := Slugify("index"); got != "" {

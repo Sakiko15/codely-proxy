@@ -410,6 +410,7 @@ func (r *Registry) SaveAccount(name string, creds *oauth.Creds, activate bool, p
 	}
 	r.ensureLocked() // 已持 r.mu（line 324），用无锁版避免死锁
 	idx := r.loadIndex()
+	prevCurrent := idx.Current
 	ts := time.Now()
 	// 写 accounts/<slug>.json（完整凭据）
 	creds.SavedAt = ts.UTC().Format(time.RFC3339)
@@ -417,24 +418,115 @@ func (r *Registry) SaveAccount(name string, creds *oauth.Creds, activate bool, p
 		return "", "", err
 	}
 	r.invalidateSlugsCache() // 文件集合可能新增 <slug>.json（P2 缓存失效）
+	if activate {
+		// 审查记录 P1-1：与 ActivateAccount 同序——先写激活凭据（codely-creds.json），
+		// 成功后再提交 current 到 index。反序会在 SaveCreds 失败（磁盘满/权限）时留下
+		// "index 指向新账号而激活凭据仍是旧账号"的持久化不一致且无自愈路径
+		if err := creds.SaveCreds(); err != nil {
+			return "", "", err
+		}
+	}
 	idx.Accounts[slug] = metaFromCreds(creds, ts.UnixMilli())
 	if activate {
 		idx.Current = slug
 	}
 	if err := r.saveIndex(idx); err != nil {
+		if activate {
+			// index 提交失败：回滚激活凭据到 prevCurrent，恢复调用前的一致态（尽力而为）
+			log.Printf("[account] saveIndex 失败，回滚激活凭据到 %q: %v", prevCurrent, err)
+			r.restoreActivationLocked(prevCurrent)
+		}
 		return "", "", err
 	}
 	if activate {
-		// 激活时同步写 codely-creds.json（让 auth/quota 老链路零改动读取）
-		if err := creds.SaveCreds(); err != nil {
-			return "", "", err
-		}
 		r.clearCaches()
 	}
 	if pool != nil {
 		pool.ReloadPool()
 	}
 	return slug, ts.UTC().Format(time.RFC3339), nil
+}
+
+// restoreActivationLocked 把激活凭据回滚到 prevCurrent（SaveAccount 的 saveIndex 失败路径）。
+// 持 r.mu 调用；LoadAccountCreds 为无锁文件读，锁内调用安全。prevCurrent 为空（此前无激活
+// 账号）则删除激活凭据，回到"未激活"一致态。尽力而为：回滚自身失败只记日志。
+func (r *Registry) restoreActivationLocked(prevCurrent string) {
+	if prevCurrent == "" {
+		if err := os.Remove(oauth.CredsFile); err != nil && !os.IsNotExist(err) {
+			log.Printf("[account] 回滚激活凭据（删除 codely-creds.json）失败: %v", err)
+		}
+		return
+	}
+	creds := r.LoadAccountCreds(prevCurrent)
+	if creds == nil {
+		log.Printf("[account] 回滚激活凭据失败：账号 %s 凭据不可读", prevCurrent)
+		return
+	}
+	creds.SavedAt = time.Now().UTC().Format(time.RFC3339)
+	if err := creds.SaveCreds(); err != nil {
+		log.Printf("[account] 回滚激活凭据到 %s 失败: %v", prevCurrent, err)
+	}
+}
+
+// SyncActivationCreds 仅当 slug 仍是当前激活账号时，把轮换后的凭据写入 codely-creds.json。
+// 持 r.mu 使"检查-写入"原子，杜绝网络窗口内切换账号后的串号（审查记录 P1-2）。
+// 账号已切换（正常情形，非故障）同样返回错误，由调用方决定是否记日志。
+func (r *Registry) SyncActivationCreds(slug string, creds *oauth.Creds) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.loadIndex().Current != slug {
+		return fmt.Errorf("激活账号已切换，跳过回写 %s 的轮换凭据", slug)
+	}
+	return creds.SaveCreds()
+}
+
+// SyncCurrentFromActivation 把激活凭据（codely-creds.json）同步回 accounts/<当前>.json。
+// 全局链轮换后 per-slug 库会反向陈旧（其 refresh_token 已被作废，池路径下次刷新必败，
+// 审查记录 P1-4）。仅在"全局刷新刚成功"的时点经 oauth.OnGlobalRefreshed 调用——此刻
+// 激活库必为最新；refresh_token 已一致（无轮换/已同步）则跳过，防覆盖池路径的更新。
+func (r *Registry) SyncCurrentFromActivation() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cur := r.loadIndex().Current
+	if cur == "" {
+		return
+	}
+	act := oauth.LoadCreds()
+	if act == nil || act.RefreshToken == "" {
+		return
+	}
+	var perSlug oauth.Creds
+	if readJSON(accountFilePath(cur), &perSlug) && perSlug.RefreshToken == act.RefreshToken {
+		return // 已一致
+	}
+	act.Source = "" // loadCreds 的归一化元信息不落 per-slug 文件
+	act.SavedAt = time.Now().UTC().Format(time.RFC3339)
+	if err := writeJSON(accountFilePath(cur), act); err != nil {
+		log.Printf("[account] 激活凭据同步回 %s 失败: %v", cur, err)
+	}
+}
+
+// SyncCredsByIdentity 按 UserID/TeamID 身份把轮换后的凭据回写到其所属的 per-slug 文件。
+// 全局链轮换遇激活切换时，激活文件不可写（防串号），但新 refresh_token 仍必须落到
+// 正确账号——否则该账号旧 token 已被作废，下次刷新必败（账号刷废，审查记录 P1-5）。
+func (r *Registry) SyncCredsByIdentity(creds *oauth.Creds) error {
+	if creds == nil || creds.UserID == "" {
+		return fmt.Errorf("凭据缺少 user_id，无法定位所属账号")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	idx := r.loadIndex()
+	for slug, meta := range idx.Accounts {
+		if meta.UserID != creds.UserID {
+			continue
+		}
+		if meta.TeamID != "" && creds.TeamID != "" && meta.TeamID != creds.TeamID {
+			continue
+		}
+		creds.SavedAt = time.Now().UTC().Format(time.RFC3339)
+		return writeJSON(accountFilePath(slug), creds)
+	}
+	return fmt.Errorf("未找到 user_id=%s 的账号，轮换凭据无法落盘", creds.UserID)
 }
 
 // LoadAccountCreds 读取某账号的完整凭据（不存在返回 nil）。对标 loadAccountCreds。
@@ -497,7 +589,13 @@ func (r *Registry) ActivateAccount(name string, pool PoolReloader) (Account, str
 		// 逻辑审查 P0：预取途中 401 刷新轮换了 refresh_token——激活态需同时回写
 		// accounts/<slug>.json 与 codely-creds.json（全局链路共用后者），best-effort
 		_, _, _ = r.SaveAccount(slug, updated, false, nil)
-		_ = updated.SaveCreds()
+		// 审查记录 P1-2：回写激活文件前核验仍是当前账号——预取窗口（最长 30s+）内
+		// 已切换到其他账号时，旧账号的轮换结果不得覆盖新账号的激活凭据（串号且无自愈）
+		if r.GetCurrentName() == slug {
+			if err := r.SyncActivationCreds(slug, updated); err != nil {
+				log.Printf("[account] 激活凭据回写失败: %v", err)
+			}
+		}
 	}
 	acct := Account{
 		Name:     slug,

@@ -74,6 +74,9 @@ func main() {
 
 	// ---- 装配全部包 ----
 	reg := account.NewRegistry()
+	// 审查记录 P1-4：全局刷新成功后把激活库同步回 per-slug 库
+	//（oauth 不能 import account，经 hook 倒置依赖；未注入时全局刷新行为不变）
+	oauth.OnGlobalRefreshed = reg.SyncCurrentFromActivation
 	b := balancer.NewBalancer(reg)
 	sec := security.New()
 	q := quota.New(reg)

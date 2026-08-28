@@ -48,28 +48,36 @@ func (b *Balancer) GetStatus() Status {
 	// 对只读状态视图可接受。
 	currentSlug := b.reg.GetCurrentName()
 
+	// 审查记录 P2 #19：锁内只做池/配置快照，文件 IO（LoadAccountCreds）移到锁外——
+	// 此前 WebUI 15s 轮询持全局最热锁 b.mu 逐账号读盘，慢盘上会阻塞所有 Pick
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	allSlugs := b.reg.ListSlugs()
+	type entry struct {
+		slug  string
+		state *AccountState
+	}
+	entries := make([]entry, 0, len(allSlugs))
+	for _, slug := range allSlugs {
+		if state := b.pool[slug]; state != nil {
+			entries = append(entries, entry{slug, state})
+		}
+	}
+	cfgSnap := b.config
+	cfgSnap.DisabledSlugs = append([]string(nil), b.config.DisabledSlugs...)
+	b.mu.Unlock()
 
 	var totalDaily, totalBilling float64
 	activeCount, coolingCount := 0, 0
-	accountsList := make([]AccountStatus, 0, len(allSlugs))
+	accountsList := make([]AccountStatus, 0, len(entries))
 
-	for _, slug := range allSlugs {
-		state := b.pool[slug]
-		if state == nil {
-			// 瞬时窗口：账号文件已写（缓存已失效、ListSlugs 已见）但写方的 ReloadPool
-			// 尚未同步进池——跳过该项，写方完成后自然出现
-			continue
-		}
-		meta := b.reg.LoadAccountCreds(slug)
-		q := state.QuotaSnapshotView()
+	for _, e := range entries {
+		slug := e.slug
+		meta := b.reg.LoadAccountCreds(slug) // 文件读无锁，锁外安全
+		q := e.state.QuotaSnapshotView()
 		daily := q.DailyRemaining()
 		billing := q.BillingRemaining()
-		isCooling := state.IsCooling()
-		isExcluded := containsStr(b.config.DisabledSlugs, slug)
+		isCooling := e.state.IsCooling()
+		isExcluded := containsStr(cfgSnap.DisabledSlugs, slug)
 
 		if !isExcluded {
 			if isCooling {
@@ -90,7 +98,7 @@ func (b *Balancer) GetStatus() Status {
 		var crMs int64
 		var crReason string
 		if isCooling {
-			crMs, crReason = state.CooldownInfo()
+			crMs, crReason = e.state.CooldownInfo()
 		}
 		acct := AccountStatus{
 			Slug:                slug,
@@ -103,7 +111,7 @@ func (b *Balancer) GetStatus() Status {
 			CooldownReason:      crReason,
 			DailyRemaining:      daily,
 			BillingRemaining:    billing,
-			Metrics:             state.MetricsSnapshot(),
+			Metrics:             e.state.MetricsSnapshot(),
 		}
 		accountsList = append(accountsList, acct)
 	}
@@ -113,8 +121,8 @@ func (b *Balancer) GetStatus() Status {
 
 	return Status{
 		OK:              true,
-		Enabled:         b.config.Enabled,
-		Mode:            b.config.Mode,
+		Enabled:         cfgSnap.Enabled,
+		Mode:            cfgSnap.Mode,
 		TotalAccounts:   len(allSlugs),
 		ActiveAccounts:  activeCount,
 		CoolingAccounts: coolingCount,
@@ -154,7 +162,7 @@ func metaUserID(c *oauth.Creds) string {
 	if c == nil {
 		return ""
 	}
-	return c.UserID
+	return string(c.UserID)
 }
 
 // timeNow 供测试替换。

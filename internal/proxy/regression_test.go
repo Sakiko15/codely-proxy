@@ -96,7 +96,7 @@ func buildTwoAccountHandler(t *testing.T, upstream http.HandlerFunc) (*Handler, 
 
 	mkAcc := func(slug, uid string, activate bool) {
 		exp := time.Now().UnixMilli() + 3600*1000
-		creds := &oauth.Creds{AccessToken: "tok-" + uid, RefreshToken: "ref-" + uid, UserID: uid, TeamID: "t" + uid, TeamName: "T" + uid, ExpiryDate: &exp}
+		creds := &oauth.Creds{AccessToken: "tok-" + uid, RefreshToken: "ref-" + uid, UserID: oauth.FlexString(uid), TeamID: "t" + uid, TeamName: "T" + uid, ExpiryDate: &exp}
 		if _, _, err := reg.SaveAccount(slug, creds, activate, nil); err != nil {
 			t.Fatalf("SaveAccount(%s): %v", slug, err)
 		}

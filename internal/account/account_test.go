@@ -31,7 +31,7 @@ func fakeCreds(userID, teamName string) *oauth.Creds {
 	return &oauth.Creds{
 		AccessToken:  "tok-" + userID,
 		RefreshToken: "ref-" + userID,
-		UserID:       userID,
+		UserID:       oauth.FlexString(userID),
 		TeamID:       "team-" + userID,
 		TeamName:     teamName,
 		ExpiryDate:   &exp,

@@ -184,6 +184,10 @@ func (q *Quota) FetchSnapshot(force bool) (*Snapshot, error) {
 		return nil, err
 	}
 	fp := account.CredFingerprint(creds)
+	// 审查记录 P2 #23：指纹掺当前 slug——同 user+team 的双 slug 账号切换时不互读缓存
+	if name := q.reg.GetCurrentName(); name != "" {
+		fp += "@" + name
+	}
 
 	q.mu.Lock()
 	now := time.Now().UnixMilli()
@@ -274,13 +278,4 @@ func (q *Quota) fetchFresh(creds *oauth.Creds, fp string) (*Snapshot, error) {
 	q.cache.fp = fp
 	q.mu.Unlock()
 	return snap, nil
-}
-
-// ClearCache 清空缓存（登录态切换后）。
-func (q *Quota) ClearCache() {
-	q.mu.Lock()
-	q.cache.ts = 0
-	q.cache.data = nil
-	q.cache.fp = ""
-	q.mu.Unlock()
 }

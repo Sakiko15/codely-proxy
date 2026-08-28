@@ -38,7 +38,7 @@ func addAccount(t *testing.T, reg *account.Registry, name, userID, team string, 
 	creds := &oauth.Creds{
 		AccessToken:  "tok-" + userID,
 		RefreshToken: "ref-" + userID,
-		UserID:       userID,
+		UserID:       oauth.FlexString(userID),
 		TeamID:       "team-" + userID,
 		TeamName:     team,
 		ExpiryDate:   &exp,

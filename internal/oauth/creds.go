@@ -43,14 +43,16 @@ func SetDataDir(dir string) {
 }
 
 // Creds 是一个 Codely 账号的 OAuth 凭据（与 PROTOCOL_SCHEMA.md §1 一致）。
-// 注意：JS 里 user_id 可 number 或 string，Go 统一用 string（FlexString 语义）。
+// 注意：JS 里 user_id 可 number 或 string，schema 规定 FlexString（审查记录 P2 #21：
+// 此前裸 string 与注释自称的"FlexString 语义"不符——数字 user_id 的 legacy/手编文件
+// 会让整条凭据链解析失败报"未找到凭据"）。
 type Creds struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token,omitempty"`
 	TokenType    string `json:"token_type,omitempty"` // 默认 "Bearer"
 	ExpiresIn    *int   `json:"expires_in,omitempty"`
 	ExpiryDate   *int64 `json:"expiry_date,omitempty"` // JS Date.now() 毫秒时间戳
-	UserID       string `json:"user_id,omitempty"`
+	UserID       FlexString `json:"user_id,omitempty"`
 	TeamID       string `json:"team_id,omitempty"`
 	TeamName     string `json:"team_name,omitempty"`
 	Source       string `json:"source,omitempty"` // 仅 loadCreds 归一化返回
@@ -109,14 +111,21 @@ func (c *Creds) IsExpiring() bool {
 // oauthClient 复用连接池，对标 codely-auth.js 用全局 fetch（复用 keep-alive）。
 // 性能审计 P4：原 httpClient/newUpstreamClient 已并入 http.go 的 HTTPClient（单一客户端 + 专用 Transport）。
 
-// postJSON 发 POST JSON 请求并解析 JSON 响应。ok 返回响应体字节，非 2xx 返回错误。
+// postJSON 发 POST JSON 请求并解析 JSON 响应。ok 返回响应体字节，非 2xx 返回错误
+//（带 CLI UA 与错误体摘要——审查记录 P2 #22：此前裸发 Go 默认 UA 且错误无上下文）。
 // 对标 JS 的 jsonFetch（captures status + first 300 chars）。
 func postJSON(url string, body any) ([]byte, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := HTTPClient.Post(url, "application/json", bytes.NewReader(payload))
+	req, err := http.NewRequest("POST", url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	applyCLIUA(req)
+	resp, err := HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -126,12 +135,12 @@ func postJSON(url string, body any) ([]byte, error) {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("HTTP %d（请重新登录: WebUI 添加账号）", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP %d: %s（请重新登录: WebUI 添加账号）", resp.StatusCode, BodySnippet(data))
 	}
 	return data, nil
 }
 
-// getJSON 发 GET 请求并读取 body，返回响应头（供状态码判断）。
+// getJSON 发 GET 请求并读取 body，返回响应头（供状态码判断）。带 CLI UA（#22）。
 func getJSON(url, bearer string) (int, []byte, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -141,6 +150,7 @@ func getJSON(url, bearer string) (int, []byte, error) {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
 	req.Header.Set("Accept", "application/json")
+	applyCLIUA(req)
 	resp, err := HTTPClient.Do(req)
 	if err != nil {
 		return 0, nil, err
@@ -180,18 +190,106 @@ func SaveCredsIfUnchanged(c *Creds, prevRefreshToken string) error {
 // oauth 不能 import account（会成环），故用 hook 倒置依赖；未注入（如单测）时无操作。
 var OnGlobalRefreshed func()
 
+// doRefresh 共享的单飞（审查记录 P2 #25）：以 refresh_token 为键——同一 token 的全局/
+// 按账号刷新去重合并（跨组件同账号并发轮换不再互踩、last-writer-wins 把败者 RT 落盘），
+// 不同 token 并行。结果统一 *Creds，避免共享时类型断言错位。
+func doRefresh(rt string, fn func() (*Creds, error)) (*Creds, error) {
+	v, err, _ := tokenRefreshFlight.Do("rt:"+rt, func() (any, error) { return fn() })
+	if err != nil {
+		return nil, err
+	}
+	return v.(*Creds), nil
+}
+
 // RefreshAccessToken 用当前激活账号的 refresh_token 换新 access_token（并发 Single-flight 防重）。
 // 对标 codely-auth.js refreshAccessToken。
 //
 // 成功时把新 access_token（及可能的 refresh_token）写回 CredsFile（仅当凭据来自本项目文件）。
 // 返回新 access_token。
 func RefreshAccessToken() (string, error) {
-	v, err, _ := tokenRefreshFlight.Do("refresh", func() (any, error) {
-		c := LoadCreds()
-		if c == nil || c.RefreshToken == "" {
-			return nil, errors.New("没有 refresh_token，请重新登录（WebUI 添加账号）")
+	c := LoadCreds()
+	if c == nil || c.RefreshToken == "" {
+		return "", errors.New("没有 refresh_token，请重新登录（WebUI 添加账号）")
+	}
+	prevRT := c.RefreshToken
+	updated, err := doRefresh(prevRT, func() (*Creds, error) { return refreshCredsFile(prevRT) })
+	if err != nil {
+		return "", err
+	}
+	return updated.AccessToken, nil
+}
+
+// refreshCredsFile 全局刷新本体：POST /auth/refresh → 更新凭据 → 守卫回写 codely-creds.json。
+// 仅在共享单飞内执行一次；合并进来的并发调用共享同一结果。
+func refreshCredsFile(prevRT string) (*Creds, error) {
+	c := LoadCreds()
+	if c == nil || c.RefreshToken != prevRT {
+		// 窗口内激活库已变化：不能以旧 token 的刷新结果覆盖新状态
+		return nil, ErrActivationChanged
+	}
+	resp, err := postJSON(Base+"/auth/refresh", map[string]string{"refresh_token": prevRT})
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token,omitempty"`
+		ExpiresIn    *int   `json:"expires_in,omitempty"`
+	}
+	if err := json.Unmarshal(resp, &r); err != nil {
+		return nil, fmt.Errorf("刷新响应解析失败: %w", err)
+	}
+	if r.AccessToken == "" {
+		return nil, errors.New("刷新响应中没有 access_token")
+	}
+	// 写回凭据文件（JS 仅当凭据来自 LOCAL_CREDS 才写；VPS 一律本项目文件）。
+	// 审查记录 P1-6：回写前以预刷新 refresh_token 核验激活库未被切换——网络窗口内
+	// 激活已切到其他账号时，旧账号的轮换结果不得覆盖新账号的激活凭据（串号且
+	// "下次 401 自愈"不成立：写入的 access_token 有效，永不触发 401）
+	c.AccessToken = r.AccessToken
+	if r.RefreshToken != "" {
+		c.RefreshToken = r.RefreshToken
+	}
+	c.ExpiryDate = expiryAfterRefresh(r.ExpiresIn)
+	if err := SaveCredsIfUnchanged(c, prevRT); err != nil {
+		if errors.Is(err, ErrActivationChanged) {
+			log.Printf("[oauth] 激活账号已切换，跳过轮换凭据回写（防串号）")
+			return c, nil
 		}
-		prevRT := c.RefreshToken
+		return nil, fmt.Errorf("保存刷新后凭据失败: %w", err)
+	}
+	if OnGlobalRefreshed != nil {
+		OnGlobalRefreshed()
+	}
+	return c, nil
+}
+
+// expiryAfterRefresh 由刷新响应的 expires_in 计算新过期时刻；上游省略时置 10 分钟短 TTL
+//（审查记录 P2 #26：沿用旧 ExpiryDate（已过期）会使 IsExpiring 恒真 → 每请求都刷新并
+// 轮换 refresh_token 的循环）。
+func expiryAfterRefresh(expiresIn *int) *int64 {
+	secs := 600
+	if expiresIn != nil && *expiresIn > 0 {
+		secs = *expiresIn
+	}
+	exp := time.Now().UnixMilli() + int64(secs)*1000
+	return &exp
+}
+
+// RefreshAccessTokenFor 刷新**指定账号**的 access_token（而非全局激活账号）。
+//
+// ⚠️ code-review #2：多账号路径（balancer 每账号 key 刷新、FetchQuota 401 重试）必须刷新
+// 该账号自己的 token，不能串到 codely-creds.json（当前激活账号）。返回更新后的 creds（含新
+// access_token/refresh_token/expiry），由调用方持久化到 accounts/<slug>.json。
+//
+// 不做跨账号 single-flight 的说明已由共享 doRefresh 取代：同一 refresh_token 的全局/
+// 按账号刷新在 tokenRefreshFlight 层合并（审查记录 P2 #25），不同 token 并行。
+// 刷新失败返回 nil+err；凭据不落盘，由调用方持久化到 accounts/<slug>.json。
+func RefreshAccessTokenFor(c *Creds) (*Creds, error) {
+	if c == nil || c.RefreshToken == "" {
+		return nil, errors.New("账号没有 refresh_token，请重新登录（WebUI 添加账号）")
+	}
+	return doRefresh(c.RefreshToken, func() (*Creds, error) {
 		resp, err := postJSON(Base+"/auth/refresh", map[string]string{"refresh_token": c.RefreshToken})
 		if err != nil {
 			return nil, err
@@ -207,72 +305,14 @@ func RefreshAccessToken() (string, error) {
 		if r.AccessToken == "" {
 			return nil, errors.New("刷新响应中没有 access_token")
 		}
-		// 写回凭据文件（JS 仅当凭据来自 LOCAL_CREDS 才写；VPS 一律本项目文件）。
-		// 审查记录 P1-6：回写前以预刷新 refresh_token 核验激活库未被切换——网络窗口内
-		// 激活已切到其他账号时，旧账号的轮换结果不得覆盖新账号的激活凭据（串号且
-		// "下次 401 自愈"不成立：写入的 access_token 有效，永不触发 401）
-		c.AccessToken = r.AccessToken
+		updated := *c
+		updated.AccessToken = r.AccessToken
 		if r.RefreshToken != "" {
-			c.RefreshToken = r.RefreshToken
+			updated.RefreshToken = r.RefreshToken
 		}
-		if r.ExpiresIn != nil {
-			exp := time.Now().UnixMilli() + int64(*r.ExpiresIn)*1000
-			c.ExpiryDate = &exp
-		}
-		if err := SaveCredsIfUnchanged(c, prevRT); err != nil {
-			if errors.Is(err, ErrActivationChanged) {
-				log.Printf("[oauth] 激活账号已切换，跳过轮换凭据回写（防串号）")
-				return r.AccessToken, nil
-			}
-			return nil, fmt.Errorf("保存刷新后凭据失败: %w", err)
-		}
-		if OnGlobalRefreshed != nil {
-			OnGlobalRefreshed()
-		}
-		return r.AccessToken, nil
+		updated.ExpiryDate = expiryAfterRefresh(r.ExpiresIn)
+		return &updated, nil
 	})
-	if err != nil {
-		return "", err
-	}
-	return v.(string), nil
-}
-
-// RefreshAccessTokenFor 刷新**指定账号**的 access_token（而非全局激活账号）。
-//
-// ⚠️ code-review #2：多账号路径（balancer 每账号 key 刷新、FetchQuota 401 重试）必须刷新
-// 该账号自己的 token，不能串到 codely-creds.json（当前激活账号）。返回更新后的 creds（含新
-// access_token/refresh_token/expiry），由调用方持久化到 accounts/<slug>.json。
-//
-// 不做跨账号 single-flight（每账号并发由调用方/单飞层保证），刷新失败返回 nil+err。
-func RefreshAccessTokenFor(c *Creds) (*Creds, error) {
-	if c == nil || c.RefreshToken == "" {
-		return nil, errors.New("账号没有 refresh_token，请重新登录（WebUI 添加账号）")
-	}
-	resp, err := postJSON(Base+"/auth/refresh", map[string]string{"refresh_token": c.RefreshToken})
-	if err != nil {
-		return nil, err
-	}
-	var r struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token,omitempty"`
-		ExpiresIn    *int   `json:"expires_in,omitempty"`
-	}
-	if err := json.Unmarshal(resp, &r); err != nil {
-		return nil, fmt.Errorf("刷新响应解析失败: %w", err)
-	}
-	if r.AccessToken == "" {
-		return nil, errors.New("刷新响应中没有 access_token")
-	}
-	updated := *c
-	updated.AccessToken = r.AccessToken
-	if r.RefreshToken != "" {
-		updated.RefreshToken = r.RefreshToken
-	}
-	if r.ExpiresIn != nil {
-		exp := time.Now().UnixMilli() + int64(*r.ExpiresIn)*1000
-		updated.ExpiryDate = &exp
-	}
-	return &updated, nil
 }
 
 // GetAccessToken 拿一个可用的 access_token（必要时自动刷新）。对标 codely-auth.js getAccessToken。
@@ -282,11 +322,15 @@ func GetAccessToken() (*Creds, error) {
 		return nil, errors.New("未找到登录凭据。请先在 WebUI 添加账号")
 	}
 	if c.IsExpiring() {
-		t, err := RefreshAccessToken()
-		if err != nil {
+		if _, err := RefreshAccessToken(); err != nil {
 			return nil, err
 		}
-		c.AccessToken = t
+		// 审查记录 P2 #24：刷新后重读文件——轮换后的新 refresh_token/expiry 随 creds
+		// 交还调用方（此前仅回填 AccessToken，调用方持过期 RT，同请求内再遇 401 必败）。
+		// 守卫跳过（激活已切换）场景下重读到的即新当前账号凭据，语义亦正确。
+		if fresh := LoadCreds(); fresh != nil {
+			return fresh, nil
+		}
 	}
 	return c, nil
 }

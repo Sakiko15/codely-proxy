@@ -209,7 +209,7 @@ func AutoName(creds *oauth.Creds) string {
 	if creds != nil && creds.UserID != "" {
 		// 逻辑审查 P2：必须过 Slugify——大写 UserID 直接拼接会在 Linux 上落盘
 		// user-AB12.json，而查找侧恒经 Slugify 小写化 → 账号无法激活/刷新
-		if s := Slugify("user-" + creds.UserID); s != "" {
+		if s := Slugify("user-" + string(creds.UserID)); s != "" {
 			return s
 		}
 	}
@@ -225,7 +225,7 @@ func accountFilePath(slug string) string {
 func metaFromCreds(creds *oauth.Creds, savedAt int64) AccountIndexEntry {
 	return AccountIndexEntry{
 		SavedAt:  time.UnixMilli(savedAt).UTC().Format(time.RFC3339),
-		UserID:   creds.UserID,
+		UserID:   string(creds.UserID),
 		TeamID:   creds.TeamID,
 		TeamName: creds.TeamName,
 		Source:   creds.Source,
@@ -371,7 +371,7 @@ func (r *Registry) GetCurrentMeta() *Account {
 	if creds != nil {
 		return &Account{
 			Name:     AutoName(creds),
-			UserID:   creds.UserID,
+			UserID:   string(creds.UserID),
 			TeamID:   creds.TeamID,
 			TeamName: creds.TeamName,
 			IsCurrent: true,
@@ -390,7 +390,7 @@ func CredFingerprint(creds *oauth.Creds) string {
 	if c == nil {
 		c = &oauth.Creds{}
 	}
-	s := strings.Join([]string{c.UserID, c.TeamID, c.TeamName}, "|")
+	s := strings.Join([]string{string(c.UserID), c.TeamID, c.TeamName}, "|")
 	h := sha1.Sum([]byte(s))
 	return hex.EncodeToString(h[:])[:12]
 }
@@ -525,7 +525,7 @@ func (r *Registry) SyncCredsByIdentity(creds *oauth.Creds) error {
 	defer r.mu.Unlock()
 	idx := r.loadIndex()
 	for slug, meta := range idx.Accounts {
-		if meta.UserID != creds.UserID {
+		if meta.UserID != string(creds.UserID) {
 			continue
 		}
 		if meta.TeamID != "" && creds.TeamID != "" && meta.TeamID != creds.TeamID {
@@ -609,7 +609,7 @@ func (r *Registry) ActivateAccount(name string, pool PoolReloader) (Account, str
 		Name:     slug,
 		TeamID:   creds.TeamID,
 		TeamName: creds.TeamName,
-		UserID:   creds.UserID,
+		UserID:   string(creds.UserID),
 		IsCurrent: true,
 	}
 	return acct, key, nil

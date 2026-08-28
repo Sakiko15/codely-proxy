@@ -98,7 +98,7 @@ func fetchAPIKeyOnce(creds *Creds) (*apiKeyResult, error) {
 			return &apiKeyResult{creds: updated}, err
 		}
 		if status < 200 || status >= 300 {
-			return &apiKeyResult{creds: updated}, fmt.Errorf("换取密钥失败: HTTP %d（请重新登录: WebUI 添加账号）", status)
+			return &apiKeyResult{creds: updated}, fmt.Errorf("换取密钥失败: HTTP %d: %s（请重新登录: WebUI 添加账号）", status, BodySnippet(data))
 		}
 		var j2 CliAPIKeyResponse
 		if err := json.Unmarshal(data, &j2); err != nil {
@@ -110,7 +110,7 @@ func fetchAPIKeyOnce(creds *Creds) (*apiKeyResult, error) {
 		return &apiKeyResult{creds: updated, key: j2.CliAPIKey}, nil
 	}
 	if status < 200 || status >= 300 {
-		return &apiKeyResult{creds: c}, fmt.Errorf("换取密钥失败: HTTP %d", status)
+		return &apiKeyResult{creds: c}, fmt.Errorf("换取密钥失败: HTTP %d: %s", status, BodySnippet(data))
 	}
 	var j CliAPIKeyResponse
 	if err := json.Unmarshal(data, &j); err != nil {

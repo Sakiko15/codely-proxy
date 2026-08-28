@@ -360,7 +360,7 @@ func (f *LoginFlow) complete(authorizationCode, suggestedName string) (*Account,
 		TokenType:    tok.TokenType,
 		ExpiresIn:    &expiresIn,
 		ExpiryDate:   &expiry,
-		UserID:       userId,
+		UserID:       oauth.FlexString(userId),
 		TeamID:       teamId,
 		TeamName:     teamName,
 	}

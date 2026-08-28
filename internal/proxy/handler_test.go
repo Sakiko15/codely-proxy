@@ -319,7 +319,7 @@ func TestHandlerUpstreamErrorNoDoubleAttempt(t *testing.T) {
 func addExtraAccount(t *testing.T, h *Handler, slug string) {
 	t.Helper()
 	exp := time.Now().UnixMilli() + 3600*1000
-	creds := &oauth.Creds{AccessToken: "tok-" + slug, RefreshToken: "ref-" + slug, UserID: slug, TeamID: "t-" + slug, TeamName: slug, ExpiryDate: &exp}
+	creds := &oauth.Creds{AccessToken: "tok-" + slug, RefreshToken: "ref-" + slug, UserID: oauth.FlexString(slug), TeamID: "t-" + slug, TeamName: slug, ExpiryDate: &exp}
 	if _, _, err := h.Registry.SaveAccount(slug, creds, false, nil); err != nil {
 		t.Fatalf("SaveAccount(%s): %v", slug, err)
 	}

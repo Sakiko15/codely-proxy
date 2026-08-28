@@ -171,10 +171,11 @@ func (b *Balancer) Pick(preferredSlug string, excluded map[string]bool) (*Accoun
 	// 读配置快照（避免与 UpdateConfig 并发写 b.config 的竞态；getAvailableCandidates 内部再读一次）
 	cfg := b.GetConfig()
 
-	// 1. 客户端显式指定账号
+	// 1. 客户端显式指定账号。禁用账号不可被钉住（审查记录 P2 #17：此前仅查 excluded，
+	// 管理员禁用的账号可被 X-Codely-Account 继续打入；冷却豁免维持显式指定语义）
 	if preferredSlug != "" {
 		slug := account.Slugify(preferredSlug)
-		if s := b.state(slug); s != nil && !excluded[slug] {
+		if s := b.state(slug); s != nil && !excluded[slug] && !containsStr(cfg.DisabledSlugs, slug) {
 			return s, nil
 		}
 	}
@@ -322,6 +323,11 @@ var saveMu sync.Mutex
 // patch 支持：enabled / mode / disabledSlugs / toggleSlug。
 // 持久化失败返回非 nil error（内存配置已生效，err 语义="已生效但未落盘"）。
 func (b *Balancer) UpdateConfig(patch map[string]any) (Config, error) {
+	// 审查记录 P2 #16：saveMu 外提至读改写之前——此前"内存提交（b.mu 内）→ 解锁 →
+	// 抢 saveMu 落盘"两段式下，并发 UpdateConfig 的落盘次序可与内存生效次序颠倒，
+	// 磁盘永久回退到旧配置。写路径低频，整段串行无碍。锁序 saveMu→b.mu（无反向边）。
+	saveMu.Lock()
+	defer saveMu.Unlock()
 	b.mu.Lock()
 	if v, ok := patch["enabled"].(bool); ok {
 		b.config.Enabled = v
@@ -352,11 +358,9 @@ func (b *Balancer) UpdateConfig(patch map[string]any) (Config, error) {
 	snap.DisabledSlugs = append([]string(nil), b.config.DisabledSlugs...) // 深拷贝（逻辑审查 P1：切片别名隔离）
 	b.mu.Unlock()
 
-	// 写盘移出锁（性能审计 P7a）：balancer.json 写入不再阻塞并发 Pick 的 b.mu 关键区
-	saveMu.Lock()
-	err := saveConfig(snap)
-	saveMu.Unlock()
-	if err != nil {
+	// 写盘仍在外层 saveMu 临界区内（次序保证见函数头）；Pick 只取 b.mu 不碰 saveMu，
+	// 保留原"落盘不阻塞 Pick"的性能考量
+	if err := saveConfig(snap); err != nil {
 		// 逻辑审查 P1：写盘失败必须上报——否则 WebUI 报成功，重启后配置回默认
 		return snap, fmt.Errorf("配置已生效但持久化失败: %v", err)
 	}

@@ -373,8 +373,16 @@ func (s *AccountState) FetchQuota(force bool) *QuotaSnapshot {
 		}
 		return cache
 	}
-	// 2. 首次冷启动或强制 → 同步拉取
-	return doFetch()
+	// 2. 首次冷启动或强制 → 同步拉取。单飞去重（审查记录 P2 #20）：运行期新增账号的
+	// 首波并发请求此前会各自打一轮上游 usage/summary；与后台刷新共用 "quota" 键，
+	// 后台刷新在途时冷启动直接共享其结果
+	v, err, _ := s.quotaFlight.Do("quota", func() (any, error) {
+		return doFetch(), nil
+	})
+	if err != nil {
+		return nil
+	}
+	return v.(*QuotaSnapshot)
 }
 
 // MetricsSnapshot 返回账号调用统计（线程安全读）。

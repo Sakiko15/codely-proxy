@@ -251,7 +251,11 @@ func (s *Server) handleBalancerConfig(rw http.ResponseWriter, req *http.Request)
 		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid json"})
 		return
 	}
-	cfg := s.Balancer.UpdateConfig(patch)
+	cfg, err := s.Balancer.UpdateConfig(patch)
+	if err != nil {
+		writeJSON(rw, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
 	writeJSON(rw, http.StatusOK, map[string]any{"ok": true, "enabled": cfg.Enabled, "mode": cfg.Mode})
 }
 
@@ -273,6 +277,9 @@ func (s *Server) handleSecurityConfig(rw http.ResponseWriter, req *http.Request)
 		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid json"})
 		return
 	}
-	s.Security.SetProxyKey(body.APIKey)
+	if err := s.Security.SetProxyKey(body.APIKey); err != nil {
+		writeJSON(rw, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
 	writeJSON(rw, http.StatusOK, s.Security.GetStatus())
 }

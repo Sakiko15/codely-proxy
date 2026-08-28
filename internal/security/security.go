@@ -11,6 +11,7 @@ package security
 
 import (
 	"crypto/subtle"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -109,19 +110,24 @@ func (s *Security) ValidKeys() []string {
 func (s *Security) AuthRequired() bool { return len(s.ValidKeys()) > 0 }
 
 // SetProxyKey 持久化保存自定义 Key（WebUI 在线配置）。空 = 清空恢复免密。
-// 对标 setProxyKey。
-func (s *Security) SetProxyKey(rawKeyString string) {
+// 对标 setProxyKey。逻辑审查 P1：写盘失败必须上报——否则 WebUI 报成功、
+// 重启后 Key 消失、/v1 回到免密模式（fail-open）。
+func (s *Security) SetProxyKey(rawKeyString string) error {
 	val := strings.TrimSpace(rawKeyString)
 	if val == "" {
-		_ = os.Remove(ProxyKeyFile)
+		if err := os.Remove(ProxyKeyFile); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("清除 key 文件失败: %w", err)
+		}
 		s.mu.Lock()
 		s.cachedKeys = nil
 		s.lastMtime = 0
 		s.mu.Unlock()
-		return
+		return nil
 	}
 	_ = os.MkdirAll(DataDir, 0o755)
-	_ = atomicfile.Write(ProxyKeyFile, []byte(val+"\n"), 0o600)
+	if err := atomicfile.Write(ProxyKeyFile, []byte(val+"\n"), 0o600); err != nil {
+		return fmt.Errorf("持久化 key 失败: %w", err)
+	}
 	if st, err := os.Stat(ProxyKeyFile); err == nil {
 		s.mu.Lock()
 		s.lastMtime = st.ModTime().UnixMilli()
@@ -133,6 +139,7 @@ func (s *Security) SetProxyKey(rawKeyString string) {
 		s.cachedKeys[i] = strings.TrimSpace(s.cachedKeys[i])
 	}
 	s.mu.Unlock()
+	return nil
 }
 
 // Validate 校验客户端请求是否合法。对标 validateRequestAuth。

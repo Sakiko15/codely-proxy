@@ -76,8 +76,8 @@ func loadConfig() Config {
 	return cfg
 }
 
-func saveConfig(cfg Config) {
-	writeJSON(ConfigFile, cfg)
+func saveConfig(cfg Config) error {
+	return writeJSON(ConfigFile, cfg)
 }
 
 // readJSON / writeJSON 与 account 包一致（本地实现避免包循环）。

@@ -290,7 +290,11 @@ func (b *Balancer) MarkFailure(slug string, statusCode int, errorMsg string) {
 func (b *Balancer) GetConfig() Config {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.config
+	// 逻辑审查 P1：DisabledSlugs 深拷贝——结构体浅拷贝共享切片底层数组，
+	// 消费方（Pick/Preheat/GetStatus）与并发 toggleSlug 的写会竞争
+	cfg := b.config
+	cfg.DisabledSlugs = append([]string(nil), b.config.DisabledSlugs...)
+	return cfg
 }
 
 // saveMu 串行化配置落盘（性能审计 P7a：写盘已移出 b.mu，用它保持并发 UpdateConfig 的落盘先后序）。
@@ -298,7 +302,8 @@ var saveMu sync.Mutex
 
 // UpdateConfig 更新负载均衡配置（WebUI /balancer/config）。对标 updateBalancerConfig。
 // patch 支持：enabled / mode / disabledSlugs / toggleSlug。
-func (b *Balancer) UpdateConfig(patch map[string]any) Config {
+// 持久化失败返回非 nil error（内存配置已生效，err 语义="已生效但未落盘"）。
+func (b *Balancer) UpdateConfig(patch map[string]any) (Config, error) {
 	b.mu.Lock()
 	if v, ok := patch["enabled"].(bool); ok {
 		b.config.Enabled = v
@@ -326,13 +331,18 @@ func (b *Balancer) UpdateConfig(patch map[string]any) Config {
 		}
 	}
 	snap := b.config // 配置快照（结构体拷贝，Pick 侧读快照的既有模式）
+	snap.DisabledSlugs = append([]string(nil), b.config.DisabledSlugs...) // 深拷贝（逻辑审查 P1：切片别名隔离）
 	b.mu.Unlock()
 
 	// 写盘移出锁（性能审计 P7a）：balancer.json 写入不再阻塞并发 Pick 的 b.mu 关键区
 	saveMu.Lock()
-	saveConfig(snap)
+	err := saveConfig(snap)
 	saveMu.Unlock()
-	return snap
+	if err != nil {
+		// 逻辑审查 P1：写盘失败必须上报——否则 WebUI 报成功，重启后配置回默认
+		return snap, fmt.Errorf("配置已生效但持久化失败: %v", err)
+	}
+	return snap, nil
 }
 
 func containsStr(list []string, s string) bool {
@@ -345,7 +355,9 @@ func containsStr(list []string, s string) bool {
 }
 
 func removeStr(list []string, s string) []string {
-	out := list[:0]
+	// 逻辑审查 P1：不能原地过滤（list[:0] 复用底层数组）——并发读者（GetConfig/快照序列化）
+	// 与本写共享内存会构成数据竞争，且已取走的"快照"内容被穿写
+	out := make([]string, 0, len(list))
 	for _, v := range list {
 		if v != s {
 			out = append(out, v)

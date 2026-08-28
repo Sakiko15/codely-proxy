@@ -4,8 +4,29 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 )
+
+func TestSetProxyKeyPersistError(t *testing.T) {
+	// 逻辑审查 P1：写盘失败必须上报且不更新内存缓存（此前静默丢错 → 重启后 /v1 fail-open）
+	s := setup(t)
+	// ProxyKeyFile 指向"文件之下"的非法路径 → MkdirAll/Write 必败
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatalf("blocker: %v", err)
+	}
+	old := ProxyKeyFile
+	ProxyKeyFile = filepath.Join(blocker, "sub", "proxy-key.txt")
+	t.Cleanup(func() { ProxyKeyFile = old })
+
+	if err := s.SetProxyKey("sk-a"); err == nil {
+		t.Fatalf("写盘失败应返回错误")
+	}
+	if s.AuthRequired() {
+		t.Fatalf("写盘失败不应更新内存缓存")
+	}
+}
 
 func TestReadKeyFileFailClosed(t *testing.T) {
 	// 稳定性审计 F6：瞬时读取错误应沿用缓存（fail-closed），而非静默关闭鉴权

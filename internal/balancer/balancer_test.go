@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -417,7 +418,7 @@ func TestBalancerPreheatKeysOnly(t *testing.T) {
 	presetKeyFile(t, "a")
 	presetKeyFile(t, "b")
 	bal := NewBalancer(reg)
-	_ = bal.UpdateConfig(map[string]any{"enabled": false}) // 关闭 LB → 不预热 quota
+	_, _ = bal.UpdateConfig(map[string]any{"enabled": false}) // 关闭 LB → 不预热 quota
 
 	bal.Preheat()
 	if got := atomic.LoadInt32(&netCalls); got != 0 {
@@ -515,6 +516,102 @@ func TestGetStatusConcurrentWithAccountSwitch(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("GetStatus 与 ActivateAccount 死锁（P0 锁序未修复）")
+	}
+}
+
+func TestRemoveStrNoAlias(t *testing.T) {
+	// 逻辑审查 P1：removeStr 不得原地过滤——入参切片必须保持原样
+	in := []string{"a", "b", "a", "c"}
+	out := removeStr(in, "a")
+	if len(out) != 2 || out[0] != "b" || out[1] != "c" {
+		t.Fatalf("removeStr 结果错误: %v", out)
+	}
+	if len(in) != 4 || in[0] != "a" || in[1] != "b" || in[2] != "a" || in[3] != "c" {
+		t.Fatalf("removeStr 穿写了入参: %v", in)
+	}
+}
+
+func TestUpdateConfigConcurrent(t *testing.T) {
+	// 逻辑审查 P1：UpdateConfig/GetConfig/GetStatus 并发下的 DisabledSlugs 别名——
+	// 正确性由本测试驱动、由 -race 背书
+	reg := setup(t)
+	addAccount(t, reg, "a", "1", "A", 0, 0, true)
+	addAccount(t, reg, "b", "2", "B", 0, 0, false)
+	bal := NewBalancer(reg)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		slugs := []string{"a", "b"}
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+				_, _ = bal.UpdateConfig(map[string]any{"toggleSlug": slugs[i%2]})
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = bal.GetConfig()
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = bal.GetStatus()
+			}
+		}
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("配置并发压测未退出")
+	}
+}
+
+func TestUpdateConfigPersistError(t *testing.T) {
+	// 逻辑审查 P1：写盘失败必须上报（此前静默丢错 → WebUI 报成功、重启后配置回默认）
+	reg := setup(t)
+	addAccount(t, reg, "a", "1", "A", 0, 0, true)
+	bal := NewBalancer(reg)
+
+	// ConfigFile 指向"文件之下"的非法路径 → MkdirAll/Write 必败
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatalf("blocker: %v", err)
+	}
+	oldCfg := ConfigFile
+	ConfigFile = filepath.Join(blocker, "sub", "balancer.json")
+	t.Cleanup(func() { ConfigFile = oldCfg })
+
+	cfg, err := bal.UpdateConfig(map[string]any{"mode": "round-robin"})
+	if err == nil {
+		t.Fatalf("写盘失败应返回错误")
+	}
+	if cfg.Mode != "round-robin" {
+		t.Fatalf("内存配置应已生效, got %+v", cfg)
+	}
+	if got := bal.GetConfig().Mode; got != "round-robin" {
+		t.Fatalf("GetConfig 应反映已生效的内存配置, got %q", got)
 	}
 }
 

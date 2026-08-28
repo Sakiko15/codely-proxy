@@ -42,11 +42,16 @@ type Status struct {
 // GetStatus 返回负载均衡状态（供 WebUI 与 API）。对标 getBalancerStatus。
 func (b *Balancer) GetStatus() Status {
 	b.syncPool()
+	// ⚠️ 锁序约束（逻辑审查 P0）：持 b.mu 期间禁止调用任何会取 r.mu 的注册表方法
+	//（GetCurrentName 等）——SaveAccount/ActivateAccount 持 r.mu 期间会经 ReloadPool
+	// 取 b.mu，双向并发即 ABBA 死锁。注册表读取先于加锁完成；current 的瞬时陈旧
+	// 对只读状态视图可接受。
+	currentSlug := b.reg.GetCurrentName()
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	allSlugs := b.reg.ListSlugs()
-	currentSlug := b.reg.GetCurrentName()
 
 	var totalDaily, totalBilling float64
 	activeCount, coolingCount := 0, 0
@@ -54,6 +59,11 @@ func (b *Balancer) GetStatus() Status {
 
 	for _, slug := range allSlugs {
 		state := b.pool[slug]
+		if state == nil {
+			// 瞬时窗口：账号文件已写（缓存已失效、ListSlugs 已见）但写方的 ReloadPool
+			// 尚未同步进池——跳过该项，写方完成后自然出现
+			continue
+		}
 		meta := b.reg.LoadAccountCreds(slug)
 		q := state.QuotaSnapshotView()
 		daily := q.DailyRemaining()

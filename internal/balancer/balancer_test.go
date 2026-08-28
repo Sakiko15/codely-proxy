@@ -463,6 +463,61 @@ func TestBalancerPreheatQuota(t *testing.T) {
 	}
 }
 
+func TestGetStatusConcurrentWithAccountSwitch(t *testing.T) {
+	// 逻辑审查 P0：GetStatus 曾持 b.mu 调 GetCurrentName（r.mu），与 ActivateAccount 的
+	// r.mu→ReloadPool（b.mu）构成 ABBA 死锁。压力循环 + watchdog：修复后双方持续推进；
+	// watchdog 触发（5s 未退出）即 tripwire 成立
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nf", 404) // 切换的 key 预取快速失败（best-effort），不影响锁测试
+	}))
+	defer srv.Close()
+	oldBase := oauth.Base
+	oauth.Base = srv.URL
+	t.Cleanup(func() { oauth.Base = oldBase })
+
+	reg := setup(t)
+	addAccount(t, reg, "a", "1", "A", 0, 0, true)
+	addAccount(t, reg, "b", "2", "B", 0, 0, false)
+	bal := NewBalancer(reg)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = bal.GetStatus()
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		slugs := []string{"a", "b"}
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+				_, _, _ = reg.ActivateAccount(slugs[i%2], bal)
+			}
+		}
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("GetStatus 与 ActivateAccount 死锁（P0 锁序未修复）")
+	}
+}
+
 func TestMarkFailureTruncatesReason(t *testing.T) {
 	// 性能审计 P5：大错误体只在前 2KB 做关键词判定；冷却原因截断至 256 字节——
 	// 64KB 错误体不再整段驻留内存态/进状态轮询

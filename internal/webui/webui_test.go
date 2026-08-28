@@ -149,11 +149,20 @@ func TestAccountsAPI(t *testing.T) {
 	var j struct {
 		OK      bool `json:"ok"`
 		Current string
-		List    []struct{ Name string }
+		List    []map[string]any
 	}
 	_ = json.Unmarshal(rw.Body.Bytes(), &j)
 	if !j.OK || j.Current != "web-org" || len(j.List) != 1 {
 		t.Fatalf("accounts 响应异常: %s", rw.Body.String())
+	}
+	// 契约（逻辑审查 P0）：wire 键必须为小驼峰——前端按 a.name/a.isCurrent 消费；
+	// 此前 Account 无 json tag 输出大写键，前端整体失灵且被本测试的大小写不敏感掩盖
+	first := j.List[0]
+	if first["name"] != "web-org" {
+		t.Fatalf("accounts wire 键应为小驼峰 name: %s", rw.Body.String())
+	}
+	if v, _ := first["isCurrent"].(bool); !v {
+		t.Fatalf("accounts wire 键应为小驼峰 isCurrent: %s", rw.Body.String())
 	}
 }
 

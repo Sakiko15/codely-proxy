@@ -79,13 +79,13 @@ type Index struct {
 
 // Account 是注册表 + 完整凭据的聚合视图（对外 API / WebUI 消费）。
 type Account struct {
-	Name     string
-	SavedAt  string
-	UserID   string
-	TeamID   string
-	TeamName string
-	Source   string
-	IsCurrent bool
+	Name      string `json:"name"`
+	SavedAt   string `json:"savedAt,omitempty"`
+	UserID    string `json:"userId,omitempty"`
+	TeamID    string `json:"teamId,omitempty"`
+	TeamName  string `json:"teamName,omitempty"`
+	Source    string `json:"source,omitempty"`
+	IsCurrent bool   `json:"isCurrent"`
 	// Creds 是该账号的完整凭据（从 accounts/<slug>.json 读；列表场景可能为 nil）。
 	Creds *oauth.Creds `json:"-"`
 }

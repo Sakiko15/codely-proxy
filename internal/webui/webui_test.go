@@ -266,6 +266,29 @@ func TestWebUILoginURLCopyable(t *testing.T) {
 	}
 }
 
+func TestWebUIFrontendStateFixes(t *testing.T) {
+	// 前端审查 F1-F7+S2：前端无自动化测试，以 embed 内容钉死关键修复标记防回归
+	data, err := webFS.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatalf("读取 embed: %v", err)
+	}
+	s := string(data)
+	for _, c := range []struct{ needle, why string }{
+		{"初始管理密码", "F1 首屏生成密码展示（登录弹窗内）"},
+		{"r.warning", "F2 删除结果 warning 透传"},
+		{"dev-start-btn", "F3 发起授权按钮防双击"},
+		{"e.message === '未登录'", "F4 轮询会话过期终止"},
+		{"'/api/login'", "F6 登录 401 不触发 showLogin"},
+		{"备注名仅支持字母数字", "F7 备注名预校验"},
+		{"/^https?:/i", "S2 授权链接 scheme 加固"},
+		{"加载失败", "F5 加载错误态"},
+	} {
+		if !strings.Contains(s, c.needle) {
+			t.Fatalf("index.html 应包含 %q（%s 回归）", c.needle, c.why)
+		}
+	}
+}
+
 func TestAuthPartialEnv(t *testing.T) {
 	// 逻辑审查 P1：WEBUI_USER/WEBUI_PASS 只设其一不再整体回退随机
 	a := NewAuth("", "mypass")

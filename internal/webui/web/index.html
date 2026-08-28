@@ -91,7 +91,7 @@
       <p class="muted" style="margin-bottom:10px">复制链接到无痕/另一浏览器，登录目标 Unity 账号后授权。</p>
       <div id="dev-step1">
         <input id="dev-alias" placeholder="账号备注名（可选）"><br><br>
-        <button onclick="startDevLogin()">发起授权</button>
+        <button id="dev-start-btn" onclick="startDevLogin()">发起授权</button>
         <button class="secondary" onclick="closeDevLogin()">取消</button>
       </div>
       <div id="dev-step2" class="hidden">
@@ -182,7 +182,8 @@ function showToast(msg, isErr) {
 async function api(path, opts = {}) {
   const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
   const j = await r.json().catch(() => ({}));
-  if (r.status === 401 && path !== '/api/auth-status') { showLogin(); throw new Error('未登录'); }
+  // 逻辑审查 F6：登录失败同样返回 401——不能触发 showLogin 短路，否则真实错误被"未登录"掩盖
+  if (r.status === 401 && path !== '/api/auth-status' && path !== '/api/login') { showLogin(); throw new Error('未登录'); }
   if (!r.ok && !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
   return j;
 }
@@ -238,12 +239,18 @@ async function checkAuth() {
   try {
     session = await api('/api/auth-status');
   } catch (e) { session = { authed: false }; }
-  if (!session.authed) { showLogin(); return false; }
-  hideLogin();
-  if (session.generatedPassword) {
-    showToast('管理密码：' + session.password + '（仅显示一次，请妥善保存）');
-    session.generatedPassword = false;
+  if (!session.authed) {
+    // 逻辑审查 F1：生成密码仅在首次成功登录前可读（服务端 MarkLogin 后收回），
+    // 展示必须在登录弹窗内——此前放在 authed 分支（服务端不可构造该组合），首屏提示从未出现过
+    if (session.generatedPassword && session.password) {
+      document.getElementById('login-hint').textContent =
+        '初始管理密码：' + session.password + '（仅首次展示，请妥善保存）';
+    }
+    showLogin();
+    return false;
   }
+  hideLogin();
+  document.getElementById('login-hint').textContent = '';
   document.getElementById('login-status').textContent = session.username;
   refreshAll();
   return true;
@@ -296,8 +303,10 @@ async function loadOverview() {
   } else { ael.innerHTML = '<span class="muted">未登录账号</span>'; }
 }
 async function loadAccounts() {
-  const r = await api('/api/accounts');
   const el = document.getElementById('accounts-list');
+  let r;
+  try { r = await api('/api/accounts'); }
+  catch (e) { el.innerHTML = '<span class="muted">加载失败</span>'; return; } // 逻辑审查 F5：错误态
   if (!r.list || !r.list.length) { el.innerHTML = '<span class="muted">暂无账号，点击「添加账号」。</span>'; return; }
   el.innerHTML = r.list.map(a => {
     const tags = [];
@@ -312,7 +321,13 @@ async function loadAccounts() {
   }).join('');
 }
 async function loadBalancer() {
-  const b = await api('/api/balancer/status');
+  let b;
+  try { b = await api('/api/balancer/status'); }
+  catch (e) {
+    // 逻辑审查 F5：失败时不动 lb-enabled/lb-mode 控件（避免重置用户正在编辑的值），仅状态区提示
+    document.getElementById('balancer-status').innerHTML = '<span class="muted">加载失败</span>';
+    return;
+  }
   document.getElementById('lb-enabled').checked = !!b.enabled;
   document.getElementById('lb-mode').value = b.mode || 'quota-first';
   const el = document.getElementById('balancer-status');
@@ -333,7 +348,7 @@ async function loadKeys() {
       `<div class="stat-row"><span class="stat-label">状态</span><span class="stat-val">${s.authRequired ? '🟢 已保护（' + s.configuredKeysCount + ' 个 Key）' : '⚪ 免密模式'}</span></div>` +
       (s.maskedKeys && s.maskedKeys.length ? `<div class="stat-row"><span class="stat-label">已配置</span><span class="stat-val muted">${esc(s.maskedKeys.join('，'))}</span></div>` : '');
     document.getElementById('apikey-input').placeholder = s.source === 'env' ? '当前由环境变量 CODELY_PROXY_API_KEY 管理' : 'sk-key1,sk-key2（留空清空）';
-  } catch (e) {}
+  } catch (e) { document.getElementById('apikey-status').innerHTML = '<span class="muted">加载失败</span>'; } // 逻辑审查 F5：错误态
 }
 async function loadQuota(force) {
   try {
@@ -369,7 +384,12 @@ async function switchAccount(name) {
 }
 async function deleteAccount(name) {
   if (!confirm('确定删除账号 ' + name + ' ？')) return;
-  try { await api('/api/account/delete', { method: 'POST', body: JSON.stringify({ name }) }); showToast('已删除'); refreshAll(); }
+  try {
+    const r = await api('/api/account/delete', { method: 'POST', body: JSON.stringify({ name }) });
+    // 逻辑审查 F2：后端"已删除但自动切换失败"返回 200+warning（此刻可能无可用主账号），此前被静默吞掉
+    if (r.warning) { showToast('已删除，但 ' + r.warning, true); } else { showToast('已删除'); }
+    refreshAll();
+  }
   catch (e) { showToast(e.message, true); }
 }
 async function setBalancer(patch) {
@@ -384,17 +404,30 @@ async function saveKeys() {
 function openDevLogin() { document.getElementById('dev-login-modal').style.display = 'flex'; document.getElementById('dev-step1').style.display = 'block'; document.getElementById('dev-step2').classList.add('hidden'); document.getElementById('dev-alias').value = ''; }
 function closeDevLogin() { if (pollTimer) clearInterval(pollTimer); document.getElementById('dev-login-modal').style.display = 'none'; }
 async function startDevLogin() {
-  const name = document.getElementById('dev-alias').value.trim();
+  // 逻辑审查 F3：双击"发起授权"会创建两个 interval，旧句柄被覆盖后永久泄漏（每 2.5s 打一次后端）
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  const btn = document.getElementById('dev-start-btn');
+  btn.disabled = true;
+  // 逻辑审查 F7：备注名按后端 Slugify 同规则预规范化——非法字符此前会被服务端静默丢弃
+  const nameInput = document.getElementById('dev-alias');
+  let name = nameInput.value.trim();
+  if (name) {
+    const slug = name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+    if (!slug) { showToast('备注名仅支持字母数字与 . _ -（将使用自动命名）', true); name = ''; }
+    else if (slug !== name) { nameInput.value = slug; name = slug; showToast('备注名已规范化为 ' + slug); }
+  }
   try {
     const r = await api('/api/account/login/start', { method: 'POST', body: JSON.stringify({ name: name || undefined }) });
     document.getElementById('dev-step1').style.display = 'none';
     document.getElementById('dev-step2').classList.remove('hidden');
     document.getElementById('dev-user-code').textContent = r.login.user_code;
     document.getElementById('dev-url-text').textContent = r.login.verification_uri_complete;
-    document.getElementById('dev-url').href = r.login.verification_uri_complete;
+    // S2 加固：仅接受 http(s) 授权链接写入 href，防上游异常值注入 javascript: URI（展示区仍完整显示原值）
+    document.getElementById('dev-url').href = /^https?:/i.test(r.login.verification_uri_complete) ? r.login.verification_uri_complete : '#';
     document.getElementById('dev-status').textContent = '等待授权中...';
     pollTimer = setInterval(pollDevLogin, 2500);
   } catch (e) { showToast(e.message, true); }
+  btn.disabled = false;
 }
 async function pollDevLogin() {
   try {
@@ -417,7 +450,11 @@ async function pollDevLogin() {
     } else {
       document.getElementById('dev-status').textContent = '⏳ 等待授权中...';
     }
-  } catch (e) { /* 轮询失败重试 */ }
+  } catch (e) {
+    // 逻辑审查 F4：会话过期时后端 401 → api() 抛"未登录"，此前每 2.5s 无限重试
+    if (e && e.message === '未登录') { closeDevLogin(); return; }
+    /* 其他轮询失败（网络抖动等）静默重试 */
+  }
 }
 async function cancelDevLogin() {
   if (pollTimer) clearInterval(pollTimer);

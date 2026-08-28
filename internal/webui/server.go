@@ -98,11 +98,15 @@ func readBody(rw http.ResponseWriter, req *http.Request, limit int64) ([]byte, b
 
 // handleLogin POST /api/login：账密校验 → 发 HttpOnly cookie。
 func (s *Server) handleLogin(rw http.ResponseWriter, req *http.Request) {
+	data, ok := readBody(rw, req, 0) // 未鉴权端点必须有 body 上限（稳定性审计 F4）
+	if !ok {
+		return
+	}
 	var body struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(data, &body); err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid json"})
 		return
 	}
@@ -176,10 +180,14 @@ func (s *Server) handleAccounts(rw http.ResponseWriter, req *http.Request) {
 
 // handleAccountDelete POST /api/account/delete：删除账号。
 func (s *Server) handleAccountDelete(rw http.ResponseWriter, req *http.Request) {
+	data, ok := readBody(rw, req, 0)
+	if !ok {
+		return
+	}
 	var body struct {
 		Name string `json:"name"`
 	}
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil || body.Name == "" {
+	if err := json.Unmarshal(data, &body); err != nil || body.Name == "" {
 		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "missing name"})
 		return
 	}
@@ -193,10 +201,14 @@ func (s *Server) handleAccountDelete(rw http.ResponseWriter, req *http.Request) 
 
 // handleAccountSwitch POST /api/account/switch：切换主账号。
 func (s *Server) handleAccountSwitch(rw http.ResponseWriter, req *http.Request) {
+	data, ok := readBody(rw, req, 0)
+	if !ok {
+		return
+	}
 	var body struct {
 		Name string `json:"name"`
 	}
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil || body.Name == "" {
+	if err := json.Unmarshal(data, &body); err != nil || body.Name == "" {
 		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "missing name"})
 		return
 	}
@@ -215,8 +227,12 @@ func (s *Server) handleBalancerStatus(rw http.ResponseWriter, req *http.Request)
 
 // handleBalancerConfig POST /api/balancer/config：更新调度配置。
 func (s *Server) handleBalancerConfig(rw http.ResponseWriter, req *http.Request) {
+	data, ok := readBody(rw, req, 0)
+	if !ok {
+		return
+	}
 	var patch map[string]any
-	if err := json.NewDecoder(req.Body).Decode(&patch); err != nil {
+	if err := json.Unmarshal(data, &patch); err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid json"})
 		return
 	}
@@ -231,10 +247,14 @@ func (s *Server) handleSecurityStatus(rw http.ResponseWriter, req *http.Request)
 
 // handleSecurityConfig POST /api/security/config：设置客户端 API Key。
 func (s *Server) handleSecurityConfig(rw http.ResponseWriter, req *http.Request) {
+	data, ok := readBody(rw, req, 0)
+	if !ok {
+		return
+	}
 	var body struct {
 		APIKey string `json:"apiKey"`
 	}
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(data, &body); err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid json"})
 		return
 	}

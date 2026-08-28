@@ -261,6 +261,17 @@ func TestAuthStatusPasswordRevealOnce(t *testing.T) {
 	}
 }
 
+func TestLoginBodySizeCapped(t *testing.T) {
+	// 稳定性审计 F4：/api/login（未鉴权）此前无 body 上限，可被灌 GB 级包 → readBody 接线后 413
+	srv, cleanup := buildServer(t)
+	defer cleanup()
+	big := strings.Repeat("a", 2<<20)
+	rw, _ := doJSON(t, srv, "POST", "/api/login", `{"username":"`+big+`"}`, "")
+	if rw.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("超大 body 应 413, got %d", rw.Code)
+	}
+}
+
 func TestLoginFlowEndpoints(t *testing.T) {
 	// 用 mock 官方端点测设备码登录
 	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

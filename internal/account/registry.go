@@ -149,6 +149,14 @@ func (r *Registry) saveIndex(idx *Index) error {
 	return writeJSON(IndexFile, idx)
 }
 
+// currentIndex 返回注册表快照（内部持 r.mu）。供 login flow 等同包调用方做碰撞检查，
+// 避免无锁读 index.json 与写者并发的撕裂读（稳定性审计 F5）。
+func (r *Registry) currentIndex() *Index {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.loadIndex()
+}
+
 // ---- slug 与命名（对标 accounts.js slugify / autoName） ----
 
 // Slugify 规范化账号名：小写 + 非 [a-z0-9._-] 替换为 '-' + 去首尾 '-' + 白名单校验。
@@ -161,6 +169,10 @@ func Slugify(name string) string {
 	// 把非 [a-z0-9._-] 的连续串替换为单个 '-'
 	s = regexp.MustCompile(`[^a-z0-9._-]+`).ReplaceAllString(s, "-")
 	s = strings.Trim(s, "-")
+	if s == "index" {
+		// 预留字（稳定性审计 F5）：会与注册表文件 accounts/index.json 同名互覆
+		return ""
+	}
 	if !slugRe.MatchString(s) {
 		return ""
 	}
@@ -400,11 +412,10 @@ func (r *Registry) clearCaches() {
 // 对标 accounts.js activateAccount。
 func (r *Registry) ActivateAccount(name string, pool PoolReloader) (Account, string, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	slug := Slugify(name)
 	creds := r.LoadAccountCreds(slug)
 	if creds == nil {
+		r.mu.Unlock()
 		return Account{}, "", fmt.Errorf("账号不存在或凭据无效: %s（先在 WebUI 添加账号）", name)
 	}
 	idx := r.loadIndex()
@@ -413,16 +424,20 @@ func (r *Registry) ActivateAccount(name string, pool PoolReloader) (Account, str
 	r.clearCaches()
 	creds.SavedAt = time.Now().UTC().Format(time.RFC3339)
 	if err := creds.SaveCreds(); err != nil {
+		r.mu.Unlock()
 		return Account{}, "", err
 	}
 	idx.Current = slug
 	if err := r.saveIndex(idx); err != nil {
+		r.mu.Unlock()
 		return Account{}, "", err
 	}
 	if pool != nil {
 		pool.ReloadPool()
 	}
-	// 尝试预取新账号的 sk- 密钥（失败不阻塞——代理会在下一请求时自动重试）
+	// 稳定性审计 F3：sk- 密钥预取走网络（oauth.HTTPClient 30s 上限），必须在锁外执行——
+	// 持 r.mu 调用会阻塞 /healthz 与免调度模式的每条 /v1 请求。失败本就不阻塞（代理下一请求自动重试）。
+	r.mu.Unlock()
 	key, _ := oauth.FetchAPIKey(creds)
 	acct := Account{
 		Name:     slug,

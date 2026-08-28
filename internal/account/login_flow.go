@@ -290,29 +290,28 @@ func (f *LoginFlow) complete(authorizationCode, suggestedName string) (*Account,
 	}
 
 	// 5. 不同账号：自动名可能撞名（不同组织同名）→ 加后缀避免覆盖
-	name := suggestedName
-	if name == "" {
-		name = AutoName(creds)
+	// 修复（稳定性审计 F5）：碰撞检查必须在 slug 域进行——此前用原始名查 index、
+	// 落盘却用 Slugify 后的名字，"My Team" 永远查不到 "my-team"，后缀永不触发 → 静默覆盖同名账号。
+	base := Slugify(suggestedName)
+	if base == "" {
+		base = Slugify(AutoName(creds))
 	}
 	f.mu.Lock()
-	idx := f.registry.loadIndex()
+	idx := f.registry.currentIndex() // 锁内快照（避免与注册表写者并发的撕裂读）
+	finalSlug := base
 	n := 2
 	for {
-		existing, ok := idx.Accounts[name]
+		existing, ok := idx.Accounts[finalSlug]
 		if !ok || existing.UserID == userId {
 			break // 未占用，或已占用但同属该 user（重建）
 		}
-		base := suggestedName
-		if base == "" {
-			base = AutoName(creds)
-		}
-		name = fmt.Sprintf("%s-%d", base, n)
+		finalSlug = fmt.Sprintf("%s-%d", base, n)
 		n++
 	}
 	f.mu.Unlock()
 
-	// 6. 保存 + 激活（密钥预取失败不阻塞，代理下次请求自动换取）
-	slug, _, err := f.registry.SaveAccount(name, creds, true, nil)
+	// 6. 保存 + 激活（以最终 slug 命名——Slugify 对已规范化名幂等；密钥预取失败不阻塞，代理下次请求自动换取）
+	slug, _, err := f.registry.SaveAccount(finalSlug, creds, true, nil)
 	if err != nil {
 		return nil, err
 	}

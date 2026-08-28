@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -321,6 +322,119 @@ func TestPollNoLogin(t *testing.T) {
 
 // jsonDecode 辅助（编译用）
 var _ = json.Marshal
+
+func TestSlugifyReserveIndex(t *testing.T) {
+	// 稳定性审计 F5：slug "index" 会与注册表文件 accounts/index.json 同名互覆 → 预留拒绝
+	if got := Slugify("index"); got != "" {
+		t.Fatalf(`Slugify("index") 应为空（预留字），got %q`, got)
+	}
+	if Slugify("normal-name") == "" {
+		t.Fatalf("普通名不应被拒绝")
+	}
+}
+
+func TestDeviceLoginSameNameCollision(t *testing.T) {
+	// 稳定性审计 F5：碰撞检查必须在 slug 域——两个同名（不同 user）团队应落为
+	// new-org 与 new-org-2，而非后者静默覆盖前者
+	meBody := []byte(`{"id":77777}`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/auth/device/initiate":
+			_, _ = w.Write([]byte(`{"auth_request_token":"art","verification_uri_complete":"https://x/a","user_code":"ABC-123","interval":1,"expires_in":600}`))
+		case "/auth/device/poll":
+			_, _ = w.Write([]byte(`{"status":"authorized","authorization_code":"authcode"}`))
+		case "/auth/device/exchange":
+			_, _ = w.Write([]byte(`{"access_token":"at","refresh_token":"rt","expires_in":3600}`))
+		case "/auth/external/me":
+			_, _ = w.Write(meBody)
+		case "/api/teams":
+			_, _ = w.Write([]byte(`{"current_team_id":"team-7","teams":[{"team_id":"team-7","team_name":"New Org","is_current":true}]}`))
+		default:
+			http.Error(w, "nf", 404)
+		}
+	}))
+	defer srv.Close()
+	oldBase := oauth.Base
+	oauth.Base = srv.URL
+	t.Cleanup(func() { oauth.Base = oldBase })
+
+	r := setup(t)
+
+	flow1 := NewLoginFlow(r)
+	if _, _, _, _, err := flow1.Start("new-org"); err != nil {
+		t.Fatalf("Start1: %v", err)
+	}
+	if st := flow1.Poll(); st.Status != "authorized" || st.Account == nil || st.Account.Name != "new-org" {
+		t.Fatalf("第一个团队应落为 new-org, got %+v", st)
+	}
+
+	// 同名团队、不同 user
+	meBody = []byte(`{"id":88888}`)
+	flow2 := NewLoginFlow(r)
+	if _, _, _, _, err := flow2.Start("new-org"); err != nil {
+		t.Fatalf("Start2: %v", err)
+	}
+	if st := flow2.Poll(); st.Status != "authorized" || st.Account == nil || st.Account.Name != "new-org-2" {
+		t.Fatalf("同名第二团队应落为 new-org-2, got %+v", st)
+	}
+	if n := len(r.ListAccounts()); n != 2 {
+		t.Fatalf("应有 2 个账号, got %d", n)
+	}
+}
+
+func TestActivateAccountPrefetchOutsideLock(t *testing.T) {
+	// 稳定性审计 F3：sk- 密钥预取走网络（最长 30s），不得持 r.mu——
+	// 否则一次切号会阻塞 /healthz 与免调度模式的每条 /v1 请求
+	var keyCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/api-token/cli-api-key" {
+			atomic.AddInt32(&keyCalls, 1)
+			time.Sleep(1 * time.Second) // 放大持锁窗口（若仍在锁内）
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"api_key":"sk-prefetch"}`))
+			return
+		}
+		http.Error(w, "nf", 404)
+	}))
+	defer srv.Close()
+	oldBase := oauth.Base
+	oauth.Base = srv.URL
+	t.Cleanup(func() { oauth.Base = oldBase })
+
+	r := setup(t)
+	exp := time.Now().UnixMilli() + 3600*1000
+	creds := fakeCreds("1", "Org")
+	creds.ExpiryDate = &exp
+	if _, _, err := r.SaveAccount("org", creds, false, nil); err != nil {
+		t.Fatalf("SaveAccount: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, _, err := r.ActivateAccount("org", nil); err != nil {
+			t.Errorf("ActivateAccount: %v", err)
+		}
+	}()
+	time.Sleep(100 * time.Millisecond) // 让激活进入预取阶段
+
+	located := make(chan struct{})
+	go func() {
+		_ = r.GetCurrentMeta() // 持 r.mu 的读路径（/healthz 与免调度 Pick 同款）
+		close(located)
+	}()
+	select {
+	case <-located:
+		// 未被预取阻塞 ✓
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("GetCurrentMeta 被锁外的预取网络调用阻塞（F3 未修复）")
+	}
+	<-done
+	if atomic.LoadInt32(&keyCalls) != 1 {
+		t.Fatalf("预取应恰好 1 次, got %d", atomic.LoadInt32(&keyCalls))
+	}
+}
 
 // TestLoadIndexCorruptedFile（稳定性审计 E）：index.json 半写/损坏 → loadIndex
 // 返回空注册表且不 panic（损坏现在会记入日志；半写本身由 atomicfile 从根上杜绝）。

@@ -15,10 +15,14 @@ type LoginFlowHolder struct {
 
 // handleLoginStart POST /api/account/login/start：发起设备码登录。
 func (s *Server) handleLoginStart(rw http.ResponseWriter, req *http.Request) {
+	data, ok := readBody(rw, req, 0)
+	if !ok {
+		return
+	}
 	var body struct {
 		Name string `json:"name"`
 	}
-	_ = json.NewDecoder(req.Body).Decode(&body)
+	_ = json.Unmarshal(data, &body) // 保持宽容语义：坏 JSON 视为未指定名字
 	verURI, userCode, expiresIn, interval, err := s.LoginFlow.Start(body.Name)
 	if err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})

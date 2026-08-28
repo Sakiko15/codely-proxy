@@ -229,6 +229,19 @@ func TestAnthropicUpstreamErrorEventNoFakeEndTurn(t *testing.T) {
 	}
 }
 
+func TestAnthropicHugeIndexFallback(t *testing.T) {
+	// 逻辑审查 P2：超长 index 数字视为解析失败 → 回退 index 0（防挂死语义不失效，
+	// 且不把溢出垃圾写进合成事件）
+	in := "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":99999999999999999999}\n\n"
+	out := runAnthropic(t, in)
+	if !strings.Contains(out, `"type":"content_block_stop","index":0`) {
+		t.Fatalf("溢出 index 应回退 0 并合成闭合: %s", out)
+	}
+	if strings.Contains(out, `content_block_stop","index":9999`) {
+		t.Fatalf("垃圾 index 不应进入合成事件: %s", out)
+	}
+}
+
 func TestOpenAIDoneNoSpace(t *testing.T) {
 	// [增强] `data:[DONE]`（无空格）应被识别，不重复补发
 	var out bytes.Buffer

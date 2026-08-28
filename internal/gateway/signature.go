@@ -24,7 +24,8 @@ func mustHex(s string) []byte {
 	b := make([]byte, len(s)/2)
 	for i := 0; i < len(b); i++ {
 		hi, lo := unhex(s[2*i]), unhex(s[2*i+1])
-		if hi < 0 || lo < 0 {
+		if hi == 0xff || lo == 0xff {
+			// 逻辑审查 P2：unhex 对非法字符返回 0xff——原 hi<0 恒假（byte 无负值），守卫曾是死代码
 			panic("gateway: 非法 hex 常量 " + signingSecretHex)
 		}
 		b[i] = hi<<4 | lo

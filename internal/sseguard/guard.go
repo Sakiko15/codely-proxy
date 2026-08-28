@@ -87,9 +87,15 @@ func parseBlockIndexOK(data []byte) (int, bool) {
 		return 0, false
 	}
 	idx := 0
+	digits := 0
 	for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
 		idx = idx*10 + int(rest[i]-'0')
 		i++
+		if digits++; digits > 9 {
+			// 逻辑审查 P2：index 恒为小整数；超长数字视为解析失败（回退 0，
+			// 对齐旧 Sscanf 溢出报错语义，不把溢出垃圾写进合成事件）
+			return 0, false
+		}
 	}
 	return idx, true
 }

@@ -153,7 +153,13 @@ func SanitizeMessages(messages []map[string]any) ([]map[string]any, bool) {
 			continue
 		}
 		raw, _ := json.Marshal(content)
-		m["content"] = sanitizeContent(raw)
+		newRaw := sanitizeContent(raw)
+		if bytes.Equal(newRaw, raw) {
+			// 混合块等解码失败场景 sanitizeContent 原样返回——不再过报 changed（逻辑审查 P2）
+			out[i] = m
+			continue
+		}
+		m["content"] = newRaw
 		out[i] = m
 		changed = true
 	}
@@ -247,18 +253,25 @@ func TransformBody(urlPath string, body []byte, sessionID string) (payload []byt
 		(bytes.Contains(msgsRaw, []byte(`"thinking"`)) || bytes.Contains(msgsRaw, []byte(`"redacted_thinking"`))) {
 		var msgs []any
 		if json.Unmarshal(msgsRaw, &msgs) == nil {
-			maps := make([]map[string]any, 0, len(msgs))
+			// 混合类型（存在非对象元素）→ 保守跳过剔除（逻辑审查 P2）：
+			// 此前非对象元素被替换为 {} 并随重组改写；畸形输入按"最小干预"原样透传
+			hasNonObject := false
 			for _, m := range msgs {
-				if mm, ok := m.(map[string]any); ok {
-					maps = append(maps, mm)
-				} else {
-					maps = append(maps, map[string]any{})
+				if _, ok := m.(map[string]any); !ok {
+					hasNonObject = true
+					break
 				}
 			}
-			cleaned, c := SanitizeMessages(maps)
-			if c {
-				j["messages"] = rawOf(cleaned)
-				changed = true
+			if !hasNonObject {
+				maps := make([]map[string]any, 0, len(msgs))
+				for _, m := range msgs {
+					maps = append(maps, m.(map[string]any))
+				}
+				cleaned, c := SanitizeMessages(maps)
+				if c {
+					j["messages"] = rawOf(cleaned)
+					changed = true
+				}
 			}
 		}
 	}

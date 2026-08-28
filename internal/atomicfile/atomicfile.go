@@ -5,12 +5,22 @@
 //（读取端解析失败返回空，ensureLocked 触发注册表塌缩）。叶子包，无内部依赖。
 package atomicfile
 
-import "os"
+import (
+	"os"
+	"sync"
+)
+
+// writeMu 串行化全部写入（逻辑审查 P2）：tmp 文件名固定为 path+".tmp"，
+// 同一目标文件的并发写者（如 codely-creds.json 的全局 refresh 与 ActivateAccount，
+// 两者无共同锁）会互踩产生拼接损坏。写入极少且极小，全局串行无碍。
+var writeMu sync.Mutex
 
 // Write 原子写入 path：写 path+".tmp" → fsync → Close → Rename 覆盖目标。
 // 任一步失败都会清理临时文件并返回错误。
 // Windows 下 os.Rename 同样覆盖已存在目标（MOVEFILE_REPLACE_EXISTING）。
 func Write(path string, data []byte, perm os.FileMode) error {
+	writeMu.Lock()
+	defer writeMu.Unlock()
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {

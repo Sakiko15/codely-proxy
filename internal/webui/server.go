@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"codely-proxy/internal/account"
@@ -29,6 +30,9 @@ type Server struct {
 	Logger   *log.Logger
 	// ProxyUpstream 用于 /healthz 展示。
 	ProxyUpstream string
+	// TrustProxy 为 true 时登录限速分桶取 X-Forwarded-For（CODELY_TRUST_PROXY=1，
+	// 反代部署形态；逻辑审查 P2）。默认 false = 用 RemoteAddr，不可伪造。
+	TrustProxy bool
 	// loginLimiter 登录失败限速（按来源 IP，稳定性审计 F7）。
 	loginLimiter *ipLimiter
 }
@@ -107,13 +111,29 @@ func readBody(rw http.ResponseWriter, req *http.Request, limit int64) ([]byte, b
 	return data, true
 }
 
+// clientIP 提取登录限速的分桶 IP。默认用 RemoteAddr（不可伪造）；CODELY_TRUST_PROXY=1
+// 时取 X-Forwarded-For 首个地址——反代部署形态下攻击者与管理员不再共享全局桶（逻辑审查 P2）。
+func (s *Server) clientIP(req *http.Request) string {
+	if s.TrustProxy {
+		if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
+			if i := strings.IndexByte(xff, ','); i >= 0 {
+				xff = xff[:i]
+			}
+			if ip := strings.TrimSpace(xff); ip != "" {
+				return ip
+			}
+		}
+	}
+	if host, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+		return host
+	}
+	return req.RemoteAddr
+}
+
 // handleLogin POST /api/login：账密校验 → 发 HttpOnly cookie。
 func (s *Server) handleLogin(rw http.ResponseWriter, req *http.Request) {
 	// 登录失败限速（稳定性审计 F7）：按来源 IP，锁定窗口内直接 429
-	ip := req.RemoteAddr
-	if host, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
-		ip = host
-	}
+	ip := s.clientIP(req)
 	if s.loginLimiter.Blocked(ip) {
 		writeJSON(rw, http.StatusTooManyRequests, map[string]any{"ok": false, "error": "too many attempts, try later"})
 		return

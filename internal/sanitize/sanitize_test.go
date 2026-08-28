@@ -189,6 +189,24 @@ func TestNullBodyPassthrough(t *testing.T) {
 	}
 }
 
+func TestMixedMessagesPassthrough(t *testing.T) {
+	// 逻辑审查 P2：messages 含非对象元素（畸形）→ 保守跳过剔除、原样透传
+	//（此前非对象元素被改写为 {}）
+	in := `{"messages":[{"role":"assistant","content":[{"type":"thinking","text":"t"},{"type":"text","text":"a"}]},"not-an-object"]}`
+	payload, _, _ := TransformBody("/v1/messages", []byte(in), "sid")
+	j := mustObj(t, payload)
+	msgs := j["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("畸形 messages 应原样透传（2 个元素）, got %d", len(msgs))
+	}
+	if _, ok := msgs[1].(string); !ok {
+		t.Fatalf("非对象元素应保留原样, got %T", msgs[1])
+	}
+	if !strings.Contains(string(payload), `"thinking"`) {
+		t.Fatalf("混合类型不应触发 thinking 剔除: %s", payload)
+	}
+}
+
 func TestNullSystemPreserved(t *testing.T) {
 	// 逻辑审查 P0："system":null 不应被改写成 ""（null 解码进 string 得零值空串）
 	in := `{"system":null,"messages":[{"role":"user","content":"hi"}]}`

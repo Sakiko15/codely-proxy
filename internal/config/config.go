@@ -40,6 +40,9 @@ type Config struct {
 	// KeepThinkingHistory 为 true 时保留 assistant 历史 thinking 块
 	//（KEEP_THINKING_HISTORY="1"/"true"；默认 false = 剔除，与 JS 一致，§19.3 [增强] 开关）。
 	KeepThinkingHistory bool
+	// TrustProxy 为 true 时登录限速的客户端 IP 取 X-Forwarded-For 首个地址
+	//（CODELY_TRUST_PROXY="1"/"true"；默认 false = 用 RemoteAddr，不可伪造，逻辑审查 P2）。
+	TrustProxy bool
 }
 
 // Load 从环境变量加载配置（CLI flag 由 cmd 层覆盖，此处只做默认 + env）。
@@ -70,6 +73,12 @@ func Load() Config {
 	if v := os.Getenv("KEEP_THINKING_HISTORY"); v != "" {
 		if strings.EqualFold(v, "1") || strings.EqualFold(v, "true") {
 			cfg.KeepThinkingHistory = true
+		}
+	}
+	// CODELY_TRUST_PROXY：反代部署形态下限速分桶信任 X-Forwarded-For（逻辑审查 P2）
+	if v := os.Getenv("CODELY_TRUST_PROXY"); v != "" {
+		if strings.EqualFold(v, "1") || strings.EqualFold(v, "true") {
+			cfg.TrustProxy = true
 		}
 	}
 	return cfg

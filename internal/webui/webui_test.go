@@ -365,6 +365,42 @@ func TestLoginIPLimiter(t *testing.T) {
 	}
 }
 
+func TestLoginIPTrustProxy(t *testing.T) {
+	// 逻辑审查 P2：TrustProxy=true 时按 X-Forwarded-For 分桶（反代形态），
+	// 不同来源各自计数、互不牵连
+	srv, cleanup := buildServer(t)
+	defer cleanup()
+	srv.TrustProxy = true
+
+	doLogin := func(xff, user, pass string) int {
+		body := `{"username":"` + user + `","password":"` + pass + `"}`
+		req := httptest.NewRequest("POST", "/api/login", strings.NewReader(body))
+		if xff != "" {
+			req.Header.Set("X-Forwarded-For", xff)
+		}
+		rw := httptest.NewRecorder()
+		mux := http.NewServeMux()
+		srv.Routes(mux)
+		mux.ServeHTTP(rw, req)
+		return rw.Code
+	}
+
+	for i := 0; i < loginMaxFails; i++ {
+		if code := doLogin("10.0.0.1", "testuser", "wrong"); code != http.StatusUnauthorized {
+			t.Fatalf("ip1 失败应 401, got %d", code)
+		}
+	}
+	if code := doLogin("10.0.0.2", "testuser", "wrong"); code != http.StatusUnauthorized {
+		t.Fatalf("ip2 首次失败应 401（未被 ip1 牵连）, got %d", code)
+	}
+	if code := doLogin("10.0.0.1", "testuser", "testpass"); code != http.StatusTooManyRequests {
+		t.Fatalf("ip1 锁定后正确密码也应 429, got %d", code)
+	}
+	if code := doLogin("10.0.0.2", "testuser", "testpass"); code != http.StatusOK {
+		t.Fatalf("ip2 未失败应可正常登录, got %d", code)
+	}
+}
+
 func TestLoginRateLimited429(t *testing.T) {
 	// 端到端：连续失败达阈值后，锁定窗口内即使正确密码也 429
 	srv, cleanup := buildServer(t)

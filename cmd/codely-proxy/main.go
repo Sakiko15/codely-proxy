@@ -99,6 +99,7 @@ func main() {
 	srv := webui.NewServer(auth, reg, b, q, sec, ph, lf)
 	srv.Logger = logger
 	srv.ProxyUpstream = p.UpstreamBase
+	srv.TrustProxy = cfg.TrustProxy // 反代形态下限速分桶信任 X-Forwarded-For（CODELY_TRUST_PROXY=1）
 	mux := http.NewServeMux()
 	srv.Routes(mux)
 

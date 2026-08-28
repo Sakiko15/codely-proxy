@@ -30,6 +30,52 @@ func NewBalancer(reg *account.Registry) *Balancer {
 // ReloadPool 动态重新同步池（账号增删时联动，PoolReloader 接口）。对标 reloadPool。
 func (b *Balancer) ReloadPool() { b.syncPool() }
 
+// Preheat 启动预热（性能审计 P3）：为池内未禁用账号预热 sk- 密钥（key 文件命中零网络；
+// 缺失才走刷新链，失败无害）与 quota 快照（仅 LB 开启且 quota-first 时；否则冷启动首个
+// 请求会在 Pick 内串行吃满 30s×N 段的刷新链）。有界并发；阻塞调用方（main 以 goroutine 启动）。
+func (b *Balancer) Preheat() {
+	b.syncPool()
+	cfg := b.GetConfig()
+	b.mu.Lock()
+	states := make([]*AccountState, 0, len(b.pool))
+	for slug, s := range b.pool {
+		if containsStr(cfg.DisabledSlugs, slug) {
+			continue
+		}
+		states = append(states, s)
+	}
+	b.mu.Unlock()
+	sort.Slice(states, func(i, j int) bool { return states[i].Slug < states[j].Slug })
+
+	preheatQuota := cfg.Enabled && cfg.Mode == "quota-first"
+	workers := 4
+	if len(states) < workers {
+		workers = len(states)
+	}
+	if workers == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	next := make(chan *AccountState)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for s := range next {
+				_, _ = s.GetAPIKey()
+				if preheatQuota {
+					s.FetchQuota(false) // 冷缓存会同步拉一轮，后台执行
+				}
+			}
+		}()
+	}
+	for _, s := range states {
+		next <- s
+	}
+	close(next)
+	wg.Wait()
+}
+
 // syncPool 确保所有已注册账号在内存池中；清理已被物理删除的账号。对标 syncPool。
 func (b *Balancer) syncPool() {
 	b.mu.Lock()
@@ -62,8 +108,8 @@ func (b *Balancer) state(slug string) *AccountState {
 }
 
 // getAvailableCandidates 获取当前有效可用账号（排除禁用/冷却/已排除）。对标 getAvailableCandidates。
+// 仅由 Pick 调用（其入口已 syncPool），不再重复同步（性能审计 P2c）。
 func (b *Balancer) getAvailableCandidates(excluded map[string]bool) []*AccountState {
-	b.syncPool()
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	var candidates []*AccountState

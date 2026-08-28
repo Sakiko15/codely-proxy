@@ -3,6 +3,7 @@ package balancer
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -383,4 +384,80 @@ func TestFetchQuotaConcurrentNoRace(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// presetKeyFile 为账号预置 key 文件缓存（避免走刷新链）。
+func presetKeyFile(t *testing.T, slug string) {
+	t.Helper()
+	if err := os.MkdirAll(account.AccountsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(account.AccountsDir+"/"+slug+".key", []byte("sk-"+slug), 0o600); err != nil {
+		t.Fatalf("写 key: %v", err)
+	}
+}
+
+func TestBalancerPreheatKeysOnly(t *testing.T) {
+	// 性能审计 P3：LB 关闭时 Preheat 仅预热 key——key 文件齐备 → 零网络调用，且 GetAPIKey 立即命中
+	var netCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&netCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	oldBase := oauth.Base
+	oauth.Base = srv.URL
+	t.Cleanup(func() { oauth.Base = oldBase })
+
+	reg := setup(t)
+	addAccount(t, reg, "a", "1", "A", 0, 0, false)
+	addAccount(t, reg, "b", "2", "B", 0, 0, false)
+	presetKeyFile(t, "a")
+	presetKeyFile(t, "b")
+	bal := NewBalancer(reg)
+	_ = bal.UpdateConfig(map[string]any{"enabled": false}) // 关闭 LB → 不预热 quota
+
+	bal.Preheat()
+	if got := atomic.LoadInt32(&netCalls); got != 0 {
+		t.Fatalf("key 文件齐备且 LB 关闭时 Preheat 不应有网络调用, got %d", got)
+	}
+	for _, slug := range []string{"a", "b"} {
+		k, err := bal.state(slug).GetAPIKey()
+		if err != nil || k == "" {
+			t.Fatalf("%s GetAPIKey 应立即命中, got %q err=%v", slug, k, err)
+		}
+	}
+}
+
+func TestBalancerPreheatQuota(t *testing.T) {
+	// 性能审计 P3：LB 开启 + quota-first 时 Preheat 应填充 quota 缓存（消除首请求冷链）
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/user/billing/usage/summary" {
+			http.Error(w, "nf", 404)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"daily_allowance":{"remaining_points":5,"quota_points":10}}`))
+	}))
+	defer srv.Close()
+	oldBase := oauth.Base
+	oauth.Base = srv.URL
+	t.Cleanup(func() { oauth.Base = oldBase })
+
+	reg := setup(t)
+	addAccount(t, reg, "a", "1", "A", 0, 0, false)
+	bal := NewBalancer(reg) // 默认 enabled + quota-first
+
+	bal.Preheat()
+	st := bal.state("a")
+	if st == nil {
+		t.Fatalf("state(a) nil")
+	}
+	st.mu.Lock()
+	warmed := st.quotaCacheData != nil
+	st.mu.Unlock()
+	if !warmed {
+		t.Fatalf("Preheat 后 quota 缓存应已填充")
+	}
 }

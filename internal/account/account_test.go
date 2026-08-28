@@ -333,6 +333,33 @@ func TestSlugifyReserveIndex(t *testing.T) {
 	}
 }
 
+func TestListSlugsCache(t *testing.T) {
+	// 性能审计 P2：accounts 目录 mtime 缓存——增删账号后缓存失效仍正确
+	r := setup(t)
+	if got := r.ListSlugs(); len(got) != 0 {
+		t.Fatalf("空注册表应无 slug, got %v", got)
+	}
+	if _, _, err := r.SaveAccount("a", fakeCreds("1", "A"), false, nil); err != nil {
+		t.Fatalf("SaveAccount a: %v", err)
+	}
+	_ = r.ListSlugs() // 填充缓存
+	if _, _, err := r.SaveAccount("b", fakeCreds("2", "B"), false, nil); err != nil {
+		t.Fatalf("SaveAccount b: %v", err)
+	}
+	got := r.ListSlugs()
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("新增账号后应失效缓存, got %v", got)
+	}
+	removed, _, err := r.RemoveAccount("b", nil)
+	if err != nil || !removed {
+		t.Fatalf("RemoveAccount b: removed=%v err=%v", removed, err)
+	}
+	got = r.ListSlugs()
+	if len(got) != 1 || got[0] != "a" {
+		t.Fatalf("删除账号后应失效缓存, got %v", got)
+	}
+}
+
 func TestDeviceLoginSameNameCollision(t *testing.T) {
 	// 稳定性审计 F5：碰撞检查必须在 slug 域——两个同名（不同 user）团队应落为
 	// new-org 与 new-org-2，而非后者静默覆盖前者

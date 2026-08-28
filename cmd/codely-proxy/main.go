@@ -78,6 +78,14 @@ func main() {
 	ph := proxy.NewHandler(p, b, reg, sec)
 	ph.Logger = logger
 
+	// 启动预热（性能审计 P3）：后台补 key 文件缓存与 quota 快照，消除重启后首个请求的长尾
+	go func() {
+		b.Preheat()
+		if n := len(reg.ListSlugs()); n > 0 {
+			logger.Printf("[init] 账号池预热完成（%d 账号）", n)
+		}
+	}()
+
 	// ---- WebUI 登录（A2b） ----
 	auth := webui.NewAuth(cfg.WebUIUser, cfg.WebUIPass)
 	if auth.IsGenerated() {

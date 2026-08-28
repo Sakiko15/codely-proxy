@@ -93,6 +93,14 @@ type Account struct {
 // Registry 是线程安全的账号注册表（WebUI 多请求并发）。
 type Registry struct {
 	mu sync.Mutex
+
+	// ListSlugs 的目录 mtime 缓存（性能审计 P2：每请求多次 ReadDir → 一次 stat）。
+	// ⚠️ 必须用独立锁而非 r.mu：SaveAccount/RemoveAccount 持 r.mu 期间会经
+	// ReloadPool → syncPool → ListSlugs 再入本方法（锁序 r.mu → b.mu → slugsMu，无反向）。
+	slugsMu    sync.Mutex
+	slugsCache []string
+	slugsMtime int64
+	slugsValid bool
 }
 
 // NewRegistry 返回一个注册表（首用自动导入：注册表为空但存在 codely-creds.json → 导入为当前账号）。
@@ -159,6 +167,10 @@ func (r *Registry) currentIndex() *Index {
 
 // ---- slug 与命名（对标 accounts.js slugify / autoName） ----
 
+// slugSepRe 把非 [a-z0-9._-] 的连续串替换为单个 '-'（性能审计 P2：包级预编译——
+// Slugify 在 X-Codely-Account 头的每请求路径上，逐调用编译正则是纯浪费）。
+var slugSepRe = regexp.MustCompile(`[^a-z0-9._-]+`)
+
 // Slugify 规范化账号名：小写 + 非 [a-z0-9._-] 替换为 '-' + 去首尾 '-' + 白名单校验。
 // 非法返回空串。对标 accounts.js slugify。
 func Slugify(name string) string {
@@ -167,7 +179,7 @@ func Slugify(name string) string {
 	}
 	s := strings.ToLower(strings.TrimSpace(name))
 	// 把非 [a-z0-9._-] 的连续串替换为单个 '-'
-	s = regexp.MustCompile(`[^a-z0-9._-]+`).ReplaceAllString(s, "-")
+	s = slugSepRe.ReplaceAllString(s, "-")
 	s = strings.Trim(s, "-")
 	if s == "index" {
 		// 预留字（稳定性审计 F5）：会与注册表文件 accounts/index.json 同名互覆
@@ -245,7 +257,44 @@ func (r *Registry) ensureLocked() {
 // ---- 列表 ----
 
 // ListSlugs 返回账号目录里实际存在的账号名（以文件为准，防 index 与文件不一致）。
+// invalidateSlugsCache 使 ListSlugs 的目录缓存失效。
+// ⚠️ 不能只靠目录 mtime 兜底：Windows NTFS 的目录 mtime 对删除是惰性更新，
+// 故由应用内仅有的两处文件集合变更点（SaveAccount/RemoveAccount）显式失效；
+// mtime 仅兜底带外变更（这些文件由应用独占管理，带外改动不保证立即可见）。
+func (r *Registry) invalidateSlugsCache() {
+	r.slugsMu.Lock()
+	r.slugsValid = false
+	r.slugsMu.Unlock()
+}
+
+// ListSlugs 列出注册表中的全部账号 slug（性能审计 P2：缓存文件集合，文件集合不变时零
+// ReadDir；应用内变更显式失效 + 目录 mtime 兜底）。返回切片为调用方私有副本。
 func (r *Registry) ListSlugs() []string {
+	st, err := os.Stat(AccountsDir)
+	if err != nil {
+		return readSlugs() // 目录不存在等 → 走直接读取（返回 nil）
+	}
+	mt := st.ModTime().UnixNano()
+	r.slugsMu.Lock()
+	if r.slugsValid && mt == r.slugsMtime {
+		out := make([]string, len(r.slugsCache))
+		copy(out, r.slugsCache)
+		r.slugsMu.Unlock()
+		return out
+	}
+	r.slugsMu.Unlock()
+
+	out := readSlugs()
+	r.slugsMu.Lock()
+	r.slugsCache = out
+	r.slugsMtime = mt
+	r.slugsValid = true
+	r.slugsMu.Unlock()
+	return out
+}
+
+// readSlugs 直接扫描 accounts 目录提取 slug（ListSlugs 的缓存未命中路径）。
+func readSlugs() []string {
 	entries, err := os.ReadDir(AccountsDir)
 	if err != nil {
 		return nil
@@ -363,6 +412,7 @@ func (r *Registry) SaveAccount(name string, creds *oauth.Creds, activate bool, p
 	if err := writeJSON(accountFilePath(slug), creds); err != nil {
 		return "", "", err
 	}
+	r.invalidateSlugsCache() // 文件集合可能新增 <slug>.json（P2 缓存失效）
 	idx.Accounts[slug] = metaFromCreds(creds, ts.UnixMilli())
 	if activate {
 		idx.Current = slug
@@ -464,6 +514,7 @@ func (r *Registry) RemoveAccount(name string, pool PoolReloader) (removed bool, 
 	}
 	wasCurrent := idx.Current == slug
 	_ = os.Remove(accountFilePath(slug))
+	r.invalidateSlugsCache() // 文件集合变更（P2 缓存失效）
 	delete(idx.Accounts, slug)
 	rest := make([]string, 0, len(idx.Accounts))
 	for k := range idx.Accounts {

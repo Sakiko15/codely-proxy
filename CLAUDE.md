@@ -67,4 +67,4 @@ Docker：多阶段 `Dockerfile`（golang:1.26-alpine → alpine:3.20 非 root，
 - **冷却规则**：`KindQuotaRateLimit` 恒先冷却当前账号（哪怕错误最终透传、无 failover），否则末账号会持续吸收 402。
 - **签名规则**：`SignRequest` 每请求新签（新时间戳，绑定 key + 去 query 的 path），不缓存；`UpstreamBase` 不含 `/v1`。
 - **`SetDataDir` 模式**：account/oauth/balancer/security 四包各自持有包级 `DataDir` 变量（刻意复制以避免 import cycle），新增数据文件要在自己包内扩展该模式。
-- 其他：`sanitize` 的违禁词改写只碰 `system` 字段；代理自产错误（`WriteError`）的 type 按状态映射官方集合（`anthropicErrType`/`openAIErrType`，勿回退为固定值）；`quota.Snapshot` 的 JSON 键保持 camelCase（WebUI/插件契约）；透传/拷贝响应头时恒丢弃上游 `Content-Length`（session 注入可能改写过 body）；`x-codely-probe: 1` 标记内部探测请求（跳过鉴权失败处理与访问日志），动日志时别删这个分支；`security.Status.FirstKey` 明文返回是 GO_PORT §17.8 记录的已知待办，勿"顺手修复"。
+- 其他：`sanitize` 的违禁词改写只碰 `system` 字段；其 body 重组用顶层 `json.RawMessage`（值字节保留、数字不失真、messages 无 thinking 时免解码），勿改回 `map[string]any` 全量往返；代理自产错误（`WriteError`）的 type 按状态映射官方集合（`anthropicErrType`/`openAIErrType`，勿回退为固定值）；`quota.Snapshot` 的 JSON 键保持 camelCase（WebUI/插件契约）；透传/拷贝响应头时恒丢弃上游 `Content-Length`（session 注入可能改写过 body）；`x-codely-probe: 1` 标记内部探测请求（跳过鉴权失败处理与访问日志），动日志时别删这个分支；`security.Status.FirstKey` 明文返回是 GO_PORT §17.8 记录的已知待办，勿"顺手修复"。

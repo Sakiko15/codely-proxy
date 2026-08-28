@@ -288,3 +288,48 @@ func TestKeepThinkingHistoryPreservesBlocks(t *testing.T) {
 		t.Fatalf("首块应为 thinking，got %v", first["type"])
 	}
 }
+
+func TestZeroCopyByteIdentical(t *testing.T) {
+	// P1：客户端自带齐全会话且无清洗需求 → changed=false 且输出逐字节等于输入
+	//（零拷贝快路径修复后真正可达；此前会话注入必触发全量重组）
+	in := `{"model":"x","litellm_session_id":"s","metadata":{"session_id":"s","user_id":"u"},"messages":[{"role":"user","content":"hi"}]}`
+	payload, _, changed := TransformBody("/v1/chat/completions", []byte(in), "proxy-sid")
+	if changed {
+		t.Fatalf("自带齐全会话应零拷贝")
+	}
+	if string(payload) != in {
+		t.Fatalf("零拷贝应逐字节相等:\n got %s\nwant %s", payload, in)
+	}
+}
+
+func TestNumbersPreservedOnInjection(t *testing.T) {
+	// P1：重组时值级字节保留——大整数文本不失真；未被修改的值内部键序不变
+	//（注：被修改的对象——如补 session_id 的 metadata——其内部键会字母序重排，属预期）
+	in := `{"custom":{"zz_big":123456789012345678901234567890,"aaa":1},"metadata":{"zz_big":987654321098765432109876543210,"aaa":1},"messages":[{"role":"user","content":"hi"}]}`
+	payload, _, changed := TransformBody("/v1/messages", []byte(in), "sid")
+	if !changed {
+		t.Fatalf("缺会话应 marked changed")
+	}
+	out := string(payload)
+	// 未被修改的 custom 值：原字节嵌入（大整数 + 内部键序不变）
+	if !strings.Contains(out, `{"zz_big":123456789012345678901234567890,"aaa":1}`) {
+		t.Fatalf("未修改值的字节应原样保留: %s", out)
+	}
+	// 被修改的 metadata：其中大整数文本仍精确（不 float64 失真）
+	if !strings.Contains(out, "987654321098765432109876543210") {
+		t.Fatalf("被修改对象内的大整数文本也应保留: %s", out)
+	}
+	j := mustObj(t, payload)
+	if j["litellm_session_id"] != "sid" {
+		t.Fatalf("顶层会话应注入: %v", j["litellm_session_id"])
+	}
+}
+
+func TestNumbersPreservedOnZeroCopy(t *testing.T) {
+	// P1：齐全会话 + 大整数 → 零拷贝路径字节不变（数字天然保留）
+	in := `{"litellm_session_id":"s","metadata":{"session_id":"s","big":123456789012345678901234567890},"messages":[]}`
+	payload, _, changed := TransformBody("/v1/messages", []byte(in), "other")
+	if changed || string(payload) != in {
+		t.Fatalf("应零拷贝且字节不变: changed=%v out=%s", changed, payload)
+	}
+}

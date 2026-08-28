@@ -866,7 +866,7 @@ dsh 场景下它写 `~/.dsh/settings.yaml` + 插件装配——**VPS 网关不�
    - 非 `/chat/completions`、`/messages` → **零解析直通**（现状）；
    - chat/messages → 解析一次；**若 body 已含合法 `litellm_session_id` + `metadata.session_id` 且无 thinking 块、无违禁文本 → 原样转发原始字节** `[增强]`（省掉 parse+stringify 的 CPU/GC）；
    - 仅当确实改动才重序列化。
-2. **请求体未知字段语义透传** `[增强]`：body 解析为 `map[string]any` 后重序列化会按字母序重排 key、数字经 float64（>2^53 大整数失真）——因此**仅在确实改动时才重序列化**，无改动场景一律零拷贝返回原始字节（字节级保真）。仅 `system` 值用 `json.RawMessage` 保留原字节；其余未知字段语义保留、不保证字节序（实现现状；早期"全部 RawMessage 保留"的设想未落地）。
+2. **请求体重组用顶层 `json.RawMessage`** `[增强]`：body 顶层解析为 `map[string]json.RawMessage`，值保持原字节——重组时**嵌套键序与数字文本逐字节保留**（>2^53 大整数不失真），仅顶层键字母序；`messages` 无 thinking 子串时整段免解码。仅在确实改动时才重组，无改动场景一律零拷贝返回原始字节；被剔除 thinking 的 messages 数组仍以 map 语义重组（仅该数组内数字受 float64 影响）。
 3. **响应侧全链路流式**：读上游 → 逐块写客户端，绝不整响应缓冲；SSE 路径每次写入后立即 Flush（`flushWriter`），避免 Go http ~4KB 缓冲攒批小事件 `[增强]`。
 4. **连接池**：keep-alive（`MaxIdleConnsPerHost` ≥ 8）、TCP_NODELAY、SSE 头 `x-accel-buffering:no`。
 5. **错误体只读前 ~64KB** 即可分类（401/402/429），不通读全量（`errBodyCap`，已实现）。

@@ -164,69 +164,110 @@ func SanitizeMessages(messages []map[string]any) ([]map[string]any, bool) {
 //   - 历史 thinking 块剔除（assistant 历史）；
 //   - 未知字段一律透传（不 rewrite，保持最新格式兼容）。
 //
-// ⚠️ 优化（§19.2）：若 body 已含合法会话标识且无任何清洗需求 → 返回原始字节（零拷贝直通，
-// 省 parse+stringify）；仅在确实改动时才重序列化。
+// ⚠️ 重组机制（稳定性审计 P1）：顶层解析为 map[string]json.RawMessage——值保持原字节，
+// 重组时嵌套键序与数字文本逐字节保留（此前 map[string]any 全量往返会重排嵌套键、数字经
+// float64 对 >2^53 失真）；messages 无 thinking 子串时整段免解码。仅被剔除 thinking 的
+// messages 数组仍以 map 语义重组（仅该数组内数字受 float64 影响）。
+// 若 body 已含合法会话标识且无任何清洗需求 → 返回原始字节（零拷贝直通）。
 //
 // 注：请求头 x-litellm-session-id 的注入由 proxy 层组装上游请求时做（header 不在 body 里）。
 func TransformBody(urlPath string, body []byte, sessionID string) (payload []byte, model string, changed bool) {
 	if len(body) == 0 || !(strings.Contains(urlPath, "/chat/completions") || strings.Contains(urlPath, "/messages")) {
 		return body, "", false
 	}
-	var j map[string]any
+	// 顶层 RawMessage 解析：值不解码（P1，见函数注释）
+	var j map[string]json.RawMessage
 	if err := json.Unmarshal(body, &j); err != nil {
 		return body, "", false // 非 JSON 原样透传
 	}
-	if m, ok := j["model"].(string); ok {
-		model = m
+	if m, ok := j["model"]; ok {
+		_ = json.Unmarshal(m, &model)
 	}
 
-	// 1. 会话注入（缺失才补）。metadata 非对象时保守降级（不 panic，§19.1）。
-	sid := sessionID
-	if v, ok := j["litellm_session_id"].(string); !ok || v == "" {
-		j["litellm_session_id"] = sid
-		changed = true
-	}
-	if meta, ok := j["metadata"].(map[string]any); ok {
-		if v, ok := meta["session_id"].(string); !ok || v == "" {
-			meta["session_id"] = sid
+	// 1. 会话注入（缺失/空/非字符串才补）。metadata 非对象时保守降级（不 panic，§19.1）。
+	if v, ok := j["litellm_session_id"]; ok {
+		var s string
+		if json.Unmarshal(v, &s) != nil || s == "" {
+			j["litellm_session_id"] = rawOf(sessionID)
 			changed = true
 		}
-	} else if j["metadata"] == nil {
-		j["metadata"] = map[string]any{"session_id": sid}
+	} else {
+		j["litellm_session_id"] = rawOf(sessionID)
 		changed = true
 	}
-	// metadata 为非对象（字符串/数组）→ 不动（透传，保守降级对齐 JS 的 catch→透传）
-
-	// 2. system 清洗（仅 system，§17.2）——只有实际改动才置 changed
-	if sys, ok := j["system"]; ok {
-		raw, _ := json.Marshal(sys)
-		newSys := sanitizeSystem(raw)
-		if !bytes.Equal(raw, newSys) {
-			j["system"] = json.RawMessage(newSys)
+	if metaRaw, ok := j["metadata"]; !ok {
+		j["metadata"] = rawOf(map[string]string{"session_id": sessionID})
+		changed = true
+	} else {
+		var meta map[string]json.RawMessage
+		if uerr := json.Unmarshal(metaRaw, &meta); uerr != nil {
+			// 非对象（字符串/数组）→ 不动（透传，保守降级对齐 JS 的 catch→透传）
+		} else if meta == nil {
+			// JSON null → 视为缺失，建对象
+			j["metadata"] = rawOf(map[string]string{"session_id": sessionID})
 			changed = true
-		}
-	}
-
-	// 3. messages 历史 thinking 剔除——只有实际剔除才置 changed
-	if msgs, ok := j["messages"].([]any); ok {
-		maps := make([]map[string]any, 0, len(msgs))
-		for _, m := range msgs {
-			if mm, ok := m.(map[string]any); ok {
-				maps = append(maps, mm)
-			} else {
-				maps = append(maps, map[string]any{})
+		} else {
+			need := true
+			if v, ok := meta["session_id"]; ok {
+				var s string
+				if json.Unmarshal(v, &s) == nil && s != "" {
+					need = false
+				}
+			}
+			if need {
+				meta["session_id"] = rawOf(sessionID)
+				j["metadata"] = rawOf(meta)
+				changed = true
 			}
 		}
-		cleaned, c := SanitizeMessages(maps)
-		if c {
-			j["messages"] = cleaned
+	}
+
+	// 2. system 清洗（仅 system，§17.2）——只有实际改动才置 changed
+	if sysRaw, ok := j["system"]; ok {
+		newSys := sanitizeSystem(sysRaw)
+		if !bytes.Equal(sysRaw, newSys) {
+			j["system"] = newSys
 			changed = true
+		}
+	}
+
+	// 3. messages 历史 thinking 剔除——Contains 预检：无 thinking 子串时整段免解码（P1）；
+	//    只有实际剔除才置 changed
+	if msgsRaw, ok := j["messages"]; ok && RemoveThinkingHistory &&
+		(bytes.Contains(msgsRaw, []byte(`"thinking"`)) || bytes.Contains(msgsRaw, []byte(`"redacted_thinking"`))) {
+		var msgs []any
+		if json.Unmarshal(msgsRaw, &msgs) == nil {
+			maps := make([]map[string]any, 0, len(msgs))
+			for _, m := range msgs {
+				if mm, ok := m.(map[string]any); ok {
+					maps = append(maps, mm)
+				} else {
+					maps = append(maps, map[string]any{})
+				}
+			}
+			cleaned, c := SanitizeMessages(maps)
+			if c {
+				j["messages"] = rawOf(cleaned)
+				changed = true
+			}
 		}
 	}
 
 	if !changed {
 		return body, model, false // 零拷贝直通
 	}
-	out, _ := json.Marshal(j)
+	out, err := json.Marshal(j) // 顶层键字母序；值级字节保留（嵌套键序/数字文本不变，P1）
+	if err != nil {
+		return body, model, false // 重组失败回退原字节（保守）
+	}
 	return out, model, true
+}
+
+// rawOf 序列化为 RawMessage（本包输入均为内置类型，不会失败；失败时以 null 占位防写入 nil）。
+func rawOf(v any) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return json.RawMessage("null")
+	}
+	return json.RawMessage(b)
 }

@@ -46,3 +46,21 @@ func TestWriteCreatesDirs(t *testing.T) {
 		t.Fatalf("内容不符: %q", got)
 	}
 }
+
+func TestCleanupTemp(t *testing.T) {
+	// 审查记录 P2 #36：启动清扫崩溃残留的 *.tmp（可能是凭据明文），不动正常文件
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "codely-creds.json.tmp"), []byte("stale"), 0o600); err != nil {
+		t.Fatalf("写 tmp: %v", err)
+	}
+	if err := Write(filepath.Join(dir, "keep.json"), []byte("ok"), 0o600); err != nil {
+		t.Fatalf("写正常文件: %v", err)
+	}
+	CleanupTemp(dir)
+	if _, err := os.Stat(filepath.Join(dir, "codely-creds.json.tmp")); !os.IsNotExist(err) {
+		t.Fatalf("残留 tmp 应被清扫")
+	}
+	if data, err := os.ReadFile(filepath.Join(dir, "keep.json")); err != nil || string(data) != "ok" {
+		t.Fatalf("正常文件不得被动: %v", err)
+	}
+}

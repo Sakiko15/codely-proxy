@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"codely-proxy/internal/account"
+	"codely-proxy/internal/atomicfile"
 	"codely-proxy/internal/balancer"
 	"codely-proxy/internal/config"
 	"codely-proxy/internal/oauth"
@@ -64,6 +65,9 @@ func main() {
 	oauth.SetDataDir(cfg.DataDir)
 	balancer.SetDataDir(cfg.DataDir)
 	security.SetDataDir(cfg.DataDir)
+	// 审查记录 P2 #36：启动清扫上次进程崩溃残留的 *.tmp（可能是凭据明文）
+	atomicfile.CleanupTemp(cfg.DataDir)
+	atomicfile.CleanupTemp(filepath.Join(cfg.DataDir, "accounts"))
 	logger.Printf("[init] 数据目录: %s", cfg.DataDir)
 
 	// ---- sanitize 开关（KEEP_THINKING_HISTORY，§19.3 [增强]）----

@@ -195,14 +195,15 @@ func (s *Server) handleAuthStatus(rw http.ResponseWriter, req *http.Request) {
 }
 
 // handleHealthz GET /healthz（无需登录，供监控/反代）。
+// 审查记录 P2 #35：account 布尔化——免登录端点不泄露 userId/teamId/teamName 等账号标识。
 func (s *Server) handleHealthz(rw http.ResponseWriter, req *http.Request) {
-	meta := s.Registry.GetCurrentMeta()
+	hasAccount := s.Registry.GetCurrentMeta() != nil
 	resp := map[string]any{
-		"ok":         true,
-		"upstream":   s.ProxyUpstream,
-		"keyCached":  s.Registry.LoadAccountCreds(s.Registry.GetCurrentName()) != nil,
-		"account":    meta,
-		"time":       time.Now().Format(time.RFC3339),
+		"ok":        true,
+		"upstream":  s.ProxyUpstream,
+		"keyCached": s.Registry.LoadAccountCreds(s.Registry.GetCurrentName()) != nil,
+		"account":   hasAccount,
+		"time":      time.Now().Format(time.RFC3339),
 	}
 	writeJSON(rw, http.StatusOK, resp)
 }
@@ -296,6 +297,25 @@ func (s *Server) handleBalancerConfig(rw http.ResponseWriter, req *http.Request)
 	if err := json.Unmarshal(data, &patch); err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid json"})
 		return
+	}
+	// 审查记录 P2 #37：已知键类型不符 → 400（此前静默忽略且恒 200，调用方无从分辨未生效）
+	if v, ok := patch["enabled"]; ok {
+		if _, isBool := v.(bool); !isBool {
+			writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "enabled 必须为布尔值"})
+			return
+		}
+	}
+	if v, ok := patch["mode"]; ok {
+		if _, isStr := v.(string); !isStr {
+			writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "mode 必须为字符串"})
+			return
+		}
+	}
+	if v, ok := patch["disabledSlugs"]; ok {
+		if _, isArr := v.([]any); !isArr {
+			writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "disabledSlugs 必须为数组"})
+			return
+		}
 	}
 	cfg, err := s.Balancer.UpdateConfig(patch)
 	if err != nil {

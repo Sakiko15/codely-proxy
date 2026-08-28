@@ -408,12 +408,15 @@ async function startDevLogin() {
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   const btn = document.getElementById('dev-start-btn');
   btn.disabled = true;
-  // 逻辑审查 F7：备注名按后端 Slugify 同规则预规范化——非法字符此前会被服务端静默丢弃
+  // 逻辑审查 F7：备注名按后端 Slugify 同规则预规范化——非法字符此前会被服务端静默丢弃；
+  // 审查记录 P2 #34：补齐 index 保留字与 64 长度上限（后端 Slugify 返回空 → 走自动命名）
   const nameInput = document.getElementById('dev-alias');
   let name = nameInput.value.trim();
   if (name) {
     const slug = name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
-    if (!slug) { showToast('备注名仅支持字母数字与 . _ -（将使用自动命名）', true); name = ''; }
+    if (!slug || slug === 'index' || slug.length > 64) {
+      showToast('备注名仅支持字母数字与 . _ -（长度≤64，且不可为 index）', true); name = '';
+    }
     else if (slug !== name) { nameInput.value = slug; name = slug; showToast('备注名已规范化为 ' + slug); }
   }
   try {

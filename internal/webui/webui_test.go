@@ -174,6 +174,34 @@ func TestHealthzNoAuth(t *testing.T) {
 	if rw.Code != 200 {
 		t.Fatalf("healthz 应 200，got %d", rw.Code)
 	}
+	// 审查记录 P2 #35：免登录端点 account 布尔化，不得泄露账号标识
+	var j map[string]any
+	_ = json.Unmarshal(rw.Body.Bytes(), &j)
+	if _, isBool := j["account"].(bool); !isBool {
+		t.Fatalf("account 应为布尔（不泄露元数据）: %s", rw.Body.String())
+	}
+	if strings.Contains(rw.Body.String(), "userId") || strings.Contains(rw.Body.String(), "teamId") {
+		t.Fatalf("healthz 不得泄露账号元数据: %s", rw.Body.String())
+	}
+}
+
+func TestBalancerConfigBadType(t *testing.T) {
+	// 审查记录 P2 #37：patch 已知键类型不符 → 400（此前静默忽略且恒 200）
+	srv, cleanup := buildServer(t)
+	defer cleanup()
+	cookie := login(t, srv)
+	rw, _ := doJSON(t, srv, "POST", "/api/balancer/config", `{"enabled":"yes"}`, cookie)
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("enabled 非布尔应 400, got %d", rw.Code)
+	}
+	rw, _ = doJSON(t, srv, "POST", "/api/balancer/config", `{"mode":123}`, cookie)
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("mode 非字符串应 400, got %d", rw.Code)
+	}
+	rw, _ = doJSON(t, srv, "POST", "/api/balancer/config", `{"enabled":true}`, cookie)
+	if rw.Code != 200 {
+		t.Fatalf("合法 patch 应 200, got %d", rw.Code)
+	}
 }
 
 func TestIndexServed(t *testing.T) {
@@ -280,6 +308,7 @@ func TestWebUIFrontendStateFixes(t *testing.T) {
 		{"e.message === '未登录'", "F4 轮询会话过期终止"},
 		{"'/api/login'", "F6 登录 401 不触发 showLogin"},
 		{"备注名仅支持字母数字", "F7 备注名预校验"},
+		{"slug === 'index'", "P2 #34 备注名校验补全（index 保留字/长度上限）"},
 		{"/^https?:/i", "S2 授权链接 scheme 加固"},
 		{"加载失败", "F5 加载错误态"},
 	} {

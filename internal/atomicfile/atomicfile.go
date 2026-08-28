@@ -7,6 +7,8 @@ package atomicfile
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -40,5 +42,26 @@ func Write(path string, data []byte, perm os.FileMode) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, path)
+	// 审查记录 P2 #36：Rename 失败（Windows 目标被占用等）同样清理 tmp——
+	// 此前是唯一不清理的失败分支，与"任一步失败都会清理临时文件"的注释矛盾，
+	// 残留的 codely-creds.json.tmp 属凭据明文
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// CleanupTemp 清扫目录下残留的 *.tmp（进程在 Rename 前被 kill/断电会留下临时文件，
+// 可能是凭据明文；审查记录 P2 #36）。启动时对数据目录与 accounts 子目录各调一次。
+func CleanupTemp(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".tmp") {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
 }

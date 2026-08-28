@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"codely-proxy/internal/account"
@@ -15,6 +16,12 @@ import (
 	"codely-proxy/internal/security"
 	"codely-proxy/internal/sseguard"
 )
+
+// activeStreams 当前在途响应流数（透传中的 200 响应；停机超时时用于观测截断规模，稳定性审计 F2）。
+var activeStreams atomic.Int64
+
+// ActiveStreams 返回在途流数。
+func ActiveStreams() int64 { return activeStreams.Load() }
 
 // Handler 是转发编排器（鉴权 → 选号 → 重试循环 → SSE 透传 → 错误分类）。
 type Handler struct {
@@ -254,6 +261,11 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 // pipeResponse 把上游 200 响应透传给客户端（SSE 加头 + 可选流式守护；非 SSE 完整透传）。
 func (h *Handler) pipeResponse(rw http.ResponseWriter, req *http.Request, r ForwardResult, slug string) {
 	resp := r.Resp
+	activeStreams.Add(1)
+	defer activeStreams.Add(-1)
+	// 上游体空闲超时兜底（稳定性审计 F1）：headers 已到但上游挂起零字节时，
+	// 无此兜底会永久占用 goroutine 与连接。SSE 与非 SSE 都生效。
+	resp.Body = newIdleBody(resp.Body, upstreamIdleTimeout)
 	// 复制响应头
 	copyHeaders(rw, resp.Header)
 	rw.Header().Set("x-codely-routed-account", slug)

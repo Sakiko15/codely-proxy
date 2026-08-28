@@ -202,6 +202,42 @@ func TestHandlerModelDeniedPassthrough(t *testing.T) {
 
 // ---- [增强] SSE 逐事件刷新 ----
 
+func TestHandlerSSEIdleTimeoutCloses(t *testing.T) {
+	// 稳定性审计 F1：上游 headers 已到但此后零字节挂起 → 空闲超时应解除阻塞，
+	// 客户端收到首事件 + 合成终止事件，goroutine 不被永久占用
+	old := upstreamIdleTimeout
+	upstreamIdleTimeout = 80 * time.Millisecond
+	t.Cleanup(func() { upstreamIdleTimeout = old })
+
+	h, _, _, cleanup := buildHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(500 * time.Millisecond) // 之后挂住不写（超出空闲窗口）
+	})
+	defer cleanup()
+
+	done := make(chan string, 1)
+	go func() {
+		rw := doReq(t, h, "POST", "/v1/chat/completions", `{"model":"codely-flash","messages":[],"stream":true}`, nil)
+		done <- rw.Body.String()
+	}()
+	select {
+	case out := <-done:
+		if !containsStr(out, `"content":"x"`) {
+			t.Fatalf("应透传首事件: %s", out)
+		}
+		if !containsStr(out, "data: [DONE]") {
+			t.Fatalf("空闲超时后应合成 [DONE] 收尾: %s", out)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("空闲超时应解除阻塞（3s 内完成）")
+	}
+}
+
 // 常量 402 mock：quota 探测（GET usage/summary）与非推理路径一律 402（额度耗尽语义），
 // 仅统计 POST /v1/chat/completions 命中数。
 func quotaMock(hits *int) func(http.ResponseWriter, *http.Request) {

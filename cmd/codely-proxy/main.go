@@ -134,10 +134,16 @@ func main() {
 		os.Exit(1)
 	case sig := <-sigCh:
 		logger.Printf("[proxy] 收到 %v，优雅停机 ...", sig)
+		// 二次信号 → 强制退出（稳定性审计 F2：在途长流可能挂起 Shutdown，给运维硬退出手段）
+		go func() {
+			<-sigCh
+			logger.Printf("[proxy] 收到二次信号，强制退出")
+			os.Exit(1)
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
-			logger.Printf("[proxy] 停机超时: %v", err)
+			logger.Printf("[proxy] 停机超时，%d 条在途流将被截断: %v", proxy.ActiveStreams(), err)
 		}
 		logger.Printf("[proxy] 已退出")
 	}

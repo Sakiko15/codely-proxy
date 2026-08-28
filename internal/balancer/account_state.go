@@ -257,7 +257,13 @@ func (s *AccountState) RefreshAPIKey() (string, error) {
 				s.persistCreds(creds) // 写回 accounts/<slug>.json
 			}
 		}
-		key, err := oauth.FetchAPIKey(creds)
+		updated, key, err := oauth.FetchAPIKey(creds)
+		if updated != nil && updated.RefreshToken != creds.RefreshToken {
+			// 逻辑审查 P0：换 key 途中 401 刷新会轮换 refresh_token——必须持久化回
+			// accounts/<slug>.json，否则下次从文件加载旧 token 刷新必失败（账号被永久刷废）。
+			// 即使换 key 最终失败也持久化（凭据已轮换，不落盘就会丢）。
+			s.persistCreds(updated)
+		}
 		if err != nil {
 			return "", err
 		}

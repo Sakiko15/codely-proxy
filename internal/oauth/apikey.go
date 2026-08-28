@@ -30,34 +30,50 @@ type CliAPIKeyResponse struct {
 	TPM       *int       `json:"tpm,omitempty"`
 }
 
+// apiKeyResult 是 fetchAPIKeyOnce 的结果。
+type apiKeyResult struct {
+	// creds 未刷新时与入参同实例；401 触发刷新成功后为轮换凭据——调用方必须持久化。
+	creds *Creds
+	key   string
+}
+
 // FetchAPIKey 用 access_token 换 LiteLLM sk- 密钥（幂等：并发 Single-flight 防重）。
 // 对标 codely-auth.js fetchApiKey。
 //
 //   - 传 creds 则用其 access_token 直接换（账号切换时用，走 per-account 路径）；
 //   - 不传则用当前激活账号（GetAccessToken 自动刷新）。
 //   - 401/403 表示 access_token 过期 → 刷新后重试一次。
-func FetchAPIKey(creds *Creds) (string, error) {
+//
+// ⚠️ 返回的 updated 凭据（逻辑审查 P0）：上游 refresh 是轮换式的——401 触发的刷新会返回
+// **新 refresh_token**，此前在此被丢弃导致账号被永久刷废。现在轮换后的凭据随结果交还，
+// 调用方必须持久化（oauth 不了解账号文件布局）；未刷新时 updated 与入参同实例。
+// 即使重试换 key 仍失败（err != nil），已轮换的凭据也会随结果返回——凭据已轮换，必须落盘。
+func FetchAPIKey(creds *Creds) (*Creds, string, error) {
 	// 有显式 creds（per-account）时不走全局单飞，直接换
 	if creds != nil {
-		return fetchAPIKeyOnce(creds)
+		res, err := fetchAPIKeyOnce(creds)
+		if res != nil {
+			return res.creds, res.key, err
+		}
+		return nil, "", err
 	}
 	v, err, _ := apiKeyFlight.Do("api-key", func() (any, error) {
 		return fetchAPIKeyOnce(nil)
 	})
-	if err != nil {
-		return "", err
+	if res, ok := v.(*apiKeyResult); ok && res != nil {
+		return res.creds, res.key, err
 	}
-	return v.(string), nil
+	return nil, "", err
 }
 
 // fetchAPIKeyOnce 执行一次换 key（不单飞）。
-func fetchAPIKeyOnce(creds *Creds) (string, error) {
+func fetchAPIKeyOnce(creds *Creds) (*apiKeyResult, error) {
 	c := creds
 	if c == nil {
 		var err error
 		c, err = GetAccessToken()
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 	}
 	u, _ := url.Parse(Base + "/api/api-token/cli-api-key")
@@ -68,51 +84,42 @@ func fetchAPIKeyOnce(creds *Creds) (string, error) {
 	}
 	status, data, err := getJSON(u.String(), c.AccessToken)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if status == 401 || status == 403 {
 		// access_token 过期：刷新后重试一次
-		// ⚠️ code-review #2：传了 creds（per-account）时按该账号刷新，不串全局激活账号；
-		// 未传 creds（走全局激活账号）时用全局刷新。
-		t := ""
-		if c != nil {
-			updated, err := RefreshAccessTokenFor(c)
-			if err == nil {
-				t = updated.AccessToken
-			}
-		} else {
-			t, _ = RefreshAccessToken()
+		// ⚠️ code-review #2：按传入凭据刷新（per-account 或全局激活账号），不串号。
+		updated, rerr := RefreshAccessTokenFor(c)
+		if rerr != nil {
+			return &apiKeyResult{creds: c}, fmt.Errorf("刷新 access_token 失败")
 		}
-		if t == "" {
-			return "", fmt.Errorf("刷新 access_token 失败")
-		}
-		status, data, err = getJSON(u.String(), t)
+		status, data, err = getJSON(u.String(), updated.AccessToken)
 		if err != nil {
-			return "", err
+			return &apiKeyResult{creds: updated}, err
 		}
 		if status < 200 || status >= 300 {
-			return "", fmt.Errorf("换取密钥失败: HTTP %d（请重新登录: WebUI 添加账号）", status)
+			return &apiKeyResult{creds: updated}, fmt.Errorf("换取密钥失败: HTTP %d（请重新登录: WebUI 添加账号）", status)
 		}
 		var j2 CliAPIKeyResponse
 		if err := json.Unmarshal(data, &j2); err != nil {
-			return "", err
+			return &apiKeyResult{creds: updated}, err
 		}
 		if !strings.HasPrefix(j2.CliAPIKey, "sk-") {
-			return "", fmt.Errorf("密钥格式异常: %s", truncate(j2.CliAPIKey, 8))
+			return &apiKeyResult{creds: updated}, fmt.Errorf("密钥格式异常: %s", truncate(j2.CliAPIKey, 8))
 		}
-		return j2.CliAPIKey, nil
+		return &apiKeyResult{creds: updated, key: j2.CliAPIKey}, nil
 	}
 	if status < 200 || status >= 300 {
-		return "", fmt.Errorf("换取密钥失败: HTTP %d", status)
+		return &apiKeyResult{creds: c}, fmt.Errorf("换取密钥失败: HTTP %d", status)
 	}
 	var j CliAPIKeyResponse
 	if err := json.Unmarshal(data, &j); err != nil {
-		return "", err
+		return &apiKeyResult{creds: c}, err
 	}
 	if !strings.HasPrefix(j.CliAPIKey, "sk-") {
-		return "", fmt.Errorf("密钥格式异常: %s", truncate(j.CliAPIKey, 8))
+		return &apiKeyResult{creds: c}, fmt.Errorf("密钥格式异常: %s", truncate(j.CliAPIKey, 8))
 	}
-	return j.CliAPIKey, nil
+	return &apiKeyResult{creds: c, key: j.CliAPIKey}, nil
 }
 
 // ClientHeaders 是伪造官方 CLI 身份头组（PROTOCOL.md §2.2 / PROTOCOL_SCHEMA.md §16）。

@@ -488,7 +488,13 @@ func (r *Registry) ActivateAccount(name string, pool PoolReloader) (Account, str
 	// 稳定性审计 F3：sk- 密钥预取走网络（oauth.HTTPClient 30s 上限），必须在锁外执行——
 	// 持 r.mu 调用会阻塞 /healthz 与免调度模式的每条 /v1 请求。失败本就不阻塞（代理下一请求自动重试）。
 	r.mu.Unlock()
-	key, _ := oauth.FetchAPIKey(creds)
+	updated, key, _ := oauth.FetchAPIKey(creds)
+	if updated != nil && updated.RefreshToken != creds.RefreshToken {
+		// 逻辑审查 P0：预取途中 401 刷新轮换了 refresh_token——激活态需同时回写
+		// accounts/<slug>.json 与 codely-creds.json（全局链路共用后者），best-effort
+		_, _, _ = r.SaveAccount(slug, updated, false, nil)
+		_ = updated.SaveCreds()
+	}
 	acct := Account{
 		Name:     slug,
 		TeamID:   creds.TeamID,

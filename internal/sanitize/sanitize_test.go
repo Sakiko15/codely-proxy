@@ -180,6 +180,27 @@ func TestNonJSONPassthrough(t *testing.T) {
 	}
 }
 
+func TestNullBodyPassthrough(t *testing.T) {
+	// 逻辑审查 P0：顶层 JSON null 是合法 JSON（Unmarshal 无错但 map 为 nil）——
+	// 此前对 nil map 赋值 panic，必须与"非 JSON"同样原样透传
+	payload, model, changed := TransformBody("/v1/messages", []byte(`null`), "sid")
+	if changed || model != "" || string(payload) != `null` {
+		t.Fatalf("顶层 null 应原样透传: changed=%v model=%q payload=%s", changed, model, payload)
+	}
+}
+
+func TestNullSystemPreserved(t *testing.T) {
+	// 逻辑审查 P0："system":null 不应被改写成 ""（null 解码进 string 得零值空串）
+	in := `{"system":null,"messages":[{"role":"user","content":"hi"}]}`
+	payload, _, changed := TransformBody("/v1/messages", []byte(in), "sid")
+	if !changed {
+		t.Fatalf("缺 session 应 marked changed")
+	}
+	if !strings.Contains(string(payload), `"system":null`) {
+		t.Fatalf("system null 应原样保留: %s", payload)
+	}
+}
+
 func TestNonChatPathPassthrough(t *testing.T) {
 	payload, _, changed := TransformBody("/v1/models", []byte(`{"x":1}`), "sid")
 	if changed || string(payload) != `{"x":1}` {

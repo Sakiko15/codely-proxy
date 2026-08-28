@@ -41,6 +41,11 @@ func SanitizeText(s string) string {
 // systemText 从 system 字段（string 或 block 数组）抽取全部 text，返回新值。
 // 若 system 是 block 数组：对每个含 text 的块做清洗，空文本块被剔除。
 func sanitizeSystem(system json.RawMessage) json.RawMessage {
+	if bytes.Equal(bytes.TrimSpace(system), []byte("null")) {
+		// JSON null 原样透传（逻辑审查 P0）：null 解码进 string 得零值空串，
+		// 会把 "system":null 误改写成 "system":""（语义改写）
+		return system
+	}
 	// string 形态
 	var str string
 	if err := json.Unmarshal(system, &str); err == nil {
@@ -179,6 +184,11 @@ func TransformBody(urlPath string, body []byte, sessionID string) (payload []byt
 	var j map[string]json.RawMessage
 	if err := json.Unmarshal(body, &j); err != nil {
 		return body, "", false // 非 JSON 原样透传
+	}
+	if j == nil {
+		// 顶层 JSON `null`：stdlib 对 map 无错但置 nil（decode.go 对 Map kind SetZero），
+		// 继续走会对 nil map 赋值 panic（逻辑审查 P0）——与"非 JSON"同样原样透传
+		return body, "", false
 	}
 	if m, ok := j["model"]; ok {
 		_ = json.Unmarshal(m, &model)

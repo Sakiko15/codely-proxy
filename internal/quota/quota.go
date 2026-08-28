@@ -234,7 +234,12 @@ func (q *Quota) fetchFresh(creds *oauth.Creds, fp string) (*Snapshot, error) {
 
 	// /key/info 依赖 sk- 密钥（失败不影响主数据）
 	var rateLimit *RateLimit
-	if apiKey, err := oauth.FetchAPIKey(creds); err == nil {
+	if updated, apiKey, ferr := oauth.FetchAPIKey(creds); ferr == nil {
+		if updated != nil && updated.RefreshToken != creds.RefreshToken {
+			// 逻辑审查 P0：401 刷新轮换的凭据持久化回激活账号文件（codely-creds.json）；
+			// 与全局刷新并发的 last-writer-wins 残余由下次 401 自愈
+			_ = updated.SaveCreds()
+		}
 		rateLimit = FetchKeyInfo(apiKey)
 	}
 

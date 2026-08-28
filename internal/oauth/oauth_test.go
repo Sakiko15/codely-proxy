@@ -71,7 +71,7 @@ func TestFetchAPIKey(t *testing.T) {
 	Base = base
 
 	writeCredsTeam(t, "tok-abc", "ref-1", "team-9", now()+10*60*1000)
-	key, err := FetchAPIKey(nil)
+	_, key, err := FetchAPIKey(nil)
 	if err != nil {
 		t.Fatalf("FetchAPIKey err: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestFetchAPIKeySkPrefixRequired(t *testing.T) {
 	Base = base
 
 	writeCreds(t, "tok-abc", "", now()+10*60*1000)
-	if _, err := FetchAPIKey(nil); err == nil {
+	if _, _, err := FetchAPIKey(nil); err == nil {
 		t.Fatalf("sk- 前缀缺失应报错")
 	}
 }
@@ -121,7 +121,7 @@ func TestFetchAPIKeyRefreshOn401(t *testing.T) {
 	Base = base
 
 	writeCreds(t, "tok-old", "ref-ok", now()+10*60*1000)
-	key, err := FetchAPIKey(nil)
+	_, key, err := FetchAPIKey(nil)
 	if err != nil {
 		t.Fatalf("FetchAPIKey err: %v", err)
 	}
@@ -130,6 +130,52 @@ func TestFetchAPIKeyRefreshOn401(t *testing.T) {
 	}
 	if key != "sk-after-refresh" {
 		t.Fatalf("key = %q, want sk-after-refresh", key)
+	}
+}
+
+func TestFetchAPIKeyReturnsRotatedCreds(t *testing.T) {
+	// 逻辑审查 P0：401 触发的刷新是轮换式的——FetchAPIKey 必须把轮换后的凭据交还
+	// 调用方持久化（此前丢弃新 refresh_token，账号被永久刷废）
+	var keyCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/auth/refresh":
+			_, _ = w.Write([]byte(`{"access_token":"at2","refresh_token":"rt-rotated","expires_in":3600}`))
+		case "/api/api-token/cli-api-key":
+			keyCalls++
+			if r.Header.Get("Authorization") == "Bearer at1" {
+				http.Error(w, "expired", 401) // 首次（旧 token）401 → 触发刷新
+				return
+			}
+			_, _ = w.Write([]byte(`{"cli_api_key":"sk-k1"}`))
+		default:
+			http.Error(w, "nf", 404)
+		}
+	}))
+	defer srv.Close()
+	oldBase := Base
+	defer func() { Base = oldBase }()
+	Base = srv.URL
+
+	// 轮换路径：401 → refresh（轮换 rt）→ 重试成功；updated 必须携带轮换后的凭据
+	creds := &Creds{AccessToken: "at1", RefreshToken: "rt1", TeamID: "t1"}
+	updated, key, err := FetchAPIKey(creds)
+	if err != nil {
+		t.Fatalf("FetchAPIKey err: %v", err)
+	}
+	if key != "sk-k1" || keyCalls != 2 {
+		t.Fatalf("key=%q calls=%d", key, keyCalls)
+	}
+	if updated == nil || updated == creds || updated.RefreshToken != "rt-rotated" || updated.AccessToken != "at2" {
+		t.Fatalf("应返回轮换后的凭据, got %+v", updated)
+	}
+
+	// 直通路径（无刷新）：updated 与入参同实例——调用方据此跳过持久化
+	creds2 := &Creds{AccessToken: "ok", RefreshToken: "keep", TeamID: "t1"}
+	updated2, key2, err := FetchAPIKey(creds2)
+	if err != nil || key2 != "sk-k1" || updated2 != creds2 || updated2.RefreshToken != "keep" {
+		t.Fatalf("无刷新应原样返回入参凭据, got %+v key=%q err=%v", updated2, key2, err)
 	}
 }
 

@@ -228,7 +228,8 @@ func TransformBody(urlPath string, body []byte, sessionID string) (*Transformed,
     var j map[string]any
     if err := json.Unmarshal(body, &j); err != nil { return &Transformed{Payload: body}, nil } // 非 JSON 原样透传
     sid := sessionID
-    if j["litellm_session_id"] == nil { j["litellm_session_id"] = sid }
+    // 实现语义（逻辑审查 P2 对齐）：缺失/空/非字符串才补
+    if v, ok := j["litellm_session_id"].(string); !ok || v == "" { j["litellm_session_id"] = sid }
     // ⚠️ 保守降级：JS 用 j.metadata = {} 但客户端 metadata 可能是非对象，
     // JS 抛错→catch→原样透传；Go 不能 panic，用类型断言保守跳过注入（对齐 JS 静默降级）。
     if m, ok := j["metadata"].(map[string]any); ok && m != nil {
@@ -614,7 +615,7 @@ dsh 场景下它写 `~/.dsh/settings.yaml` + 插件装配——**VPS 网关不�
 
 ## 12. `internal/config` + `internal/logging` + CLI 入口
 
-- 配置加载：`Config{Port, Bind, DataDir, WebUIUser, WebUIPass, ProxyAPIKey}`，来源优先级 `env > args > 默认`；
+- 配置加载：`Config{Port, Bind, DataDir, WebUIUser, WebUIPass, ProxyAPIKey}`，来源优先级 `flag > env > 默认`（flag 默认值取自 env，显式传参覆盖；逻辑审查 P2 对齐实现）；
 - 日志：stdout 标签化 `[HH:MM:SS] [proxy|key|balancer|quota|account|probe] msg`（Docker 直接收集）；
 - `main.go` 仅保留启动代理的 flag：`--port`（默认 8790 / `CODELY_PROXY_PORT`）、`--bind`（默认 127.0.0.1 / `CODELY_PROXY_BIND`）、
   `--data-dir`（默认 `/app/data` / `CODELY_DATA_DIR`）、`--webui-user`/`--webui-pass`（`WEBUI_USER`/`WEBUI_PASS`）；

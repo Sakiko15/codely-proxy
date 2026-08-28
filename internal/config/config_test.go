@@ -2,6 +2,18 @@ package config
 
 import "testing"
 
+func TestParsePortStrict(t *testing.T) {
+	// 逻辑审查 P2：严格全串解析（Sscanf 不要求全消费，"8790abc" 曾静默当 8790）
+	if p, err := parsePort("8790"); err != nil || p != 8790 {
+		t.Fatalf("合法端口解析失败: %v %v", p, err)
+	}
+	for _, bad := range []string{"8790abc", "87.90", "abc", "0", "99999", "-1", ""} {
+		if _, err := parsePort(bad); err == nil {
+			t.Fatalf("非法端口 %q 应报错", bad)
+		}
+	}
+}
+
 // TestLoadKeepThinkingHistory 验证 KEEP_THINKING_HISTORY 解析：
 // 仅 "1"/"true"（大小写不敏感）为 true；未设/空/"0"/垃圾值一律 false（默认剔除行为不变）。
 func TestLoadTrustProxy(t *testing.T) {

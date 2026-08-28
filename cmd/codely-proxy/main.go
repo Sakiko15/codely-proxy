@@ -36,11 +36,13 @@ import (
 var version = "0.1.0"
 
 func main() {
-	// ---- flag 解析（env > flag > 默认，config.Load 已处理 env） ----
+	// ---- flag 解析（flag > env > 默认：flag 默认值取自 env，显式传参覆盖） ----
 	cfg := config.Load()
 	port := flag.Int("port", cfg.Port, "监听端口（env CODELY_PROXY_PORT）")
 	bind := flag.String("bind", cfg.Bind, "监听地址（env CODELY_PROXY_BIND）")
 	dataDir := flag.String("data-dir", cfg.DataDir, "数据目录（env CODELY_DATA_DIR）")
+	webuiUser := flag.String("webui-user", cfg.WebUIUser, "WebUI 用户名（env WEBUI_USER）")
+	webuiPass := flag.String("webui-pass", cfg.WebUIPass, "WebUI 密码（env WEBUI_PASS）")
 	showVer := flag.Bool("version", false, "显示版本")
 	flag.Parse()
 
@@ -51,6 +53,8 @@ func main() {
 	cfg.Port = *port
 	cfg.Bind = *bind
 	cfg.DataDir = *dataDir
+	cfg.WebUIUser = *webuiUser
+	cfg.WebUIPass = *webuiPass
 
 	logger := log.New(os.Stdout, "", log.LstdFlags)
 

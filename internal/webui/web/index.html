@@ -380,6 +380,14 @@ async function pollDevLogin() {
     } else if (r.status === 'denied' || r.status === 'expired') {
       clearInterval(pollTimer);
       document.getElementById('dev-status').textContent = '❌ ' + (r.message || r.status);
+    } else if (r.status === 'error') {
+      // 逻辑审查 P2：授权完成后 exchange 失败 → slot 已清，此前会无限显示"等待授权中"
+      clearInterval(pollTimer);
+      document.getElementById('dev-status').textContent = '❌ 登录失败：' + (r.error || r.message || '未知错误');
+    } else if (r.status === 'idle') {
+      // slot 已清（授权后 exchange 失败/会话过期）——停止轮询
+      clearInterval(pollTimer);
+      document.getElementById('dev-status').textContent = '❌ 登录会话已失效，请重新发起';
     } else {
       document.getElementById('dev-status').textContent = '⏳ 等待授权中...';
     }

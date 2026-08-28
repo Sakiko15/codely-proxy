@@ -36,7 +36,9 @@ const (
 	KindModelDenied
 	// KindQuotaRateLimit 402/429 → 冷却 + 可选漂移，或透传。
 	KindQuotaRateLimit
-	// KindError 网络/上游错误（连接失败、超时、5xx 等）。
+	// KindError 网络/上游错误（连接失败、超时等）。
+	// ⚠️ 上游 5xx 不属于此类——走 KindOK 原样透传，不冷却不漂移（与 JS 语义一致；
+	// 逻辑审查 P2：修正此处声称"5xx ∈ KindError"的误导性注释）。
 	KindError
 )
 

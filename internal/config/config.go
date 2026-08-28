@@ -13,8 +13,11 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -55,6 +58,10 @@ func Load() Config {
 	if v := os.Getenv("CODELY_PROXY_PORT"); v != "" {
 		if p, err := parsePort(v); err == nil {
 			cfg.Port = p
+		} else {
+			// 逻辑审查 P2：非法端口此前无任何日志地静默回退默认——运维显式配置了
+			// 端口却听不到诊断线索
+			log.Printf("[config] CODELY_PROXY_PORT=%q 非法（%v），回退默认 %d", v, err, DefaultPort)
 		}
 	}
 	if v := os.Getenv("CODELY_PROXY_BIND"); v != "" {
@@ -86,8 +93,12 @@ func Load() Config {
 
 // defaultDataDir 返回默认数据目录：Docker 场景用 /app/data，本地用 ./data。
 func defaultDataDir() string {
-	if _, err := os.Stat("/app/data"); err == nil {
-		return "/app/data"
+	// /app/data 探测仅用于 Linux 容器场景（逻辑审查 P2：Windows 下 /app/data 会解析到
+	// 当前盘符根、可能劫持数据目录；且必须是目录而非普通文件）
+	if runtime.GOOS != "windows" {
+		if st, err := os.Stat("/app/data"); err == nil && st.IsDir() {
+			return "/app/data"
+		}
 	}
 	// 本地：二进制旁的 ./data
 	exe, err := os.Executable()
@@ -98,9 +109,10 @@ func defaultDataDir() string {
 }
 
 func parsePort(s string) (int, error) {
-	var p int
-	if _, err := fmt.Sscanf(s, "%d", &p); err != nil {
-		return 0, err
+	// 严格全串解析（逻辑审查 P2：Sscanf 不要求全消费，"8790abc" 曾静默当 8790）
+	p, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("非法端口: %s", s)
 	}
 	if p <= 0 || p > 65535 {
 		return 0, fmt.Errorf("非法端口: %s", s)

@@ -52,6 +52,10 @@ func hmacSHA256(key, msg []byte) []byte {
 	return m.Sum(nil)
 }
 
+// signingK1 派生密钥第一层：HMAC(SECRET, label)。仅依赖两个常量，init 计算一次
+//（审查记录 P2 #2：此前每请求重算；A2 禁的是绑定 key/path/time 的签名缓存，此层不涉及）。
+var signingK1 = hmacSHA256(signingSecret, []byte(codelySigningLabel))
+
 // CodelySignature 计算指定时刻的签名头值（供 golden test 与 signRequest 复用）。
 // 算法（PROTOCOL.md §2.4）：
 //
@@ -62,8 +66,7 @@ func hmacSHA256(key, msg []byte) []byte {
 //
 // tsSec 为 unix 秒字符串。返回头值形如 "v1.1780000000.FkYX0UcxY-..."。
 func CodelySignature(apiKey, pathname, tsSec string) string {
-	k1 := hmacSHA256(signingSecret, []byte(codelySigningLabel))
-	signingKey := hmacSHA256(k1, []byte(apiKey))
+	signingKey := hmacSHA256(signingK1, []byte(apiKey))
 	sig := hmacSHA256(signingKey, []byte("v1\n"+pathname+"\n"+tsSec))
 	return "v1." + tsSec + "." + base64.RawURLEncoding.EncodeToString(sig)
 }

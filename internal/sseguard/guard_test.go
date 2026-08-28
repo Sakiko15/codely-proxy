@@ -71,8 +71,8 @@ func TestAnthropicCutAfterStopBeforeMessageStop(t *testing.T) {
 }
 
 func TestAnthropicChunkBoundary(t *testing.T) {
-	// 事件被拆到多个 chunk，且最后一个事件没有结尾 \n（残留行缓冲）——都要正确处理
-	// 分 3 段：先发到 content_block_start，再发 stop+message_stop 的一半，再发一半（无 \n）
+	// 事件被拆到多个 chunk——跨 chunk 只算一次（残留行缓冲分支见 TestAnthropicFinishResidualLine）
+	// 分 3 段：先发到 content_block_start，再发 stop+message_stop 的一半，再发一半
 	out := runAnthropic(t,
 		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2",
 		"}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\nevent: message_stop\ndata: {\"type\":\"message_sto",
@@ -96,6 +96,90 @@ func TestAnthropicPipeMidStreamError(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"type":"message_stop"`) {
 		t.Fatalf("断流也应合成 message_stop，got: %s", out.String())
+	}
+}
+
+func TestAnthropicFinishResidualLine(t *testing.T) {
+	// 审查记录 P2 #6：Finish 时残留行缓冲（整个 message_stop 事件无结尾换行）——
+	// 识别后不得重复合成终止事件
+	out := runAnthropic(t,
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1}\n\n",
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}",
+	)
+	if n := strings.Count(out, `"type":"message_stop"`); n != 1 {
+		t.Fatalf("残留 message_stop 识别后不得重复合成, got %d: %s", n, out)
+	}
+	if n := strings.Count(out, `"type":"content_block_stop"`); n != 1 {
+		t.Fatalf("block_stop 不应重复合成, got %d", n)
+	}
+}
+
+func TestAnthropicMalformedStopKeepsBlocks(t *testing.T) {
+	// 审查记录 P2 #3：解析失败的 stop 必须忽略而非清空开放块——否则 Finish 漏补
+	// 真实块的 stop，恰复活本包要防的"start 后无 stop 挂死"
+	out := runAnthropic(t,
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":5}\n\n",
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":\"oops\"}\n\n",
+	)
+	if !strings.Contains(out, `"type":"content_block_stop","index":5`) {
+		t.Fatalf("畸形 stop 后真实开放块仍应在 Finish 补 stop: %s", out)
+	}
+}
+
+func TestAnthropicIndexColonSpaceTolerated(t *testing.T) {
+	// 审查记录 P2 #3：`"index" :5`（冒号前空格）应被识别——与 eventType 正则的容忍度对称
+	out := runAnthropic(t,
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\" :2}\n\n",
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\" :2}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	)
+	if n := strings.Count(out, `"type":"content_block_stop"`); n != 1 {
+		t.Fatalf("冒号前空格应被识别，stop 只算一次: %s", out)
+	}
+	if n := strings.Count(out, `"type":"message_stop"`); n != 1 {
+		t.Fatalf("完整流不得合成: %s", out)
+	}
+}
+
+func TestAnthropicOversizedLineBounded(t *testing.T) {
+	// 审查记录 P2 #4：无换行的畸形流超 1MB → 放弃跟踪并按流异常收尾（内存有界、不挂死）
+	big := strings.Repeat("x", lineBufferCap+4096)
+	out := runAnthropic(t, big)
+	if !strings.Contains(out, `"type":"message_stop"`) {
+		t.Fatalf("超限流仍应安全收尾")
+	}
+	if strings.Contains(out, `"stop_reason":"end_turn"`) {
+		t.Fatalf("流异常不得合成假 end_turn")
+	}
+}
+
+func TestAnthropicBOMStrippedForTracking(t *testing.T) {
+	// 审查记录 P2 #5：首块 BOM 只在跟踪侧剥离（透传字节不变）——BOM 粘在 data: 行上不漏判
+	bom := "\xef\xbb\xbf"
+	out := runAnthropic(t,
+		bom+"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1}\n\n",
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	)
+	if !strings.HasPrefix(out, bom) {
+		t.Fatalf("透传应保留原始 BOM 字节")
+	}
+	if n := strings.Count(out, `"type":"message_stop"`); n != 1 {
+		t.Fatalf("BOM 不得导致事件漏判重复合成: %d", n)
+	}
+}
+
+func TestOpenAIOversizedLineBounded(t *testing.T) {
+	// 审查记录 P2 #4：OpenAI 侧行缓冲同样有界；Finish 幂等补发 [DONE]
+	var out bytes.Buffer
+	g := &OpenAIGuard{}
+	big := strings.Repeat("y", lineBufferCap+4096)
+	if err := g.Write([]byte(big), &out); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := g.Finish(&out); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if !strings.HasSuffix(out.String(), "data: [DONE]\n\n") {
+		t.Fatalf("超限流 Finish 应补发 [DONE]")
 	}
 }
 

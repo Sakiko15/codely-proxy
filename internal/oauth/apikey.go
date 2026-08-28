@@ -122,20 +122,6 @@ func fetchAPIKeyOnce(creds *Creds) (*apiKeyResult, error) {
 	return &apiKeyResult{creds: c, key: j.CliAPIKey}, nil
 }
 
-// ClientHeaders 是伪造官方 CLI 身份头组（PROTOCOL.md §2.2 / PROTOCOL_SCHEMA.md §16）。
-// 与 node 版 CLIENT_HEADERS 逐项一致。注：node 版在 codely-auth.js 与 codely-proxy.js 各维护一份，
-// Go 收敛为网关包一处（见 GO_PORT.md §2.1）。
-var ClientHeaders = http.Header{
-	"User-Agent":                  {"codely-cli/1.0.0-release.41 (win32; x64)"},
-	"X-Stainless-Lang":            {"js"},
-	"X-Stainless-Package-Version": {"5.11.0"},
-	"X-Stainless-OS":              {"Windows"},
-	"X-Stainless-Arch":            {"x64"},
-	"X-Stainless-Runtime":         {"node"},
-	"X-Stainless-Runtime-Version": {"v24.3.0"},
-	"X-Stainless-Retry-Count":     {"0"},
-}
-
 // ModelInfo 是 /v1/models 返回的条目（PROTOCOL_SCHEMA.md §9）。
 type ModelInfo struct {
 	ID          string `json:"id"`   // 客户端只能发 codely-* alias
@@ -197,9 +183,10 @@ func fetchModels(base, apiKey string) ([]ModelInfo, error) {
 	return j.Data, nil
 }
 
-// applyClientHeaders 把 CLIENT_HEADERS 写到请求头。
+// applyClientHeaders 把 CLIENT_HEADERS 写到请求头（头组定义于 internal/gateway，
+// 审查记录 P2 #1 归位）。
 func applyClientHeaders(req *http.Request) {
-	for k, vs := range ClientHeaders {
+	for k, vs := range gateway.ClientHeaders {
 		for _, v := range vs {
 			req.Header.Add(k, v)
 		}

@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"codely-proxy/internal/gateway"
 )
 
 // upstreamTransport 控制面出站共享 Transport（性能审计 P4）：不设则落到 http.DefaultTransport
@@ -91,6 +93,6 @@ func Get(url, bearer string) (int, []byte, error) {
 // 已注入 ClientHeaders，此处对齐——此前设备码登录链路裸发 Go 默认 UA）。
 func applyCLIUA(req *http.Request) {
 	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", ClientHeaders.Get("User-Agent"))
+		req.Header.Set("User-Agent", gateway.ClientHeaders.Get("User-Agent"))
 	}
 }

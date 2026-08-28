@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"codely-proxy/internal/gateway"
-	"codely-proxy/internal/oauth"
 	"codely-proxy/internal/sanitize"
 )
 
@@ -128,7 +127,7 @@ func (p *Proxy) AttemptForward(ctx context.Context, method, upPath string, reqHe
 	}
 	req.ContentLength = int64(len(payload))
 	// CLIENT_HEADERS（伪造 CLI 身份）+ 认证 + 会话
-	for k, vs := range oauth.ClientHeaders {
+	for k, vs := range gateway.ClientHeaders {
 		for _, v := range vs {
 			req.Header.Add(k, v)
 		}
@@ -166,8 +165,11 @@ func (p *Proxy) AttemptForward(ctx context.Context, method, upPath string, reqHe
 	// 5. 响应分类
 	switch resp.StatusCode {
 	case http.StatusUnauthorized, http.StatusForbidden:
-		// 读 body（上限 64KB，§19.2-5）：区分模型权限拒 vs 密钥失效
+		// 读 body（上限 64KB，§19.2-5）：区分模型权限拒 vs 密钥失效。
+		// 排空剩余 body 以复用 keep-alive 连接（审查记录 P2 #11）；>64KB 错误体实践中
+		// 不存在（见本文件头注释），截断漏判 denied 的残余风险已记录接受（审查记录 #8）
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyCap))
+		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		if teamModelDeniedRE.Match(errBody) {
 			// 模型被团队权限拒绝：透传（换 key 无济于事），带上游真实头
@@ -178,6 +180,7 @@ func (p *Proxy) AttemptForward(ctx context.Context, method, upPath string, reqHe
 	case http.StatusPaymentRequired, http.StatusTooManyRequests:
 		// 402/429：额度耗尽/限流（读 body 上限同 64KB，§19.2-5）
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyCap))
+		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		return ForwardResult{Kind: KindQuotaRateLimit, Status: resp.StatusCode, Body: errBody, Header: resp.Header.Clone(), Model: model}
 	default:

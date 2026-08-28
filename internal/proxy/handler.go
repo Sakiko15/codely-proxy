@@ -2,6 +2,8 @@
 package proxy
 
 import (
+	"unicode/utf8"
+
 	"bytes"
 	"context"
 	"errors"
@@ -268,9 +270,7 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 			reason = lastErr.Error()
 		}
 		// 性能审计 P5：错误体（≤64KB）不再整段进客户端 502 消息
-		if len(reason) > 512 {
-			reason = reason[:512]
-		}
+		reason = truncateReason(reason, 512)
 		WriteError(rw, req, http.StatusBadGateway, "codely-proxy: 上游请求失败 ("+reason+")", "bad_gateway")
 	}
 }
@@ -327,16 +327,54 @@ func writePassthrough(rw http.ResponseWriter, r ForwardResult, slug string) {
 	_, _ = rw.Write(r.Body)
 }
 
-// copyHeaders 复制响应头（删除 content-length，因会话注入可能改写请求体，上游长度无意义）。
+// hopByHopHeaders 逐跳头集合（RFC 7230 §6.1）：不应由代理透传（审查记录 P2 #9）。
+var hopByHopHeaders = []string{"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"}
+
+func isHopByHop(h string) bool {
+	for _, k := range hopByHopHeaders {
+		if strings.EqualFold(h, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// copyHeaders 复制响应头（删除 content-length，因会话注入可能改写请求体，上游长度无意义）；
+// 过滤 hop-by-hop 头与 Connection 列出的头（审查记录 P2 #9：上游 Connection: close 不得
+// 强制关闭客户端连接，Trailer/Upgrade 等同理）。
 func copyHeaders(rw http.ResponseWriter, src http.Header) {
+	dropConn := map[string]bool{}
+	for _, v := range src.Values("Connection") {
+		for _, tok := range strings.Split(v, ",") {
+			if tok = strings.TrimSpace(tok); tok != "" {
+				dropConn[strings.ToLower(tok)] = true
+			}
+		}
+	}
 	for k, vs := range src {
 		if strings.EqualFold(k, "Content-Length") {
+			continue
+		}
+		if isHopByHop(k) || dropConn[strings.ToLower(k)] {
 			continue
 		}
 		for _, v := range vs {
 			rw.Header().Add(k, v)
 		}
 	}
+}
+
+// truncateReason 按字节上限截断错误原因，并在 rune 边界回退（审查记录 P2 #10：
+// 直接 reason[:512] 会劈开 UTF-8 序列，json.Marshal 后消息尾部变 U+FFFD 乱码）。
+func truncateReason(reason string, limit int) string {
+	if len(reason) <= limit {
+		return reason
+	}
+	cut := reason[:limit]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut
 }
 
 func modelSuffix(model string) string {

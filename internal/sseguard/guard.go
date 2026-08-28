@@ -71,15 +71,22 @@ func parseBlockIndex(data []byte) int {
 	return idx
 }
 
-// parseBlockIndexOK 解析 index（[]byte 零分配手写解析，跳过前导空白，
-// 兼容 `"index": 1` 带空格形态；index 恒为非负十进制）。
+// parseBlockIndexOK 解析 index（[]byte 零分配手写解析，容忍冒号两侧空白——
+// 与 eventType 正则的 `"type"\s*:\s*"` 对称，审查记录 P2 #3；index 恒为非负十进制）。
 func parseBlockIndexOK(data []byte) (int, bool) {
-	m := bytes.Index(data, []byte(`"index":`))
+	m := bytes.Index(data, []byte(`"index"`))
 	if m < 0 {
 		return 0, false
 	}
-	rest := data[m+len(`"index":`):]
+	rest := data[m+len(`"index"`):]
 	i := 0
+	for i < len(rest) && (rest[i] == ' ' || rest[i] == '\t') {
+		i++
+	}
+	if i >= len(rest) || rest[i] != ':' {
+		return 0, false
+	}
+	i++
 	for i < len(rest) && (rest[i] == ' ' || rest[i] == '\t') {
 		i++
 	}
@@ -100,11 +107,21 @@ func parseBlockIndexOK(data []byte) (int, bool) {
 	return idx, true
 }
 
+// lineBufferCap 行缓冲上限（审查记录 P2 #4）：畸形上游持续输出无换行数据时防内存无界
+// 增长。超限视为流异常：清空缓冲；Anthropic 侧置 sawError（Finish 走 messageStopOnly
+// 安全收尾，不挂死），OpenAI 侧放弃 [DONE] 跟踪（Finish 补发，幂等）。
+const lineBufferCap = 1 << 20
+
+// utf8BOM 首块剥离（审查记录 P2 #5）：仅跟踪侧剥离，透传字节不变——BOM 粘在首个
+// data: 行上会使前缀判定失败、事件漏判。
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
 // AnthropicGuard 是 /messages 流的行缓冲状态机。
 type AnthropicGuard struct {
 	openBlocks     map[int]bool // 开放中的 content_block index 集合（start 增 / stop 删）
 	sawMessageStop bool
 	sawError       bool   // 观测到上游 error 事件（Finish 时不再合成假 end_turn）
+	bomChecked     bool   // 首块是否已剥 BOM
 	lineBuffer     []byte // 未成行的尾部
 }
 
@@ -124,11 +141,11 @@ func (g *AnthropicGuard) scan(line []byte) {
 		}
 		g.openBlocks[parseBlockIndex(data)] = true
 	case "content_block_stop":
+		// 审查记录 P2 #3：解析失败（畸形/罕见空格形态）→ 忽略该事件并保留开放状态。
+		// 此前防御性清空全部开放块——恰会复活本包要防的"start 后无 stop 挂死"；
+		// 宁可在 Finish 多补 stop（客户端无害），也不能漏补
 		if idx, ok := parseBlockIndexOK(data); ok {
 			delete(g.openBlocks, idx)
-		} else {
-			// 无 index 的 stop（罕见）：防御性清空，避免泄漏未闭合块
-			g.openBlocks = map[int]bool{}
 		}
 	case "message_stop":
 		g.sawMessageStop = true
@@ -143,6 +160,10 @@ func (g *AnthropicGuard) Write(p []byte, w io.Writer) error {
 	if _, err := w.Write(p); err != nil {
 		return err
 	}
+	if !g.bomChecked {
+		g.bomChecked = true
+		p = bytes.TrimPrefix(p, utf8BOM)
+	}
 	g.lineBuffer = append(g.lineBuffer, p...)
 	for {
 		idx := bytes.IndexByte(g.lineBuffer, '\n')
@@ -152,6 +173,11 @@ func (g *AnthropicGuard) Write(p []byte, w io.Writer) error {
 		line := g.lineBuffer[:idx]
 		g.lineBuffer = g.lineBuffer[idx+1:]
 		g.scan(line)
+	}
+	if len(g.lineBuffer) > lineBufferCap {
+		// 审查记录 P2 #4：畸形无换行流——放弃本行跟踪并按流异常收尾（内存有界、不挂死）
+		g.lineBuffer = g.lineBuffer[:0]
+		g.sawError = true
 	}
 	return nil
 }
@@ -191,14 +217,19 @@ func (g *AnthropicGuard) Finish(w io.Writer) error {
 
 // OpenAIGuard 是 /chat/completions 流的 [DONE] 合成。
 type OpenAIGuard struct {
-	sawDone bool
-	buf     []byte // 行缓冲（跟踪 [DONE] 是否出现过）
+	sawDone    bool
+	bomChecked bool   // 首块是否已剥 BOM
+	buf        []byte // 行缓冲（跟踪 [DONE] 是否出现过）
 }
 
 // Write 消费上游 chunk：原样写入客户端 + 扫描 [DONE]。
 func (g *OpenAIGuard) Write(p []byte, w io.Writer) error {
 	if _, err := w.Write(p); err != nil {
 		return err
+	}
+	if !g.bomChecked {
+		g.bomChecked = true
+		p = bytes.TrimPrefix(p, utf8BOM)
 	}
 	g.buf = append(g.buf, p...)
 	for {
@@ -211,6 +242,10 @@ func (g *OpenAIGuard) Write(p []byte, w io.Writer) error {
 		if isDoneLine(line) {
 			g.sawDone = true
 		}
+	}
+	if len(g.buf) > lineBufferCap {
+		// 审查记录 P2 #4：畸形无换行流——放弃 [DONE] 跟踪（Finish 幂等补发，内存有界）
+		g.buf = g.buf[:0]
 	}
 	return nil
 }

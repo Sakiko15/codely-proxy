@@ -3,6 +3,7 @@ package webui
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -94,7 +95,13 @@ func readBody(rw http.ResponseWriter, req *http.Request, limit int64) ([]byte, b
 	req.Body = http.MaxBytesReader(rw, req.Body, limit)
 	data, err := io.ReadAll(req.Body)
 	if err != nil {
-		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]any{"ok": false, "error": "request body too large"})
+		// 逻辑审查 P1：区分"超限"与"读取失败"（客户端断连等）——状态码语义
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]any{"ok": false, "error": "request body too large"})
+		} else {
+			writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "read request body failed"})
+		}
 		return nil, false
 	}
 	return data, true
@@ -207,11 +214,17 @@ func (s *Server) handleAccountDelete(rw http.ResponseWriter, req *http.Request) 
 		return
 	}
 	removed, next, err := s.Registry.RemoveAccount(body.Name, s.Balancer)
-	if err != nil {
+	if err != nil && !removed {
+		// 真失败（账号仍在）→ 400
 		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	writeJSON(rw, http.StatusOK, map[string]any{"ok": removed, "nextCurrent": next})
+	resp := map[string]any{"ok": removed, "nextCurrent": next}
+	if err != nil {
+		// 逻辑审查 P1：已删除但收尾失败（自动切换）——200 + warning，前端可见
+		resp["warning"] = err.Error()
+	}
+	writeJSON(rw, http.StatusOK, resp)
 }
 
 // handleAccountSwitch POST /api/account/switch：切换主账号。

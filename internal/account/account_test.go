@@ -323,6 +323,39 @@ func TestPollNoLogin(t *testing.T) {
 // jsonDecode 辅助（编译用）
 var _ = json.Marshal
 
+func TestRemoveAccountCascadeSwitchFail(t *testing.T) {
+	// 逻辑审查 P1：删除当前账号且级联激活失败——删除已成立（不得谎报 removed=false），
+	// 且指向已删账号的 codely-creds.json 必须清除（不能继续用已删账号凭据承载 /v1）
+	r := setup(t)
+	if _, _, err := r.SaveAccount("a", fakeCreds("1", "A"), true, nil); err != nil {
+		t.Fatalf("SaveAccount a: %v", err)
+	}
+	if _, _, err := r.SaveAccount("b", fakeCreds("2", "B"), false, nil); err != nil {
+		t.Fatalf("SaveAccount b: %v", err)
+	}
+	// 破坏 b 的凭据文件 → 级联激活 ActivateAccount(b) 失败
+	if err := os.Remove(AccountsDir + "/b.json"); err != nil {
+		t.Fatalf("remove b.json: %v", err)
+	}
+	if _, err := os.Stat(oauth.CredsFile); err != nil {
+		t.Fatalf("前置：a 为激活账号，codely-creds.json 应存在")
+	}
+
+	removed, next, err := r.RemoveAccount("a", nil)
+	if !removed {
+		t.Fatalf("删除已成立，removed 不应为 false（谎报）")
+	}
+	if err == nil {
+		t.Fatalf("级联切换失败应返回 warning 错误")
+	}
+	if _, statErr := os.Stat(oauth.CredsFile); !os.IsNotExist(statErr) {
+		t.Fatalf("指向已删账号的激活凭据应被清除")
+	}
+	if next == "" {
+		t.Fatalf("nextCurrent 应指向剩余账号")
+	}
+}
+
 func TestSlugifyReserveIndex(t *testing.T) {
 	// 稳定性审计 F5：slug "index" 会与注册表文件 accounts/index.json 同名互覆 → 预留拒绝
 	if got := Slugify("index"); got != "" {

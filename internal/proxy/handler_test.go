@@ -80,6 +80,29 @@ func doReq(t *testing.T, h *Handler, method, path, body string, headers map[stri
 	return rw
 }
 
+// errBodyReader 恒返回读取错误（模拟客户端上传中途断连）。
+type errBodyReader struct{}
+
+func (errBodyReader) Read(p []byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+func TestHandlerBodyReadErrorNot413(t *testing.T) {
+	// 逻辑审查 P1：读取失败（断连等）不再误归类 413 request_too_large
+	h, _, _, cleanup := buildHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("不应到达上游")
+	})
+	defer cleanup()
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", errBodyReader{})
+	rw := httptest.NewRecorder()
+	h.ServeHTTP(rw, req)
+	if rw.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("读取失败不应归类 413, got %d", rw.Code)
+	}
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("读取失败应 400, got %d", rw.Code)
+	}
+}
+
 func TestHandlerUnauthorizedNoKey(t *testing.T) {
 	h, _, _, cleanup := buildHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Fatalf("不应到达上游")

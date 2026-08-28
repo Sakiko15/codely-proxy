@@ -90,7 +90,7 @@ func main() {
 	auth := webui.NewAuth(cfg.WebUIUser, cfg.WebUIPass)
 	if auth.IsGenerated() {
 		// 随机密码打印到日志（A2b 决策：首屏也展示，这里给运维留存）
-		logger.Printf("[webui] ⚠️  未设置 WEBUI_USER/WEBUI_PASS，已生成随机管理密码：")
+		logger.Printf("[webui] ⚠️  未设置 WEBUI_PASS（用户名 %s），已生成随机管理密码：", auth.Username())
 		logger.Printf("[webui]      用户名: %s  密码: %s", auth.Username(), auth.Password())
 		logger.Printf("[webui]      请登录 WebUI 后立即修改或设置环境变量固化（推荐 docker-compose 设置 WEBUI_USER/WEBUI_PASS）")
 	}

@@ -243,6 +243,27 @@ func TestAuthGeneratedPassword(t *testing.T) {
 	}
 }
 
+func TestAuthPartialEnv(t *testing.T) {
+	// 逻辑审查 P1：WEBUI_USER/WEBUI_PASS 只设其一不再整体回退随机
+	a := NewAuth("", "mypass")
+	if a.IsGenerated() {
+		t.Fatalf("设了 WEBUI_PASS 不应视为生成密码")
+	}
+	if !a.CheckCredentials("admin", "mypass") {
+		t.Fatalf("只设 WEBUI_PASS 应生效（用户名回退 admin）")
+	}
+	b := NewAuth("ops", "")
+	if !b.IsGenerated() {
+		t.Fatalf("未设 WEBUI_PASS 应生成密码")
+	}
+	if b.Username() != "ops" {
+		t.Fatalf("只设 WEBUI_USER 应保留用户名, got %q", b.Username())
+	}
+	if !b.CheckCredentials("ops", b.Password()) {
+		t.Fatalf("生成密码应与用户名匹配")
+	}
+}
+
 func TestAuthStatusPasswordRevealOnce(t *testing.T) {
 	// 安全修复：生成密码仅暴露到首次成功登录为止（此前 /api/auth-status 永久匿名可读）
 	srv, cleanup := buildServer(t)
@@ -279,6 +300,28 @@ func TestLoginBodySizeCapped(t *testing.T) {
 	rw, _ := doJSON(t, srv, "POST", "/api/login", `{"username":"`+big+`"}`, "")
 	if rw.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("超大 body 应 413, got %d", rw.Code)
+	}
+}
+
+// errLoginBody 恒返回读取错误（模拟客户端上传中途断连）。
+type errLoginBody struct{}
+
+func (errLoginBody) Read(p []byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+func TestLoginBodyReadErrorNot413(t *testing.T) {
+	// 逻辑审查 P1：读取失败（断连等）与超限区分——400 而非 413
+	srv, cleanup := buildServer(t)
+	defer cleanup()
+	req := httptest.NewRequest("POST", "/api/login", errLoginBody{})
+	rw := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	srv.Routes(mux)
+	mux.ServeHTTP(rw, req)
+	if rw.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("读取失败不应归类 413, got %d", rw.Code)
+	}
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("读取失败应 400, got %d", rw.Code)
 	}
 }
 

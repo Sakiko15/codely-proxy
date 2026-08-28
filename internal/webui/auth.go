@@ -27,15 +27,19 @@ type Auth struct {
 	sessions map[string]time.Time // token -> 过期时间
 }
 
-// NewAuth 创建登录态。优先用 env WEBUI_USER/WEBUI_PASS；未设则随机生成（A2b）。
+// NewAuth 创建登录态。WEBUI_USER/WEBUI_PASS 各自独立取 env（逻辑审查 P1：只设其一
+// 不再整体回退随机——此前只设 WEBUI_PASS 会被静默忽略且日志误导）；
+// 两者皆未设则 admin + 随机密码（A2b）。
 func NewAuth(envUser, envPass string) *Auth {
 	a := &Auth{sessions: map[string]time.Time{}}
-	if envUser != "" && envPass != "" {
-		a.username = envUser
+	a.username = envUser
+	if a.username == "" {
+		a.username = "admin"
+	}
+	if envPass != "" {
 		a.password = envPass
 		a.generated = false
 	} else {
-		a.username = "admin"
 		a.password = randomPassword(12)
 		a.generated = true
 	}

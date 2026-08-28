@@ -540,11 +540,18 @@ func (r *Registry) RemoveAccount(name string, pool PoolReloader) (removed bool, 
 	}
 	r.mu.Unlock()
 
-	// 级联激活（锁外）
+	// 级联激活（锁外）。逻辑审查 P1：删除已成立（文件与 index 均已改），任何收尾失败
+	// 都不能谎报 removed=false；且指向已删账号的 codely-creds.json 必须清除，
+	// 否则已删账号的凭据会继续承载 /v1 流量。
+	var warn error
 	if wasCurrent {
 		if len(rest) > 0 {
 			if _, _, err := r.ActivateAccount(rest[0], pool); err != nil {
-				return false, rest[0], err
+				_ = os.Remove(oauth.CredsFile)
+				r.mu.Lock()
+				r.clearCaches()
+				r.mu.Unlock()
+				warn = fmt.Errorf("账号已删除，但自动切换到 [%s] 失败: %v（请在账号列表手动切换主账号）", rest[0], err)
 			}
 		} else {
 			// 全部删光：清空激活凭据与密钥缓存
@@ -557,7 +564,10 @@ func (r *Registry) RemoveAccount(name string, pool PoolReloader) (removed bool, 
 	if pool != nil {
 		pool.ReloadPool()
 	}
-	idx = r.loadIndex()
+	idx = r.currentIndex()
+	if warn != nil {
+		return true, idx.Current, warn
+	}
 	return true, idx.Current, nil
 }
 

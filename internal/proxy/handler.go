@@ -4,6 +4,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -51,7 +52,15 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	_, err := buf.ReadFrom(req.Body)
 	body := buf.Bytes()
 	if err != nil {
-		WriteError(rw, req, http.StatusRequestEntityTooLarge, "request body too large", "request_too_large")
+		// 逻辑审查 P1：区分"超限"与"读取失败"（客户端中途断连等）——
+		// 此前一律 413，把断连统计成"请求体过大"
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			WriteError(rw, req, http.StatusRequestEntityTooLarge, "request body too large", "request_too_large")
+		} else {
+			h.logf("proxy", "读取请求体失败: %v", err)
+			WriteError(rw, req, http.StatusBadRequest, "read request body failed", "invalid_request_error")
+		}
 		return
 	}
 	// GET /v1/models 等可能无 body

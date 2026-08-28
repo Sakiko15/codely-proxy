@@ -223,6 +223,42 @@ func TestAuthGeneratedPassword(t *testing.T) {
 	if a.ValidSession(tok) {
 		t.Fatalf("销毁后 session 应无效")
 	}
+	// 生成密码暴露窗口：首次成功登录前可暴露，MarkLogin 后收回（安全审计）
+	if !a.CanRevealPassword() {
+		t.Fatalf("初始应可暴露生成密码")
+	}
+	a.MarkLogin()
+	if a.CanRevealPassword() {
+		t.Fatalf("成功登录后不应再暴露生成密码")
+	}
+}
+
+func TestAuthStatusPasswordRevealOnce(t *testing.T) {
+	// 安全修复：生成密码仅暴露到首次成功登录为止（此前 /api/auth-status 永久匿名可读）
+	srv, cleanup := buildServer(t)
+	defer cleanup()
+	srv.Auth = NewAuth("", "") // 覆盖为随机密码模式
+
+	rw, _ := doJSON(t, srv, "GET", "/api/auth-status", "", "")
+	var j map[string]any
+	_ = json.Unmarshal(rw.Body.Bytes(), &j)
+	pwd, _ := j["password"].(string)
+	if j["generatedPassword"] != true || pwd == "" {
+		t.Fatalf("首次登录前应暴露生成密码: %s", rw.Body.String())
+	}
+
+	// 用生成密码登录 → 之后不再暴露
+	body := `{"username":"admin","password":"` + pwd + `"}`
+	rw2, _ := doJSON(t, srv, "POST", "/api/login", body, "")
+	if rw2.Code != 200 {
+		t.Fatalf("生成密码登录应成功，got %d", rw2.Code)
+	}
+	rw3, _ := doJSON(t, srv, "GET", "/api/auth-status", "", "")
+	var j3 map[string]any
+	_ = json.Unmarshal(rw3.Body.Bytes(), &j3)
+	if j3["generatedPassword"] == true || j3["password"] != nil {
+		t.Fatalf("首次登录后不应再暴露生成密码: %s", rw3.Body.String())
+	}
 }
 
 func TestLoginFlowEndpoints(t *testing.T) {

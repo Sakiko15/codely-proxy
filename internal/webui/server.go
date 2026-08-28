@@ -110,6 +110,7 @@ func (s *Server) handleLogin(rw http.ResponseWriter, req *http.Request) {
 		writeJSON(rw, http.StatusUnauthorized, map[string]any{"ok": false, "error": "invalid credentials"})
 		return
 	}
+	s.Auth.MarkLogin() // 首次成功登录后收回生成密码的匿名可读性（安全审计）
 	tok := s.Auth.CreateSession()
 	s.Auth.setSessionCookie(rw, tok)
 	writeJSON(rw, http.StatusOK, map[string]any{"ok": true})
@@ -131,9 +132,9 @@ func (s *Server) handleAuthStatus(rw http.ResponseWriter, req *http.Request) {
 		"authed":  authed,
 		"username": s.Auth.Username(),
 	}
-	if s.Auth.IsGenerated() {
+	if s.Auth.CanRevealPassword() {
 		resp["generatedPassword"] = true
-		resp["password"] = s.Auth.Password() // 首屏展示一次（A2b）
+		resp["password"] = s.Auth.Password() // 首次成功登录前的首屏提示（A2b；登录后收回）
 	}
 	writeJSON(rw, http.StatusOK, resp)
 }

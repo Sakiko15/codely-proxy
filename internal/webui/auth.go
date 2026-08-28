@@ -23,6 +23,7 @@ type Auth struct {
 	username string
 	password string // 明文密码（env 提供或随机生成），仅存内存
 	generated bool  // 密码是自动生成的（需打印到日志/首屏提示用户）
+	revealed  bool  // 已有成功登录（生成密码不再经 /api/auth-status 暴露，安全审计）
 	sessions map[string]time.Time // token -> 过期时间
 }
 
@@ -43,6 +44,21 @@ func NewAuth(envUser, envPass string) *Auth {
 
 // IsGenerated 是否自动生成了密码（用于日志/首屏展示）。
 func (a *Auth) IsGenerated() bool { return a.generated }
+
+// CanRevealPassword 生成密码是否仍可经 /api/auth-status 展示。
+// 仅在首次成功登录前为 true（安全审计：缩小匿名可读窗口；启动日志中始终有存底）。
+func (a *Auth) CanRevealPassword() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.generated && !a.revealed
+}
+
+// MarkLogin 记录一次成功登录（生成密码自此不再对外暴露）。
+func (a *Auth) MarkLogin() {
+	a.mu.Lock()
+	a.revealed = true
+	a.mu.Unlock()
+}
 
 // Password 返回当前密码（用于日志打印）。
 func (a *Auth) Password() string { return a.password }

@@ -170,6 +170,7 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 		}
 
 		failoverNext := false
+	attemptLoop:
 		for attempt := 0; attempt < 2; attempt++ {
 			r := h.Proxy.AttemptForward(ctx, req.Method, req.URL.RequestURI(), req.Header, body, state.SessionID(), apiKey)
 
@@ -197,7 +198,7 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 					h.logf("balancer", "[%s] 收到 HTTP %d（额度耗尽/限流），已冷却，漂移下一个...", slug, status)
 					excluded[slug] = true
 					failoverNext = true
-					break
+					break attemptLoop // 修复：switch 内裸 break 不退出重试循环，会对刚失败账号多发一次必败请求
 				}
 				// 否则透传（带 x-codely-routed-account；该账号已冷却）
 				if !isProbe {
@@ -232,7 +233,7 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 				h.Balancer.MarkFailure(slug, http.StatusBadGateway, r.Err.Error())
 				excluded[slug] = true
 				failoverNext = true
-				break
+				break attemptLoop // 同上：立即进入账号漂移，不重试刚失败账号
 			}
 		}
 		if failoverNext {

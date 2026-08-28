@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -295,4 +297,90 @@ func TestFetchQuotaFromUpstream(t *testing.T) {
 	if q.BillingRemaining() != 567 {
 		t.Fatalf("billing = %v, want 567", q.BillingRemaining())
 	}
+}
+
+func TestRefreshCredsSingleFlight(t *testing.T) {
+	// 稳定性审计 D：refresh 轮换式返回新 token，并发刷新会互相作废——
+	// 同账号并发 RefreshCreds 应去重为一次上游调用，且全部拿到同一结果
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/auth/refresh" {
+			http.Error(w, "nf", 404)
+			return
+		}
+		atomic.AddInt32(&calls, 1)
+		time.Sleep(50 * time.Millisecond) // 放大并发窗口
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"new-at","refresh_token":"new-rt","expires_in":3600}`))
+	}))
+	defer srv.Close()
+	oldBase := oauth.Base
+	oauth.Base = srv.URL
+	t.Cleanup(func() { oauth.Base = oldBase })
+
+	reg := setup(t)
+	addAccount(t, reg, "a", "1", "A", 0, 0, false)
+	bal := NewBalancer(reg)
+	st := bal.state("a")
+	if st == nil {
+		t.Fatalf("state(a) nil")
+	}
+	expired := time.Now().UnixMilli() - 1000 // 过期凭据
+	creds := &oauth.Creds{AccessToken: "old-at", RefreshToken: "old-rt", UserID: "1", TeamID: "team-1", ExpiryDate: &expired}
+
+	const n = 10
+	var wg sync.WaitGroup
+	results := make([]*oauth.Creds, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], _ = st.RefreshCreds(creds)
+		}(i)
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("并发刷新应去重为 1 次上游调用，got %d", got)
+	}
+	for i, c := range results {
+		if c == nil || c.AccessToken != "new-at" || c.RefreshToken != "new-rt" {
+			t.Fatalf("goroutine %d 应拿到统一的刷新结果，got %+v", i, c)
+		}
+	}
+}
+
+func TestFetchQuotaConcurrentNoRace(t *testing.T) {
+	// 稳定性审计 B：doFetch 错误路径曾无锁读 quotaCacheData（数据竞争）——
+	// 冷启动/过期/强制混合并发场景跑通即视为通过（正确性由 -race 背书）
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/user/billing/usage/summary" {
+			http.Error(w, "nf", 404)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"daily_allowance":{"remaining_points":1,"quota_points":10}}`))
+	}))
+	defer srv.Close()
+	oldBase := oauth.Base
+	oauth.Base = srv.URL
+	t.Cleanup(func() { oauth.Base = oldBase })
+
+	reg := setup(t)
+	addAccount(t, reg, "a", "1", "A", 0, 0, false)
+	bal := NewBalancer(reg)
+	st := bal.state("a")
+	if st == nil {
+		t.Fatalf("state(a) nil")
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			st.FetchQuota(i%4 == 0) // 混合冷启动(force)与后台刷新路径
+		}(i)
+	}
+	wg.Wait()
 }

@@ -202,6 +202,74 @@ func TestHandlerModelDeniedPassthrough(t *testing.T) {
 
 // ---- [增强] SSE 逐事件刷新 ----
 
+// 常量 402 mock：quota 探测（GET usage/summary）与非推理路径一律 402（额度耗尽语义），
+// 仅统计 POST /v1/chat/completions 命中数。
+func quotaMock(hits *int) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			http.Error(w, `{}`, http.StatusPaymentRequired)
+			return
+		}
+		*hits++
+		http.Error(w, `{"error":{"message":"insufficient quota"}}`, http.StatusPaymentRequired)
+	}
+}
+
+func TestHandlerQuotaDriftNoDoubleAttempt(t *testing.T) {
+	// 回归（稳定性审计 C）：KindQuotaRateLimit 漂移分支的裸 break 只退出 switch 不退出
+	// 重试循环，会对刚冷却的账号多发一次必败请求——双账号恒 402 应恰好各打 1 次（共 2 次）
+	hits := 0
+	h, _, _, cleanup := buildHandler(t, quotaMock(&hits))
+	defer cleanup()
+	// 预置第二个账号（首账号由 buildHandler 注册为 acc1）
+	addExtraAccount(t, h, "acc2")
+
+	rw := doReq(t, h, "POST", "/v1/chat/completions", `{"model":"codely-flash","messages":[]}`, nil)
+	if rw.Code != 402 {
+		t.Fatalf("全部账号 402 应透传 402，got %d: %s", rw.Code, rw.Body.String())
+	}
+	if hits != 2 {
+		t.Fatalf("两账号各应仅请求 1 次（漂移不重试刚失败账号），got %d", hits)
+	}
+}
+
+func TestHandlerUpstreamErrorNoDoubleAttempt(t *testing.T) {
+	// 回归（稳定性审计 C）：KindError 分支同样不应重试刚失败账号——
+	// 上游连接被掐断（ErrAbortHandler）→ 每账号 1 次，最终 502
+	hits := 0
+	h, _, _, cleanup := buildHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			http.Error(w, `{}`, http.StatusPaymentRequired)
+			return
+		}
+		hits++
+		panic(http.ErrAbortHandler) // 掐断连接 → 客户端侧 KindError
+	})
+	defer cleanup()
+
+	rw := doReq(t, h, "POST", "/v1/chat/completions", `{"model":"codely-flash","messages":[]}`, nil)
+	if rw.Code != 502 {
+		t.Fatalf("上游连接异常应最终 502，got %d", rw.Code)
+	}
+	if hits != 1 {
+		t.Fatalf("单账号网络错误应仅请求 1 次（不重试刚失败账号），got %d", hits)
+	}
+}
+
+// addExtraAccount 给 handler 的注册表追加一个池化账号（含 key 缓存，避免触发刷新链）。
+func addExtraAccount(t *testing.T, h *Handler, slug string) {
+	t.Helper()
+	exp := time.Now().UnixMilli() + 3600*1000
+	creds := &oauth.Creds{AccessToken: "tok-" + slug, RefreshToken: "ref-" + slug, UserID: slug, TeamID: "t-" + slug, TeamName: slug, ExpiryDate: &exp}
+	if _, _, err := h.Registry.SaveAccount(slug, creds, false, nil); err != nil {
+		t.Fatalf("SaveAccount(%s): %v", slug, err)
+	}
+	_ = os.MkdirAll(account.AccountsDir, 0o755)
+	if err := os.WriteFile(account.AccountsDir+"/"+slug+".key", []byte("sk-"+slug), 0o600); err != nil {
+		t.Fatalf("写 key 缓存: %v", err)
+	}
+}
+
 // fakeFlusher 最小 ResponseWriter + Flusher，带计数。
 type fakeFlusher struct {
 	writes  int

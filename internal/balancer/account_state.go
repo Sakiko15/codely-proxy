@@ -158,6 +158,8 @@ type AccountState struct {
 	quotaCacheData *QuotaSnapshot
 	metrics        Metrics
 	keyFlight      singleflight.Group
+	quotaFlight    singleflight.Group // 后台 quota 刷新去重（TTL 过期瞬间并发请求只刷一次）
+	refreshFlight  singleflight.Group // 按账号凭据刷新去重（refresh 轮换式返回，并发会互相作废）
 }
 
 // NewAccountState 创建账号运行时状态（初始化会话）。
@@ -243,7 +245,7 @@ func (s *AccountState) RefreshAPIKey() (string, error) {
 		}
 		// 若 access_token 已过期，先按本账号刷新凭据，再换 key
 		if creds.IsExpiring() {
-			updated, err := oauth.RefreshAccessTokenFor(creds)
+			updated, err := s.RefreshCreds(creds)
 			if err == nil {
 				creds = updated
 				s.persistCreds(creds) // 写回 accounts/<slug>.json
@@ -268,6 +270,20 @@ func (s *AccountState) RefreshAPIKey() (string, error) {
 	return v.(string), nil
 }
 
+// RefreshCreds 刷新**本账号**凭据（single-flight 按账号去重）。
+// 动机（稳定性审计）：上游 refresh 是轮换式的——并发用同一 refresh_token 刷新会互相作废，
+// 旧 token 的结果可能覆盖新 token 把账号刷下线；后台 quota 刷新（FetchQuota 401 重试）与
+// 密钥刷新（RefreshAPIKey）共用此处去重。
+func (s *AccountState) RefreshCreds(creds *oauth.Creds) (*oauth.Creds, error) {
+	v, err, _ := s.refreshFlight.Do("refresh", func() (any, error) {
+		return oauth.RefreshAccessTokenFor(creds)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*oauth.Creds), nil
+}
+
 // persistCreds 把刷新后的账号凭据写回 accounts/<slug>.json（不激活、不触发 ReloadPool，避免死锁）。
 func (s *AccountState) persistCreds(creds *oauth.Creds) {
 	// SaveAccount 会 ReloadPool → 调 syncPool → 不碰已存在 account；此处用底层写，避免持锁回调
@@ -286,28 +302,29 @@ func (s *AccountState) FetchQuota(force bool) *QuotaSnapshot {
 	s.mu.Unlock()
 
 	doFetch := func() *QuotaSnapshot {
+		// 用外层锁内快照的 cache，而非直读 s.quotaCacheData——后台 goroutine 无锁读会构成数据竞争
 		creds := s.registry.LoadAccountCreds(s.Slug)
 		if creds == nil || creds.AccessToken == "" {
-			return s.quotaCacheData // 无凭据返回旧缓存（或 nil）
+			return cache // 无凭据返回旧缓存（或 nil）
 		}
 		status, body, err := oauth.Get(oauth.Base+"/api/user/billing/usage/summary", creds.AccessToken)
 		if err != nil {
-			return s.quotaCacheData
+			return cache
 		}
 		if status == 401 {
 			// §17.4 修复：刷新后重试一次（JS 版只刷新不重试）
 			// ⚠️ code-review #2：必须按本账号刷新，不能串到全局激活账号。
-			if updated, err := oauth.RefreshAccessTokenFor(creds); err == nil {
+			if updated, err := s.RefreshCreds(creds); err == nil {
 				s.persistCreds(updated)
 				status, body, _ = oauth.Get(oauth.Base+"/api/user/billing/usage/summary", updated.AccessToken)
 			}
 		}
 		if status < 200 || status >= 300 {
-			return s.quotaCacheData
+			return cache
 		}
 		var q QuotaSnapshot
 		if err := json.Unmarshal(body, &q); err != nil {
-			return s.quotaCacheData
+			return cache
 		}
 		s.mu.Lock()
 		s.quotaCacheData = &q
@@ -319,7 +336,13 @@ func (s *AccountState) FetchQuota(force bool) *QuotaSnapshot {
 	// 1. 有缓存且非强制 → 立即返回缓存（< 1ms 纯内存），后台异步刷新
 	if hasCache && !force {
 		if isStale {
-			go doFetch() // 后台静默刷新，不阻塞
+			// single-flight 去重：TTL 过期瞬间的并发请求只起一个后台刷新（否则并发 refresh 轮换竞争）
+			go func() {
+				_, _, _ = s.quotaFlight.Do("quota", func() (any, error) {
+					doFetch()
+					return nil, nil
+				})
+			}()
 		}
 		return cache
 	}

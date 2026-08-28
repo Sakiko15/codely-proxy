@@ -7,6 +7,32 @@ import (
 	"testing"
 )
 
+func TestReadKeyFileFailClosed(t *testing.T) {
+	// 稳定性审计 F6：瞬时读取错误应沿用缓存（fail-closed），而非静默关闭鉴权
+	s := setup(t)
+	s.SetProxyKey("sk-a")
+	if got := s.ValidKeys(); len(got) != 1 || got[0] != "sk-a" {
+		t.Fatalf("预置 key 失败: %v", got)
+	}
+	// 把 key 文件替换为同名目录 → stat 成功但 ReadFile 必败
+	if err := os.Remove(ProxyKeyFile); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := os.MkdirAll(ProxyKeyFile, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if got := s.ValidKeys(); len(got) != 1 || got[0] != "sk-a" {
+		t.Fatalf("读取异常应沿用缓存（fail-closed）, got %v", got)
+	}
+	// 文件不存在 = 免密设计态（维持原语义）
+	if err := os.RemoveAll(ProxyKeyFile); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if got := s.ValidKeys(); len(got) != 0 {
+		t.Fatalf("文件不存在应恢复免密, got %v", got)
+	}
+}
+
 func setup(t *testing.T) *Security {
 	t.Helper()
 	dir := t.TempDir()

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"time"
 
@@ -27,19 +28,22 @@ type Server struct {
 	Logger   *log.Logger
 	// ProxyUpstream 用于 /healthz 展示。
 	ProxyUpstream string
+	// loginLimiter 登录失败限速（按来源 IP，稳定性审计 F7）。
+	loginLimiter *ipLimiter
 }
 
 // NewServer 组装 WebUI 服务。
 func NewServer(auth *Auth, reg *account.Registry, b *balancer.Balancer, q *quota.Quota, sec *security.Security, ph *proxy.Handler, lf *account.LoginFlow) *Server {
 	return &Server{
-		Auth:      auth,
-		Registry:  reg,
-		Balancer:  b,
-		Quota:     q,
-		Security:  sec,
-		Proxy:     ph,
-		LoginFlow: lf,
-		Logger:    log.Default(),
+		Auth:         auth,
+		Registry:     reg,
+		Balancer:     b,
+		Quota:        q,
+		Security:     sec,
+		Proxy:        ph,
+		LoginFlow:    lf,
+		Logger:       log.Default(),
+		loginLimiter: newIPLimiter(),
 	}
 }
 
@@ -64,8 +68,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/security/status", admin(s.handleSecurityStatus))
 	mux.HandleFunc("POST /api/security/config", admin(s.handleSecurityConfig))
 
-	// --- 健康检查（无需登录，供监控） ---
-	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	// --- 健康检查（无需登录，供监控；超时兜底防慢客户端钉住 goroutine，稳定性审计 F7） ---
+	mux.Handle("GET /healthz", http.TimeoutHandler(http.HandlerFunc(s.handleHealthz), 10*time.Second, `{"ok":false,"error":"timeout"}`))
 
 	// --- WebUI 静态资源（go:embed） ---
 	mux.HandleFunc("GET /{$}", s.handleIndex)
@@ -98,6 +102,15 @@ func readBody(rw http.ResponseWriter, req *http.Request, limit int64) ([]byte, b
 
 // handleLogin POST /api/login：账密校验 → 发 HttpOnly cookie。
 func (s *Server) handleLogin(rw http.ResponseWriter, req *http.Request) {
+	// 登录失败限速（稳定性审计 F7）：按来源 IP，锁定窗口内直接 429
+	ip := req.RemoteAddr
+	if host, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+		ip = host
+	}
+	if s.loginLimiter.Blocked(ip) {
+		writeJSON(rw, http.StatusTooManyRequests, map[string]any{"ok": false, "error": "too many attempts, try later"})
+		return
+	}
 	data, ok := readBody(rw, req, 0) // 未鉴权端点必须有 body 上限（稳定性审计 F4）
 	if !ok {
 		return
@@ -111,9 +124,11 @@ func (s *Server) handleLogin(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if !s.Auth.CheckCredentials(body.Username, body.Password) {
+		s.loginLimiter.Fail(ip)
 		writeJSON(rw, http.StatusUnauthorized, map[string]any{"ok": false, "error": "invalid credentials"})
 		return
 	}
+	s.loginLimiter.OK(ip)
 	s.Auth.MarkLogin() // 首次成功登录后收回生成密码的匿名可读性（安全审计）
 	tok := s.Auth.CreateSession()
 	s.Auth.setSessionCookie(rw, tok)

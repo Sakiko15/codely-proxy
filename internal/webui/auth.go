@@ -75,10 +75,19 @@ func (a *Auth) CheckCredentials(user, pass string) bool {
 }
 
 // CreateSession 创建登录态 token（返回 HttpOnly cookie 值）。
+// len>64 时顺手清扫过期会话（稳定性审计 F7：放弃的会话不再无界累积）。
 func (a *Auth) CreateSession() string {
 	tok := randomToken(32)
+	now := time.Now()
 	a.mu.Lock()
-	a.sessions[tok] = time.Now().Add(12 * time.Hour)
+	if len(a.sessions) > 64 {
+		for t, exp := range a.sessions {
+			if now.After(exp) {
+				delete(a.sessions, t)
+			}
+		}
+	}
+	a.sessions[tok] = now.Add(12 * time.Hour)
 	a.mu.Unlock()
 	return tok
 }
@@ -171,6 +180,84 @@ func randomToken(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// ---- 登录失败限速（稳定性审计 F7：防弱 WEBUI_PASS 被公网爆破） ----
+
+const (
+	loginMaxFails     = 10              // 窗口内失败上限
+	loginFailWindow   = 5 * time.Minute // 失败计数窗口
+	loginLockDuration = 5 * time.Minute // 达到上限后的锁定时长
+)
+
+// ipFailEntry 单 IP 的失败状态。
+type ipFailEntry struct {
+	count       int
+	windowStart time.Time
+	lockedUntil time.Time
+}
+
+// ipLimiter 极简内存态按 IP 失败限速器（无外部依赖；进程重启即清零）。
+type ipLimiter struct {
+	mu    sync.Mutex
+	fails map[string]*ipFailEntry
+}
+
+func newIPLimiter() *ipLimiter { return &ipLimiter{fails: map[string]*ipFailEntry{}} }
+
+// Blocked 该 IP 是否处于锁定期。nil 接收器 = 未启用限速。
+func (l *ipLimiter) Blocked(ip string) bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st, ok := l.fails[ip]
+	return ok && time.Now().Before(st.lockedUntil)
+}
+
+// Fail 记录一次失败：滚动窗口内达到阈值 → 锁定 loginLockDuration。
+func (l *ipLimiter) Fail(ip string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.fails == nil {
+		l.fails = map[string]*ipFailEntry{}
+	}
+	now := time.Now()
+	st, ok := l.fails[ip]
+	if !ok || now.Sub(st.windowStart) > loginFailWindow {
+		if !ok {
+			st = &ipFailEntry{}
+			l.fails[ip] = st
+		}
+		st.windowStart = now
+		st.count = 0
+	}
+	st.count++
+	if st.count >= loginMaxFails {
+		st.lockedUntil = now.Add(loginLockDuration)
+	}
+	// 惰性清理：过期且未锁定的条目（防 map 无界增长）
+	if len(l.fails) > 256 {
+		for k, e := range l.fails {
+			if now.After(e.lockedUntil) && now.Sub(e.windowStart) > loginFailWindow {
+				delete(l.fails, k)
+			}
+		}
+	}
+}
+
+// OK 登录成功 → 清除该 IP 的失败计数。
+func (l *ipLimiter) OK(ip string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	delete(l.fails, ip)
+	l.mu.Unlock()
 }
 
 // 供测试/环境注入。

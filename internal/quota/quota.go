@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"codely-proxy/internal/account"
 	"codely-proxy/internal/gateway"
 	"codely-proxy/internal/oauth"
@@ -101,6 +103,7 @@ type Quota struct {
 		data *Snapshot
 		fp   string
 	}
+	sf singleflight.Group // 快照抓取单飞（force 连点/过期并发只打一轮上游，稳定性审计 F7）
 }
 
 // New 创建计费快照服务。
@@ -190,6 +193,19 @@ func (q *Quota) FetchSnapshot(force bool) (*Snapshot, error) {
 	}
 	q.mu.Unlock()
 
+	// 单飞（稳定性审计 F7）：force 连点或过期瞬间的并发只打一轮上游（以凭据指纹为 key，
+	// 换账号并发各抓各的）
+	v, err, _ := q.sf.Do(fp, func() (any, error) {
+		return q.fetchFresh(creds, fp)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*Snapshot), nil
+}
+
+// fetchFresh 拉一轮完整快照并写缓存（FetchSnapshot 的网络+组装段）。
+func (q *Quota) fetchFresh(creds *oauth.Creds, fp string) (*Snapshot, error) {
 	// 并行拉 usage/summary + plan；apiKey 用于 /key/info（依赖，拆开）
 	summaryRaw, sumErr := call(q.reg, "/api/user/billing/usage/summary", creds)
 	planRaw, planErr := call(q.reg, "/api/user/plan", creds)

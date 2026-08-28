@@ -2,6 +2,7 @@ package webui
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -269,6 +270,62 @@ func TestLoginBodySizeCapped(t *testing.T) {
 	rw, _ := doJSON(t, srv, "POST", "/api/login", `{"username":"`+big+`"}`, "")
 	if rw.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("超大 body 应 413, got %d", rw.Code)
+	}
+}
+
+func TestAuthSessionLazySweep(t *testing.T) {
+	// 稳定性审计 F7：放弃的会话不再无界累积——超阈值时惰性清扫过期项
+	a := NewAuth("", "")
+	now := time.Now()
+	a.mu.Lock()
+	for i := 0; i < 100; i++ {
+		a.sessions[fmt.Sprintf("expired-%d", i)] = now.Add(-1 * time.Hour)
+	}
+	a.mu.Unlock()
+	_ = a.CreateSession() // 触发惰性清扫
+	a.mu.Lock()
+	n := len(a.sessions)
+	a.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("过期会话应被清扫，剩 %d 条", n)
+	}
+}
+
+func TestLoginIPLimiter(t *testing.T) {
+	// 稳定性审计 F7：滚动窗口内达到失败阈值 → 锁定；其他 IP 不受牵连；成功清零
+	l := newIPLimiter()
+	for i := 0; i < loginMaxFails-1; i++ {
+		l.Fail("1.2.3.4")
+	}
+	if l.Blocked("1.2.3.4") {
+		t.Fatalf("未达阈值不应锁定")
+	}
+	l.Fail("1.2.3.4")
+	if !l.Blocked("1.2.3.4") {
+		t.Fatalf("达到阈值应锁定")
+	}
+	if l.Blocked("5.6.7.8") {
+		t.Fatalf("其他 IP 不应被牵连")
+	}
+	l.OK("1.2.3.4")
+	if l.Blocked("1.2.3.4") {
+		t.Fatalf("登录成功应清零")
+	}
+}
+
+func TestLoginRateLimited429(t *testing.T) {
+	// 端到端：连续失败达阈值后，锁定窗口内即使正确密码也 429
+	srv, cleanup := buildServer(t)
+	defer cleanup()
+	for i := 0; i < loginMaxFails; i++ {
+		rw, _ := doJSON(t, srv, "POST", "/api/login", `{"username":"testuser","password":"wrong"}`, "")
+		if rw.Code != http.StatusUnauthorized {
+			t.Fatalf("错误密码应 401, got %d", rw.Code)
+		}
+	}
+	rw, _ := doJSON(t, srv, "POST", "/api/login", `{"username":"testuser","password":"testpass"}`, "")
+	if rw.Code != http.StatusTooManyRequests {
+		t.Fatalf("锁定窗口内正确密码也应 429, got %d", rw.Code)
 	}
 }
 

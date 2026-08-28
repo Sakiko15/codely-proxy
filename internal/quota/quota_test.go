@@ -4,12 +4,49 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"codely-proxy/internal/account"
 	"codely-proxy/internal/oauth"
 )
+
+func TestFetchSnapshotForceSingleFlight(t *testing.T) {
+	// 稳定性审计 F7：force 连点/过期瞬间的并发只打一轮上游
+	var summaryCalls int32
+	q, _, cleanup := setup(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/user/billing/usage/summary":
+			atomic.AddInt32(&summaryCalls, 1)
+			time.Sleep(100 * time.Millisecond) // 放大并发窗口
+			_, _ = w.Write([]byte(`{"totals":{"recorded_points":1}}`))
+		case "/api/user/plan":
+			_, _ = w.Write([]byte(`{"plan_type":"free","is_active":true}`))
+		default:
+			http.Error(w, "nf", 404)
+		}
+	}))
+	defer cleanup()
+
+	const n = 5
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := q.FetchSnapshot(true); err != nil {
+				t.Errorf("FetchSnapshot: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := atomic.LoadInt32(&summaryCalls); got != 1 {
+		t.Fatalf("force 并发应单飞为 1 次 usage 拉取, got %d", got)
+	}
+}
 
 // setup 建临时数据目录 + 注册表（含一个激活账号）+ mock usage 服务。
 func setup(t *testing.T, handler http.HandlerFunc) (*Quota, *account.Registry, func()) {

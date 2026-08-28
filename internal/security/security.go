@@ -11,6 +11,7 @@ package security
 
 import (
 	"crypto/subtle"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -44,14 +45,20 @@ type Security struct {
 func New() *Security { return &Security{} }
 
 // readKeyFile 读 proxy-key.txt（带 mtime 缓存）。对标 codely-security.js readKeyFromFile。
-// 返回 fileKey；nil 表示未修改（沿用缓存）。
+// 返回 fileKey；第二返回值 true 表示未修改（沿用缓存）。
+// 稳定性审计 F6：仅"文件不存在"视为免密设计态；其他读取异常（权限抖动/句柄争用等）
+// 沿用既有缓存（fail-closed）并记日志——此前任何错误都会静默清空鉴权（fail-open）。
 func (s *Security) readKeyFile() (string, bool) {
 	st, err := os.Stat(ProxyKeyFile)
 	if err != nil {
-		s.mu.Lock()
-		s.lastMtime = 0
-		s.mu.Unlock()
-		return "", false
+		if os.IsNotExist(err) {
+			s.mu.Lock()
+			s.lastMtime = 0
+			s.mu.Unlock()
+			return "", false
+		}
+		log.Printf("[security] stat %s 失败（沿用现有 Key 缓存）: %v", ProxyKeyFile, err)
+		return "", true
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -61,7 +68,8 @@ func (s *Security) readKeyFile() (string, bool) {
 	s.lastMtime = st.ModTime().UnixMilli()
 	data, err := os.ReadFile(ProxyKeyFile)
 	if err != nil {
-		return "", false
+		log.Printf("[security] 读取 %s 失败（沿用现有 Key 缓存）: %v", ProxyKeyFile, err)
+		return "", true
 	}
 	return strings.TrimSpace(string(data)), false
 }

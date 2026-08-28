@@ -243,6 +243,29 @@ func TestAuthGeneratedPassword(t *testing.T) {
 	}
 }
 
+func TestWebUILoginURLCopyable(t *testing.T) {
+	// 逻辑审查：设备码登录的授权链接必须完整可见且可一键复制——
+	// 此前 URL 仅存在于 <a> 的 href 属性里（页面无文本展示、无复制按钮），
+	// 且 copyText 在非 HTTPS 部署下因 navigator.clipboard 缺失整体失效。
+	// 前端无自动化测试，以 embed 内容钉死复制能力防回归。
+	data, err := webFS.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatalf("读取 embed: %v", err)
+	}
+	s := string(data)
+	for _, needle := range []string{
+		"dev-url-text",     // 完整链接的可见展示区
+		"copyLoginUrl",     // 一键复制处理函数
+		"复制授权链接",       // 复制按钮
+		"execCommand",      // 非 HTTPS 降级复制
+		"verification_uri_complete",
+	} {
+		if !strings.Contains(s, needle) {
+			t.Fatalf("index.html 应包含 %q（登录链接复制能力回归）", needle)
+		}
+	}
+}
+
 func TestAuthPartialEnv(t *testing.T) {
 	// 逻辑审查 P1：WEBUI_USER/WEBUI_PASS 只设其一不再整体回退随机
 	a := NewAuth("", "mypass")

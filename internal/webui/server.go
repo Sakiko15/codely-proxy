@@ -219,6 +219,10 @@ func (s *Server) handleAccountDelete(rw http.ResponseWriter, req *http.Request) 
 		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
+	if removed {
+		// 逻辑审查 P2：清理 disabledSlugs 中已删账号的残留（同名重建不再无声继承禁用态）
+		s.Balancer.OnAccountRemoved(account.Slugify(body.Name))
+	}
 	resp := map[string]any{"ok": removed, "nextCurrent": next}
 	if err != nil {
 		// 逻辑审查 P1：已删除但收尾失败（自动切换）——200 + warning，前端可见

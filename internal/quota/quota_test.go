@@ -13,6 +13,27 @@ import (
 	"codely-proxy/internal/oauth"
 )
 
+func TestFetchSnapshotUsageFailErrors(t *testing.T) {
+	// 逻辑审查 P2：usage（主数据）拉取失败必须抛错——此前 plan 成功时会返回
+	// 空额度快照并缓存 15s，WebUI 显示额度 0/空误导用户
+	q, _, cleanup := setup(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/user/billing/usage/summary":
+			http.Error(w, "boom", 500)
+		case "/api/user/plan":
+			_, _ = w.Write([]byte(`{"plan_type":"free","is_active":true}`))
+		default:
+			http.Error(w, "nf", 404)
+		}
+	}))
+	defer cleanup()
+
+	if _, err := q.FetchSnapshot(false); err == nil {
+		t.Fatalf("usage 失败应返回错误（即便 plan 成功）")
+	}
+}
+
 func TestFetchSnapshotForceSingleFlight(t *testing.T) {
 	// 稳定性审计 F7：force 连点/过期瞬间的并发只打一轮上游
 	var summaryCalls int32

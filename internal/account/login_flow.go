@@ -302,8 +302,8 @@ func (f *LoginFlow) complete(authorizationCode, suggestedName string) (*Account,
 	n := 2
 	for {
 		existing, ok := idx.Accounts[finalSlug]
-		if !ok || existing.UserID == userId {
-			break // 未占用，或已占用但同属该 user（重建）
+		if !ok || (userId != "" && existing.UserID == userId) {
+			break // 未占用，或已占用且同属该 user（重建）；userId 为空串不得命中重建分支（P2：防静默覆盖）
 		}
 		finalSlug = fmt.Sprintf("%s-%d", base, n)
 		n++

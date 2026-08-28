@@ -30,6 +30,24 @@ func NewBalancer(reg *account.Registry) *Balancer {
 // ReloadPool 动态重新同步池（账号增删时联动，PoolReloader 接口）。对标 reloadPool。
 func (b *Balancer) ReloadPool() { b.syncPool() }
 
+// OnAccountRemoved 账号删除后清理配置中的残留引用（逻辑审查 P2：
+// disabledSlugs 残留已删 slug，会让同名重建的新账号无声继承禁用态）。
+func (b *Balancer) OnAccountRemoved(slug string) {
+	b.mu.Lock()
+	if !containsStr(b.config.DisabledSlugs, slug) {
+		b.mu.Unlock()
+		return
+	}
+	b.config.DisabledSlugs = removeStr(b.config.DisabledSlugs, slug)
+	snap := b.config
+	snap.DisabledSlugs = append([]string(nil), b.config.DisabledSlugs...)
+	b.mu.Unlock()
+
+	saveMu.Lock()
+	_ = saveConfig(snap)
+	saveMu.Unlock()
+}
+
 // Preheat 启动预热（性能审计 P3）：为池内未禁用账号预热 sk- 密钥（key 文件命中零网络；
 // 缺失才走刷新链，失败无害）与 quota 快照（仅 LB 开启且 quota-first 时；否则冷启动首个
 // 请求会在 Pick 内串行吃满 30s×N 段的刷新链）。有界并发；阻塞调用方（main 以 goroutine 启动）。

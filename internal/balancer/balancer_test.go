@@ -615,6 +615,28 @@ func TestUpdateConfigPersistError(t *testing.T) {
 	}
 }
 
+func TestOnAccountRemoved(t *testing.T) {
+	// 逻辑审查 P2：账号删除后清理 disabledSlugs 残留——同名重建的新账号
+	// 不再无声继承禁用态
+	reg := setup(t)
+	addAccount(t, reg, "a", "1", "A", 0, 0, true)
+	bal := NewBalancer(reg)
+	_, _ = bal.UpdateConfig(map[string]any{"disabledSlugs": []any{"a", "gone"}})
+
+	bal.OnAccountRemoved("a")
+	cfg := bal.GetConfig()
+	for _, s := range cfg.DisabledSlugs {
+		if s == "a" {
+			t.Fatalf("已删账号的禁用残留应被清理: %v", cfg.DisabledSlugs)
+		}
+	}
+	// 与账号无关的条目保留（去重幂等）
+	bal.OnAccountRemoved("a")
+	if got := bal.GetConfig().DisabledSlugs; len(got) != 1 || got[0] != "gone" {
+		t.Fatalf("无关条目应保留: %v", got)
+	}
+}
+
 func TestMarkFailureTruncatesReason(t *testing.T) {
 	// 性能审计 P5：大错误体只在前 2KB 做关键词判定；冷却原因截断至 256 字节——
 	// 64KB 错误体不再整段驻留内存态/进状态轮询

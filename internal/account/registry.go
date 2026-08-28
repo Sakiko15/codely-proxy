@@ -199,7 +199,11 @@ func AutoName(creds *oauth.Creds) string {
 		}
 	}
 	if creds != nil && creds.UserID != "" {
-		return "user-" + creds.UserID
+		// 逻辑审查 P2：必须过 Slugify——大写 UserID 直接拼接会在 Linux 上落盘
+		// user-AB12.json，而查找侧恒经 Slugify 小写化 → 账号无法激活/刷新
+		if s := Slugify("user-" + creds.UserID); s != "" {
+			return s
+		}
 	}
 	return "account-" + randHex(2)
 }
@@ -520,6 +524,9 @@ func (r *Registry) RemoveAccount(name string, pool PoolReloader) (removed bool, 
 	}
 	wasCurrent := idx.Current == slug
 	_ = os.Remove(accountFilePath(slug))
+	// 逻辑审查 P2：伴生文件一并清理——残留的 sk- key 会被同名重建的新账号静默复用
+	_ = os.Remove(filepath.Join(AccountsDir, slug+".key"))
+	_ = os.Remove(filepath.Join(AccountsDir, slug+".session"))
 	r.invalidateSlugsCache() // 文件集合变更（P2 缓存失效）
 	delete(idx.Accounts, slug)
 	rest := make([]string, 0, len(idx.Accounts))

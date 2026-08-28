@@ -323,6 +323,95 @@ func TestPollNoLogin(t *testing.T) {
 // jsonDecode 辅助（编译用）
 var _ = json.Marshal
 
+func TestDeviceLoginCollisionEmptyUserID(t *testing.T) {
+	// 逻辑审查 P2：userId 为空串不得命中"同属该 user 重建"分支——同名登录应走 -2 后缀
+	// 而非静默覆盖既有账号（F5 修复的残留缺口）
+	meBody := []byte(`{"id":77777}`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/auth/device/initiate":
+			_, _ = w.Write([]byte(`{"auth_request_token":"art","verification_uri_complete":"https://x/a","user_code":"ABC-123","interval":1,"expires_in":600}`))
+		case "/auth/device/poll":
+			_, _ = w.Write([]byte(`{"status":"authorized","authorization_code":"authcode"}`))
+		case "/auth/device/exchange":
+			_, _ = w.Write([]byte(`{"access_token":"at","refresh_token":"rt","expires_in":3600}`))
+		case "/auth/external/me":
+			_, _ = w.Write(meBody)
+		case "/api/teams":
+			_, _ = w.Write([]byte(`{"current_team_id":"team-7","teams":[{"team_id":"team-7","team_name":"New Org","is_current":true}]}`))
+		default:
+			http.Error(w, "nf", 404)
+		}
+	}))
+	defer srv.Close()
+	oldBase := oauth.Base
+	oauth.Base = srv.URL
+	t.Cleanup(func() { oauth.Base = oldBase })
+
+	r := setup(t)
+
+	flow1 := NewLoginFlow(r)
+	if _, _, _, _, err := flow1.Start("new-org"); err != nil {
+		t.Fatalf("Start1: %v", err)
+	}
+	if st := flow1.Poll(); st.Status != "authorized" || st.Account == nil || st.Account.Name != "new-org" {
+		t.Fatalf("第一个团队应落为 new-org, got %+v", st)
+	}
+
+	// userId 为空串的同名登录 → 必须落为 new-org-2（不覆盖）
+	meBody = []byte(`{"id":""}`)
+	flow2 := NewLoginFlow(r)
+	if _, _, _, _, err := flow2.Start("new-org"); err != nil {
+		t.Fatalf("Start2: %v", err)
+	}
+	if st := flow2.Poll(); st.Status != "authorized" || st.Account == nil || st.Account.Name != "new-org-2" {
+		t.Fatalf("空 userId 同名登录应落为 new-org-2, got %+v", st)
+	}
+	if n := len(r.ListAccounts()); n != 2 {
+		t.Fatalf("应有 2 个账号, got %d", n)
+	}
+}
+
+func TestAutoNameUpperUserID(t *testing.T) {
+	// 逻辑审查 P2：user-+UserID 必须过 Slugify——大写 UserID 在 Linux 上
+	// 落盘与查找大小写不一致会导致账号无法激活/刷新
+	if got := AutoName(&oauth.Creds{UserID: "AB12"}); got != "user-ab12" {
+		t.Fatalf("大写 UserID 应小写化, got %q", got)
+	}
+	if got := AutoName(&oauth.Creds{TeamName: "My Org", UserID: "AB12"}); got != "my-org" {
+		t.Fatalf("teamName 优先路径不应受影响, got %q", got)
+	}
+}
+
+func TestRemoveAccountRemovesSidecarFiles(t *testing.T) {
+	// 逻辑审查 P2：删除账号必须清理 <slug>.key/.session 伴生文件——
+	// 残留的 sk- key 会被同名重建的新账号静默复用
+	r := setup(t)
+	if _, _, err := r.SaveAccount("a", fakeCreds("1", "A"), true, nil); err != nil {
+		t.Fatalf("SaveAccount: %v", err)
+	}
+	if err := os.MkdirAll(AccountsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(AccountsDir+"/a.key", []byte("sk-a"), 0o600); err != nil {
+		t.Fatalf("写 key: %v", err)
+	}
+	if err := os.WriteFile(AccountsDir+"/a.session", []byte("sid-a"), 0o600); err != nil {
+		t.Fatalf("写 session: %v", err)
+	}
+
+	removed, _, err := r.RemoveAccount("a", nil)
+	if err != nil || !removed {
+		t.Fatalf("RemoveAccount: removed=%v err=%v", removed, err)
+	}
+	for _, f := range []string{"a.key", "a.session"} {
+		if _, statErr := os.Stat(AccountsDir + "/" + f); !os.IsNotExist(statErr) {
+			t.Fatalf("伴生文件 %s 应被清理", f)
+		}
+	}
+}
+
 func TestRemoveAccountCascadeSwitchFail(t *testing.T) {
 	// 逻辑审查 P1：删除当前账号且级联激活失败——删除已成立（不得谎报 removed=false），
 	// 且指向已删账号的 codely-creds.json 必须清除（不能继续用已删账号凭据承载 /v1）

@@ -227,8 +227,9 @@ func (q *Quota) fetchFresh(creds *oauth.Creds, fp string) (*Snapshot, error) {
 			}
 		}
 	}
-	if sumErr != nil && plan == nil {
-		// 连 usage 都没拿到 → 抛错（客户端该知道）
+	if sumErr != nil {
+		// usage 是主数据（额度/账单）：拉取失败必须抛错（逻辑审查 P2）——
+		// 此前 plan 成功时会返回空额度快照并缓存 15s，WebUI 显示额度 0/空误导用户
 		return nil, sumErr
 	}
 

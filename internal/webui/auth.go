@@ -125,24 +125,28 @@ func (a *Auth) DestroySession(tok string) {
 const sessionCookieName = "codely_webui_session"
 
 // setSessionCookie 把登录态写到 HttpOnly cookie。
-func (a *Auth) setSessionCookie(rw http.ResponseWriter, tok string) {
+// secure（审查记录 P2 #29）：TLS 直连或反代声明 X-Forwarded-Proto=https 时置位——
+// 纯 HTTP 本地部署保持缺省以免破坏可用性。
+func (a *Auth) setSessionCookie(rw http.ResponseWriter, tok string, secure bool) {
 	http.SetCookie(rw, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    tok,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   12 * 3600,
 	})
 }
 
-// clearSessionCookie 清 cookie（登出）。
-func clearSessionCookie(rw http.ResponseWriter) {
+// clearSessionCookie 清 cookie（登出）。secure 与签发时保持一致才能确保清除生效。
+func clearSessionCookie(rw http.ResponseWriter, secure bool) {
 	http.SetCookie(rw, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   secure,
 		MaxAge:   -1,
 	})
 }
@@ -189,15 +193,15 @@ func randomToken(n int) string {
 // ---- 登录失败限速（稳定性审计 F7：防弱 WEBUI_PASS 被公网爆破） ----
 
 const (
-	loginMaxFails     = 10              // 窗口内失败上限
+	loginMaxFails     = 10              // 滑动窗口内失败上限
 	loginFailWindow   = 5 * time.Minute // 失败计数窗口
 	loginLockDuration = 5 * time.Minute // 达到上限后的锁定时长
+	loginMaxEntries   = 4096            // fails map 硬上限（审查记录 P2 #28：伪造 IP 洪泛不无界增长）
 )
 
-// ipFailEntry 单 IP 的失败状态。
+// ipFailEntry 单 IP 的失败状态（滑动窗口：保存窗口内的失败时刻，审查记录 P2 #27）。
 type ipFailEntry struct {
-	count       int
-	windowStart time.Time
+	stamps      []time.Time // 窗口内的失败时刻（滚动剔除窗外项）
 	lockedUntil time.Time
 }
 
@@ -205,9 +209,12 @@ type ipFailEntry struct {
 type ipLimiter struct {
 	mu    sync.Mutex
 	fails map[string]*ipFailEntry
+	now   func() time.Time // 可注入时钟（测试用）
 }
 
-func newIPLimiter() *ipLimiter { return &ipLimiter{fails: map[string]*ipFailEntry{}} }
+func newIPLimiter() *ipLimiter {
+	return &ipLimiter{fails: map[string]*ipFailEntry{}, now: time.Now}
+}
 
 // Blocked 该 IP 是否处于锁定期。nil 接收器 = 未启用限速。
 func (l *ipLimiter) Blocked(ip string) bool {
@@ -217,10 +224,13 @@ func (l *ipLimiter) Blocked(ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	st, ok := l.fails[ip]
-	return ok && time.Now().Before(st.lockedUntil)
+	return ok && l.now().Before(st.lockedUntil)
 }
 
-// Fail 记录一次失败：滚动窗口内达到阈值 → 锁定 loginLockDuration。
+// Fail 记录一次失败：滑动窗口内失败达阈值 → 锁定 loginLockDuration。
+// 滑动窗口（审查记录 P2 #27）：此前为固定窗口——每窗只失败上限-1 次即可无限续期，
+// 攻击者可以 ≈108 次/小时的节奏无成本爆破；滑动窗口下窗口内的历史失败持续计数。
+// map 硬上限（#28）：超限先清"未锁定且已无窗口内失败"的条目，仍超则驱逐一条最早失败的。
 func (l *ipLimiter) Fail(ip string) {
 	if l == nil {
 		return
@@ -230,26 +240,47 @@ func (l *ipLimiter) Fail(ip string) {
 	if l.fails == nil {
 		l.fails = map[string]*ipFailEntry{}
 	}
-	now := time.Now()
+	now := l.now()
 	st, ok := l.fails[ip]
-	if !ok || now.Sub(st.windowStart) > loginFailWindow {
-		if !ok {
-			st = &ipFailEntry{}
-			l.fails[ip] = st
+	if !ok {
+		st = &ipFailEntry{}
+		l.fails[ip] = st
+	}
+	cutoff := now.Add(-loginFailWindow)
+	kept := st.stamps[:0]
+	for _, ts := range st.stamps {
+		if ts.After(cutoff) {
+			kept = append(kept, ts)
 		}
-		st.windowStart = now
-		st.count = 0
 	}
-	st.count++
-	if st.count >= loginMaxFails {
+	st.stamps = append(kept, now)
+	if len(st.stamps) >= loginMaxFails {
 		st.lockedUntil = now.Add(loginLockDuration)
+		st.stamps = st.stamps[:0] // 锁定后重新累计
 	}
-	// 惰性清理：过期且未锁定的条目（防 map 无界增长）
-	if len(l.fails) > 256 {
+	if len(l.fails) > loginMaxEntries {
 		for k, e := range l.fails {
-			if now.After(e.lockedUntil) && now.Sub(e.windowStart) > loginFailWindow {
+			if len(e.stamps) == 0 && !l.now().Before(e.lockedUntil) {
 				delete(l.fails, k)
 			}
+		}
+	}
+	if len(l.fails) > loginMaxEntries {
+		// 驱逐一条最早失败的条目，保持 map 有界（单次驱逐，均摊可接受）
+		oldestK := ""
+		var oldest time.Time
+		first := true
+		for k, e := range l.fails {
+			var t time.Time
+			if len(e.stamps) > 0 {
+				t = e.stamps[0]
+			}
+			if first || t.Before(oldest) {
+				oldestK, oldest, first = k, t, false
+			}
+		}
+		if oldestK != "" {
+			delete(l.fails, oldestK)
 		}
 	}
 }

@@ -430,6 +430,102 @@ func TestLoginIPLimiter(t *testing.T) {
 	}
 }
 
+func TestLoginIPLimiterSlidingWindow(t *testing.T) {
+	// 审查记录 P2 #27：滑动窗口——跨窗失败不累积（此前固定窗口每窗 9 次可无限续期爆破）
+	l := newIPLimiter()
+	base := time.Now()
+	l.now = func() time.Time { return base }
+	for i := 0; i < loginMaxFails-1; i++ {
+		l.Fail("1.2.3.4")
+	}
+	if l.Blocked("1.2.3.4") {
+		t.Fatalf("未达阈值不应锁定")
+	}
+	// 时间推进跨过窗口：旧失败全部过期，不与新失败累积
+	l.now = func() time.Time { return base.Add(loginFailWindow + time.Minute) }
+	for i := 0; i < loginMaxFails-1; i++ {
+		l.Fail("1.2.3.4")
+	}
+	if l.Blocked("1.2.3.4") {
+		t.Fatalf("跨窗后旧失败不应累积（滑动窗口只计窗外新失败）")
+	}
+	// 同一窗口内继续失败达阈值 → 锁定
+	l.Fail("1.2.3.4")
+	if !l.Blocked("1.2.3.4") {
+		t.Fatalf("窗口内累计达阈值应锁定")
+	}
+}
+
+func TestLoginIPLimiterMapBounded(t *testing.T) {
+	// 审查记录 P2 #28：伪造 IP 洪泛时 map 有硬上限
+	l := newIPLimiter()
+	for i := 0; i < loginMaxEntries+500; i++ {
+		l.Fail(fmt.Sprintf("10.%d.%d.%d", i>>16&255, i>>8&255, i&255))
+	}
+	l.mu.Lock()
+	n := len(l.fails)
+	l.mu.Unlock()
+	if n > loginMaxEntries {
+		t.Fatalf("map 应有硬上限, got %d", n)
+	}
+}
+
+func TestLoginIPXFFRightmost(t *testing.T) {
+	// 审查记录 P2 #28：追加型反代下取 XFF 最右地址——客户端自带的伪造段不参与分桶
+	srv, cleanup := buildServer(t)
+	defer cleanup()
+	srv.TrustProxy = true
+	doLogin := func(xff, user, pass string) int {
+		body := `{"username":"` + user + `","password":"` + pass + `"}`
+		req := httptest.NewRequest("POST", "/api/login", strings.NewReader(body))
+		req.Header.Set("X-Forwarded-For", xff)
+		rec := httptest.NewRecorder()
+		mux := http.NewServeMux()
+		srv.Routes(mux)
+		mux.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	// 攻击者自带 XFF "9.9.9.9"，反代追加真实来源 "10.0.0.7" → 分桶取最右的 10.0.0.7
+	for i := 0; i < loginMaxFails; i++ {
+		if code := doLogin("9.9.9.9, 10.0.0.7", "testuser", "wrong"); code != http.StatusUnauthorized {
+			t.Fatalf("失败应 401, got %d", code)
+		}
+	}
+	// 伪造段轮换无效：同真实 IP 再来（即使正确密码）也锁定
+	if code := doLogin("8.8.8.8, 10.0.0.7", "testuser", "testpass"); code != http.StatusTooManyRequests {
+		t.Fatalf("真实 IP 已锁定，伪造段轮换不得绕过, got %d", code)
+	}
+	// 其他真实 IP 不受牵连
+	if code := doLogin("7.7.7.7, 10.0.0.8", "testuser", "testpass"); code != http.StatusOK {
+		t.Fatalf("其他真实 IP 应可正常登录, got %d", code)
+	}
+}
+
+func TestLoginCookieSecure(t *testing.T) {
+	// 审查记录 P2 #29：TLS/反代 https 场景 cookie 带 Secure；纯 HTTP 不带（保持可用性）
+	srv, cleanup := buildServer(t)
+	defer cleanup()
+	srv.TrustProxy = true
+
+	_, setCookie := doJSON(t, srv, "POST", "/api/login", `{"username":"testuser","password":"testpass"}`, "")
+	if setCookie == "" {
+		t.Fatalf("登录应返回 set-cookie")
+	}
+	if strings.Contains(setCookie, "Secure") {
+		t.Fatalf("纯 HTTP 不应带 Secure: %q", setCookie)
+	}
+
+	req := httptest.NewRequest("POST", "/api/login", strings.NewReader(`{"username":"testuser","password":"testpass"}`))
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	srv.Routes(mux)
+	mux.ServeHTTP(rec, req)
+	if sc := rec.Header().Get("Set-Cookie"); !strings.Contains(sc, "Secure") {
+		t.Fatalf("反代 https 场景应带 Secure: %q", sc)
+	}
+}
+
 func TestLoginIPTrustProxy(t *testing.T) {
 	// 逻辑审查 P2：TrustProxy=true 时按 X-Forwarded-For 分桶（反代形态），
 	// 不同来源各自计数、互不牵连

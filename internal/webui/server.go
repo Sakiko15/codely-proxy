@@ -112,12 +112,14 @@ func readBody(rw http.ResponseWriter, req *http.Request, limit int64) ([]byte, b
 }
 
 // clientIP 提取登录限速的分桶 IP。默认用 RemoteAddr（不可伪造）；CODELY_TRUST_PROXY=1
-// 时取 X-Forwarded-For 首个地址——反代部署形态下攻击者与管理员不再共享全局桶（逻辑审查 P2）。
+// 时取 X-Forwarded-For **最右**地址——追加型反代把真实来源追加在末尾，最右段不可被
+// 客户端伪造（审查记录 P2 #28；此前取首段，攻击者可自带 XFF 头轮换绕过限速）。
+// 前提：TrustProxy=1 表示前面恰有一层可信反代。
 func (s *Server) clientIP(req *http.Request) string {
 	if s.TrustProxy {
 		if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
-			if i := strings.IndexByte(xff, ','); i >= 0 {
-				xff = xff[:i]
+			if i := strings.LastIndexByte(xff, ','); i >= 0 {
+				xff = xff[i+1:]
 			}
 			if ip := strings.TrimSpace(xff); ip != "" {
 				return ip
@@ -128,6 +130,13 @@ func (s *Server) clientIP(req *http.Request) string {
 		return host
 	}
 	return req.RemoteAddr
+}
+
+// isSecureRequest 判定本次会话 cookie 是否应带 Secure 属性（审查记录 P2 #29）：
+// TLS 直连，或反代声明 X-Forwarded-Proto=https。纯 HTTP 本地部署为 false（不影响可用性）。
+func (s *Server) isSecureRequest(req *http.Request) bool {
+	return req.TLS != nil ||
+		(s.TrustProxy && strings.EqualFold(req.Header.Get("X-Forwarded-Proto"), "https"))
 }
 
 // handleLogin POST /api/login：账密校验 → 发 HttpOnly cookie。
@@ -158,14 +167,14 @@ func (s *Server) handleLogin(rw http.ResponseWriter, req *http.Request) {
 	s.loginLimiter.OK(ip)
 	s.Auth.MarkLogin() // 首次成功登录后收回生成密码的匿名可读性（安全审计）
 	tok := s.Auth.CreateSession()
-	s.Auth.setSessionCookie(rw, tok)
+	s.Auth.setSessionCookie(rw, tok, s.isSecureRequest(req))
 	writeJSON(rw, http.StatusOK, map[string]any{"ok": true})
 }
 
 // handleLogout POST /api/logout：清会话。
 func (s *Server) handleLogout(rw http.ResponseWriter, req *http.Request) {
 	s.Auth.DestroySession(SessionTokenFromRequest(req))
-	clearSessionCookie(rw)
+	clearSessionCookie(rw, s.isSecureRequest(req))
 	writeJSON(rw, http.StatusOK, map[string]any{"ok": true})
 }
 

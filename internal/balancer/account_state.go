@@ -26,6 +26,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"codely-proxy/internal/account"
+	"codely-proxy/internal/atomicfile"
 	"codely-proxy/internal/oauth"
 )
 
@@ -97,7 +98,7 @@ func writeJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0o600)
+	return atomicfile.Write(path, append(data, '\n'), 0o600)
 }
 
 // QuotaSnapshot 是 usage/summary 的每日赠送/充值点数（AccountState 缓存用）。
@@ -181,7 +182,7 @@ func (s *AccountState) initSession() {
 	}
 	s.sessionID = newUUID()
 	_ = os.MkdirAll(account.AccountsDir, 0o755)
-	_ = os.WriteFile(sessionFile, []byte(s.sessionID), 0o600)
+	_ = atomicfile.Write(sessionFile, []byte(s.sessionID), 0o600)
 }
 
 // SessionID 返回该账号的会话 UUID（线程安全读）。
@@ -261,7 +262,7 @@ func (s *AccountState) RefreshAPIKey() (string, error) {
 		// 写回 accounts/<slug>.key
 		keyFile := filepath.Join(account.AccountsDir, s.Slug+".key")
 		_ = os.MkdirAll(account.AccountsDir, 0o755)
-		_ = os.WriteFile(keyFile, []byte(key), 0o600)
+		_ = atomicfile.Write(keyFile, []byte(key), 0o600)
 		return key, nil
 	})
 	if err != nil {

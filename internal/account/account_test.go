@@ -321,3 +321,19 @@ func TestPollNoLogin(t *testing.T) {
 
 // jsonDecode 辅助（编译用）
 var _ = json.Marshal
+
+// TestLoadIndexCorruptedFile（稳定性审计 E）：index.json 半写/损坏 → loadIndex
+// 返回空注册表且不 panic（损坏现在会记入日志；半写本身由 atomicfile 从根上杜绝）。
+func TestLoadIndexCorruptedFile(t *testing.T) {
+	r := setup(t)
+	if err := os.MkdirAll(AccountsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(IndexFile, []byte(`{"current":`), 0o600); err != nil { // 模拟半写
+		t.Fatalf("写损坏 index: %v", err)
+	}
+	idx := r.loadIndex()
+	if idx == nil || len(idx.Accounts) != 0 {
+		t.Fatalf("损坏 index 应返回空注册表, got %+v", idx)
+	}
+}

@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"codely-proxy/internal/atomicfile"
 )
 
 // DataDir 数据目录（由 cmd 层注入）。
@@ -111,7 +113,7 @@ func (s *Security) SetProxyKey(rawKeyString string) {
 		return
 	}
 	_ = os.MkdirAll(DataDir, 0o755)
-	_ = os.WriteFile(ProxyKeyFile, []byte(val+"\n"), 0o600)
+	_ = atomicfile.Write(ProxyKeyFile, []byte(val+"\n"), 0o600)
 	if st, err := os.Stat(ProxyKeyFile); err == nil {
 		s.mu.Lock()
 		s.lastMtime = st.ModTime().UnixMilli()

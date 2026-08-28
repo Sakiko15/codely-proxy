@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"golang.org/x/sync/singleflight"
+
+	"codely-proxy/internal/atomicfile"
 )
 
 // 上游常量（PROTOCOL.md §1 / GO_PORT.md §7）。
@@ -90,7 +92,8 @@ func (c *Creds) SaveCreds() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(CredsFile, data, 0o600)
+	// 原子写（稳定性审计：codely-creds.json 半写 → LoadCreds 返回 nil → 全部请求失败直到重新登录）
+	return atomicfile.Write(CredsFile, data, 0o600)
 }
 
 // IsExpiring 判断 access_token 是否过期边缘（过期前 60s 视为需要刷新）。

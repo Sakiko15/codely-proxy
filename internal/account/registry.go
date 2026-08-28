@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -29,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"codely-proxy/internal/atomicfile"
 	"codely-proxy/internal/oauth"
 )
 
@@ -105,9 +107,18 @@ func NewRegistry() *Registry {
 func readJSON(path string, v any) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			// 非"不存在"的读取失败（权限等）：此前静默吞掉，至少让它可见
+			log.Printf("[registry] 读取 %s 失败: %v", path, err)
+		}
 		return false
 	}
-	return json.Unmarshal(data, v) == nil
+	if err := json.Unmarshal(data, v); err != nil {
+		// 文件存在但损坏（半写/截断）：静默返回空会让注册表无声塌缩，显式记录
+		log.Printf("[registry] 解析 %s 失败（文件损坏？）: %v", path, err)
+		return false
+	}
+	return true
 }
 
 func writeJSON(path string, v any) error {
@@ -120,7 +131,8 @@ func writeJSON(path string, v any) error {
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o600)
+	// 原子写（稳定性审计：断电/OOM 半写产生截断文件 → 注册表静默塌缩）
+	return atomicfile.Write(path, data, 0o600)
 }
 
 // loadIndex 读注册表（不存在返回空）。

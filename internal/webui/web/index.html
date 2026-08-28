@@ -402,10 +402,10 @@ async function saveKeys() {
   catch (e) { showToast(e.message, true); }
 }
 function openDevLogin() { document.getElementById('dev-login-modal').style.display = 'flex'; document.getElementById('dev-step1').style.display = 'block'; document.getElementById('dev-step2').classList.add('hidden'); document.getElementById('dev-alias').value = ''; }
-function closeDevLogin() { if (pollTimer) clearInterval(pollTimer); document.getElementById('dev-login-modal').style.display = 'none'; }
+function closeDevLogin() { if (pollTimer) clearTimeout(pollTimer); document.getElementById('dev-login-modal').style.display = 'none'; }
 async function startDevLogin() {
-  // 逻辑审查 F3：双击"发起授权"会创建两个 interval，旧句柄被覆盖后永久泄漏（每 2.5s 打一次后端）
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  // 逻辑审查 F3：双击"发起授权"会创建两条轮询链，旧句柄被覆盖后永久泄漏（持续打后端）
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   const btn = document.getElementById('dev-start-btn');
   btn.disabled = true;
   // 逻辑审查 F7：备注名按后端 Slugify 同规则预规范化——非法字符此前会被服务端静默丢弃
@@ -425,39 +425,50 @@ async function startDevLogin() {
     // S2 加固：仅接受 http(s) 授权链接写入 href，防上游异常值注入 javascript: URI（展示区仍完整显示原值）
     document.getElementById('dev-url').href = /^https?:/i.test(r.login.verification_uri_complete) ? r.login.verification_uri_complete : '#';
     document.getElementById('dev-status').textContent = '等待授权中...';
-    pollTimer = setInterval(pollDevLogin, 2500);
+    pollTimer = setTimeout(pollDevLogin, 500);
   } catch (e) { showToast(e.message, true); }
   btn.disabled = false;
 }
 async function pollDevLogin() {
+  // 修复（授权后无限等待的两处前端帮凶）：
+  // 1. setInterval → setTimeout 链——上次请求返回后再排下一次，上游慢时不再叠加在途 poll
+  //   （浏览器同源 6 连接会被占满，拖垮整个 WebUI）。弹窗已关闭则不再续链。
+  // 2. else 分支显示后端透传的真实原因（slow_down / HTTP 429 等），此前一律死文案"等待授权中"。
+  const again = () => {
+    if (document.getElementById('dev-login-modal').style.display !== 'none') {
+      pollTimer = setTimeout(pollDevLogin, 2500);
+    }
+  };
   try {
     const r = await api('/api/account/login/status');
     if (r.status === 'authorized') {
-      clearInterval(pollTimer);
+      clearTimeout(pollTimer);
       showToast('🎉 授权成功：' + (r.account ? r.account.name : ''));
       closeDevLogin(); refreshAll();
     } else if (r.status === 'denied' || r.status === 'expired') {
-      clearInterval(pollTimer);
+      clearTimeout(pollTimer);
       document.getElementById('dev-status').textContent = '❌ ' + (r.message || r.status);
     } else if (r.status === 'error') {
       // 逻辑审查 P2：授权完成后 exchange 失败 → slot 已清，此前会无限显示"等待授权中"
-      clearInterval(pollTimer);
+      clearTimeout(pollTimer);
       document.getElementById('dev-status').textContent = '❌ 登录失败：' + (r.error || r.message || '未知错误');
     } else if (r.status === 'idle') {
       // slot 已清（授权后 exchange 失败/会话过期）——停止轮询
-      clearInterval(pollTimer);
+      clearTimeout(pollTimer);
       document.getElementById('dev-status').textContent = '❌ 登录会话已失效，请重新发起';
     } else {
-      document.getElementById('dev-status').textContent = '⏳ 等待授权中...';
+      document.getElementById('dev-status').textContent = '⏳ ' + (r.message || '等待授权中...');
+      again();
     }
   } catch (e) {
     // 逻辑审查 F4：会话过期时后端 401 → api() 抛"未登录"，此前每 2.5s 无限重试
     if (e && e.message === '未登录') { closeDevLogin(); return; }
     /* 其他轮询失败（网络抖动等）静默重试 */
+    again();
   }
 }
 async function cancelDevLogin() {
-  if (pollTimer) clearInterval(pollTimer);
+  if (pollTimer) clearTimeout(pollTimer);
   try { await api('/api/account/login/cancel', { method: 'POST' }); } catch (e) {}
   closeDevLogin();
 }

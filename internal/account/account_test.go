@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -317,6 +318,154 @@ func TestPollNoLogin(t *testing.T) {
 	flow := NewLoginFlow(r)
 	if st := flow.Poll(); st.Status != "idle" {
 		t.Fatalf("无登录时应 idle, got %+v", st)
+	}
+}
+
+// TestDeviceLoginPollThrottleAndMessage 验证（授权后无限等待修复）：
+// 1) 非 2xx 折叠为 pending 但携带状态码与上游错误体摘要；
+// 2) 上游 poll 按 initiate 的 interval 节流——前端高频询问不再每次都打上游；
+// 3) 节流窗口内回传最近一次异常说明（此前被前端死文案掩盖）。
+func TestDeviceLoginPollThrottleAndMessage(t *testing.T) {
+	var pollCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/auth/device/initiate":
+			_, _ = w.Write([]byte(`{"auth_request_token":"art","verification_uri_complete":"https://x/a","user_code":"CODE","interval":2,"expires_in":600}`))
+		case "/auth/device/poll":
+			pollCalls++
+			http.Error(w, `{"error":"rate limited"}`, http.StatusTooManyRequests)
+		default:
+			http.Error(w, "nf", 404)
+		}
+	}))
+	defer srv.Close()
+	oldBase := oauth.Base
+	oauth.Base = srv.URL
+	t.Cleanup(func() { oauth.Base = oldBase })
+
+	r := setup(t)
+	flow := NewLoginFlow(r)
+	if _, _, _, _, err := flow.Start(""); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	st := flow.Poll()
+	if st.Status != "pending" || !strings.Contains(st.Message, "429") {
+		t.Fatalf("非 2xx 应 pending 且带状态码, got %+v", st)
+	}
+	// 节流窗口内的第二次询问：不打上游、回传上次异常说明
+	st2 := flow.Poll()
+	if st2.Status != "pending" || !strings.Contains(st2.Message, "429") {
+		t.Fatalf("节流窗口内应 pending 并回传 message, got %+v", st2)
+	}
+	if pollCalls != 1 {
+		t.Fatalf("节流应挡住第二次上游 poll, pollCalls=%d", pollCalls)
+	}
+}
+
+// TestDeviceLoginSlowDownBackoff 验证 RFC 8628 退避：slow_down → interval +5（封顶 30）。
+// initiate interval=2 → 7；新节奏写进 message，节流窗口内不再打上游。
+func TestDeviceLoginSlowDownBackoff(t *testing.T) {
+	var pollCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/auth/device/initiate":
+			_, _ = w.Write([]byte(`{"auth_request_token":"art","verification_uri_complete":"https://x/a","user_code":"CODE","interval":2,"expires_in":600}`))
+		case "/auth/device/poll":
+			pollCalls++
+			if pollCalls == 1 {
+				_, _ = w.Write([]byte(`{"status":"slow_down"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"status":"pending"}`))
+		default:
+			http.Error(w, "nf", 404)
+		}
+	}))
+	defer srv.Close()
+	oldBase := oauth.Base
+	oauth.Base = srv.URL
+	t.Cleanup(func() { oauth.Base = oldBase })
+
+	r := setup(t)
+	flow := NewLoginFlow(r)
+	if _, _, _, _, err := flow.Start(""); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	st := flow.Poll()
+	if st.Status != "pending" || st.Progress != 2 || !strings.Contains(st.Message, "7s") {
+		t.Fatalf("slow_down 应 progress=2 且消息含新节奏 7s, got %+v", st)
+	}
+	st2 := flow.Poll()
+	if pollCalls != 1 || st2.Status != "pending" || !strings.Contains(st2.Message, "放慢") {
+		t.Fatalf("退避后节流应生效且回传原因, pollCalls=%d st2=%+v", pollCalls, st2)
+	}
+}
+
+// TestDeviceLoginStalePollNoComplete 验证 CAS：poll 在途时用户重新 Start，
+// 迟到的 authorized 不得触发 complete（授权码一次性，会登记用户已放弃的账号），
+// 且新登录 slot 不被迟到终态误杀。
+func TestDeviceLoginStalePollNoComplete(t *testing.T) {
+	pollEntered := make(chan struct{})
+	release := make(chan struct{})
+	var pollCalls, exchangeCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/auth/device/initiate":
+			_, _ = w.Write([]byte(`{"auth_request_token":"art","verification_uri_complete":"https://x/a","user_code":"CODE","interval":2,"expires_in":600}`))
+		case "/auth/device/poll":
+			pollCalls++
+			if pollCalls == 1 {
+				close(pollEntered)
+				<-release // 第一拍挂住，制造"poll 在途"
+			}
+			_, _ = w.Write([]byte(`{"status":"authorized","authorization_code":"authcode"}`))
+		case "/auth/device/exchange":
+			exchangeCalls++
+			_, _ = w.Write([]byte(`{"access_token":"at","refresh_token":"rt","expires_in":3600}`))
+		case "/auth/external/me":
+			_, _ = w.Write([]byte(`{"id":1}`))
+		case "/api/teams":
+			_, _ = w.Write([]byte(`{"current_team_id":"t","teams":[{"team_id":"t","team_name":"T","is_current":true}]}`))
+		default:
+			http.Error(w, "nf", 404)
+		}
+	}))
+	defer srv.Close()
+	oldBase := oauth.Base
+	oauth.Base = srv.URL
+	t.Cleanup(func() { oauth.Base = oldBase })
+
+	r := setup(t)
+	flow := NewLoginFlow(r)
+	if _, _, _, _, err := flow.Start(""); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	type pollResult struct{ st LoginStatus }
+	done := make(chan pollResult, 1)
+	go func() { done <- pollResult{flow.Poll()} }()
+
+	<-pollEntered // 第一拍已进入上游 poll（挂住中）
+	// 重新发起 → slot 被第二个登录覆盖
+	if _, _, _, _, err := flow.Start(""); err != nil {
+		t.Fatalf("Start2: %v", err)
+	}
+	close(release)
+
+	st := (<-done).st
+	if st.Status != "idle" {
+		t.Fatalf("迟到的 authorized 应 CAS 失败返回 idle, got %+v", st)
+	}
+	if exchangeCalls != 0 {
+		t.Fatalf("过期登录不得触发 exchange, got %d", exchangeCalls)
+	}
+	if flow.GetInfo() == nil {
+		t.Fatalf("新登录的 slot 应保留（不被迟到终态误杀）")
 	}
 }
 

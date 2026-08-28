@@ -289,6 +289,25 @@ func TestWebUIFrontendStateFixes(t *testing.T) {
 	}
 }
 
+func TestWebUILoginPollFeedback(t *testing.T) {
+	// 登录轮询修复（授权后无限等待）：pending 分支必须消费后端 message
+	//（此前死文案"等待授权中"掩盖 slow_down/429），轮询为 setTimeout 链防在途叠加
+	data, err := webFS.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatalf("读取 embed: %v", err)
+	}
+	s := string(data)
+	for _, c := range []struct{ needle, why string }{
+		{"r.message || '等待授权中...'", "轮询 pending 显示真实原因"},
+		{"setTimeout(pollDevLogin", "轮询改为 setTimeout 链"},
+		{"clearTimeout(pollTimer)", "定时器清理用 clearTimeout"},
+	} {
+		if !strings.Contains(s, c.needle) {
+			t.Fatalf("index.html 应包含 %q（%s 回归）", c.needle, c.why)
+		}
+	}
+}
+
 func TestAuthPartialEnv(t *testing.T) {
 	// 逻辑审查 P1：WEBUI_USER/WEBUI_PASS 只设其一不再整体回退随机
 	a := NewAuth("", "mypass")

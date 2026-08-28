@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -25,13 +26,30 @@ var HTTPClient = &http.Client{
 	Transport: upstreamTransport,
 }
 
-// PostJSON 发 POST JSON 请求并读取响应体。非 2xx 返回错误（含状态码）。
+// BodySnippet 返回响应体的诊断摘要（前 256 字节，去首尾空白）。
+// 非 2xx 时附进错误信息——此前只有 "HTTP 429" 这类无上下文报错，上游限速/参数错的
+// 真实原因（限流提示、400 欢迎页等）对排障完全不可见。
+func BodySnippet(data []byte) string {
+	const capBytes = 256
+	if len(data) > capBytes {
+		data = data[:capBytes]
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// PostJSON 发 POST JSON 请求并读取响应体。非 2xx 返回错误（含状态码与响应体摘要）。
 func PostJSON(url string, body any) ([]byte, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := HTTPClient.Post(url, "application/json", bytes.NewReader(payload))
+	req, err := http.NewRequest("POST", url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	applyCLIUA(req)
+	resp, err := HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -41,7 +59,7 @@ func PostJSON(url string, body any) ([]byte, error) {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, BodySnippet(data))
 	}
 	return data, nil
 }
@@ -56,6 +74,7 @@ func Get(url, bearer string) (int, []byte, error) {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
 	req.Header.Set("Accept", "application/json")
+	applyCLIUA(req)
 	resp, err := HTTPClient.Do(req)
 	if err != nil {
 		return 0, nil, err
@@ -66,4 +85,12 @@ func Get(url, bearer string) (int, []byte, error) {
 		return resp.StatusCode, nil, err
 	}
 	return resp.StatusCode, data, nil
+}
+
+// applyCLIUA 补 CLI 身份 UA（PROTOCOL.md §2.2：UA 是上游身份校验项；同域换 key 链路
+// 已注入 ClientHeaders，此处对齐——此前设备码登录链路裸发 Go 默认 UA）。
+func applyCLIUA(req *http.Request) {
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", ClientHeaders.Get("User-Agent"))
+	}
 }

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"sync"
 	"time"
@@ -26,6 +27,10 @@ type loginSlot struct {
 	startedAt        int64
 	expiresAt        int64
 	interval         int
+	// lastPoll 上次实际打上游 poll 的时刻（Poll 按上游 interval 节流用）
+	lastPoll time.Time
+	// lastMessage 最近一次真实上游交互的结果说明（节流窗口内回复给前端，保持原因可见）
+	lastMessage string
 	// verURIComplete 供展示
 	verURIComplete string
 	userCode       string
@@ -71,9 +76,6 @@ type teamsResponse struct {
 		TeamName  string `json:"team_name"`
 		IsCurrent bool   `json:"is_current"`
 	} `json:"teams"`
-}
-type meResponse struct {
-	ID string `json:"id"` // 可能 number → JSON 反序列化用 string 会失败，需 FlexString
 }
 
 // LoginStatus 是 pollLogin 的返回视图（供 WebUI /status 轮询）。
@@ -144,52 +146,117 @@ func (f *LoginFlow) Start(name string) (verURI, userCode string, expiresIn, inte
 func (f *LoginFlow) Poll() LoginStatus {
 	f.mu.Lock()
 	slot := f.slot
-	f.mu.Unlock()
 	if slot == nil {
+		f.mu.Unlock()
 		return LoginStatus{Status: "idle", Progress: 0}
 	}
 	if time.Now().UnixMilli() > slot.expiresAt {
-		f.Cancel()
+		f.slot = nil
+		f.mu.Unlock()
 		return LoginStatus{Status: "expired", Progress: 0, Message: "授权码已过期，请重试"}
 	}
+	// 修复（授权后无限等待）：按上游 interval 节流真实 poll。前端每 2.5s 询问一次，
+	// 此前每次询问都同步打一次上游——快于上游约定会持续触发 slow_down/429，而下方把
+	// 一切失败折叠成 pending → 用户视角「永远等待授权中」。节流后前端可保持高询问频率，
+	// 上游节奏由这里守住；真实状态最多晚一个 interval 发现。节流窗口内回传 lastMessage，
+	// 让限速/异常原因持续可见而非一闪而过。
+	if !slot.lastPoll.IsZero() && time.Since(slot.lastPoll) < time.Duration(slot.interval)*time.Second {
+		msg := slot.lastMessage
+		f.mu.Unlock()
+		return LoginStatus{Status: "pending", Progress: 1, Message: msg}
+	}
+	slot.lastPoll = time.Now()
+	token := slot.authRequestToken
+	f.mu.Unlock()
 
-	u := oauth.Base + "/auth/device/poll?auth_request_token=" + url.QueryEscape(slot.authRequestToken)
+	u := oauth.Base + "/auth/device/poll?auth_request_token=" + url.QueryEscape(token)
 	status, raw, err := oauth.Get(u, "")
 	if err != nil {
-		return LoginStatus{Status: "pending", Progress: 1, Message: "轮询异常（将自动重试）：" + err.Error()}
+		msg := "轮询异常（将自动重试）：" + err.Error()
+		f.setSlotMessage(slot, msg)
+		return LoginStatus{Status: "pending", Progress: 1, Message: msg}
 	}
 	if status < 200 || status >= 300 {
-		return LoginStatus{Status: "pending", Progress: 1, Message: fmt.Sprintf("轮询异常 HTTP %d（将自动重试）", status)}
+		msg := fmt.Sprintf("轮询异常 HTTP %d（将自动重试）：%s", status, oauth.BodySnippet(raw))
+		f.setSlotMessage(slot, msg)
+		return LoginStatus{Status: "pending", Progress: 1, Message: msg}
 	}
 	var st devicePollResponse
 	if err := json.Unmarshal(raw, &st); err != nil {
-		return LoginStatus{Status: "pending", Progress: 1, Message: "轮询响应解析失败（将自动重试）"}
+		msg := "轮询响应解析失败（将自动重试）"
+		f.setSlotMessage(slot, msg)
+		return LoginStatus{Status: "pending", Progress: 1, Message: msg}
 	}
+	f.setSlotMessage(slot, "") // 上游正常应答，清除残留的异常说明
 	switch st.Status {
 	case "pending":
 		return LoginStatus{Status: "pending", Progress: 1}
 	case "slow_down":
-		return LoginStatus{Status: "pending", Progress: 2}
+		// RFC 8628：上游明确要求放慢——interval +5s（封顶 30s），下一拍起由节流生效。
+		// 此前该信号被折叠成 pending 且从不退避，节奏永不纠正 → 持续限速 → 永远等待。
+		f.mu.Lock()
+		if f.slot == slot {
+			slot.interval += 5
+			if slot.interval > 30 {
+				slot.interval = 30
+			}
+			slot.lastMessage = fmt.Sprintf("上游要求放慢轮询，已自动调整为 %ds 一次", slot.interval)
+			msg := slot.lastMessage
+			f.mu.Unlock()
+			return LoginStatus{Status: "pending", Progress: 2, Message: msg}
+		}
+		f.mu.Unlock()
+		return LoginStatus{Status: "pending", Progress: 2, Message: "上游要求放慢轮询"}
 	case "denied":
-		f.Cancel()
+		f.clearSlotIfCurrent(slot)
 		return LoginStatus{Status: "denied", Message: "你在浏览器里拒绝了授权"}
 	case "expired":
-		f.Cancel()
+		f.clearSlotIfCurrent(slot)
 		return LoginStatus{Status: "expired", Message: "授权码已过期，请重试"}
 	case "completed":
-		f.Cancel()
+		f.clearSlotIfCurrent(slot)
 		return LoginStatus{Status: "expired", Message: "授权码已被使用（可能他处已完成登录），请重试"}
 	case "authorized":
-		f.Cancel() // 先清 slot
+		// CAS 取走 slot：仅当仍是本次登录才清空——授权码是一次性的，双 tab/重复轮询
+		// 双 complete 会让第二次 exchange 必败（error）或产生 -2 重复账号
+		f.mu.Lock()
+		taken := false
+		if f.slot == slot {
+			f.slot = nil
+			taken = true
+		}
+		f.mu.Unlock()
+		if !taken {
+			return LoginStatus{Status: "idle", Message: "本次登录已被新发起的登录接管"}
+		}
 		acct, err := f.complete(st.AuthorizationCode, slot.name)
 		if err != nil {
 			return LoginStatus{Status: "error", Error: err.Error()}
 		}
 		return LoginStatus{Status: "authorized", Account: acct}
 	default:
-		f.Cancel()
+		f.clearSlotIfCurrent(slot)
 		return LoginStatus{Status: "unknown", Message: "未知状态：" + st.Status}
 	}
+}
+
+// setSlotMessage 仅当 slot 仍是当前登录时更新 lastMessage（节流窗口内回传给前端）。
+func (f *LoginFlow) setSlotMessage(slot *loginSlot, msg string) {
+	f.mu.Lock()
+	if f.slot == slot {
+		slot.lastMessage = msg
+	}
+	f.mu.Unlock()
+}
+
+// clearSlotIfCurrent 仅当 slot 仍是当前登录时清空（CAS 语义）。
+// 此前的 Cancel() 无条件置 nil——迟到的旧 poll 终态会误杀新发起的登录。
+func (f *LoginFlow) clearSlotIfCurrent(slot *loginSlot) {
+	f.mu.Lock()
+	if f.slot == slot {
+		f.slot = nil
+	}
+	f.mu.Unlock()
 }
 
 // Cancel 取消/清理进行中的登录。对标 cancelLogin。
@@ -215,7 +282,8 @@ func (f *LoginFlow) complete(authorizationCode, suggestedName string) (*Account,
 	// 1. exchange 换 token
 	raw, err := oauth.PostJSON(oauth.Base+"/auth/device/exchange", deviceExchangeRequest{AuthorizationCode: authorizationCode})
 	if err != nil {
-		return nil, fmt.Errorf("换取 token 失败: %w", err)
+		// 授权码是一次性的：exchange 失败无法原地重试，必须重新走完整设备授权
+		return nil, fmt.Errorf("换取 token 失败（授权码已作废，请重新发起授权）: %w", err)
 	}
 	var tok deviceExchangeResponse
 	if err := json.Unmarshal(raw, &tok); err != nil {
@@ -228,8 +296,15 @@ func (f *LoginFlow) complete(authorizationCode, suggestedName string) (*Account,
 	// 2. 用户/组织信息
 	bearer := tok.AccessToken
 	userId := ""
-	status, rawMe, _ := oauth.Get(oauth.Base+"/auth/external/me", bearer)
-	if status >= 200 && status < 300 {
+	status, rawMe, err := oauth.Get(oauth.Base+"/auth/external/me", bearer)
+	switch {
+	case err != nil:
+		// me/teams 失败此前完全静默——userId 留空会让同账号识别失效、AutoName 缺组织名，
+		// 至少留一条诊断日志
+		log.Printf("[account] 获取用户信息失败（非致命，userId 留空）: %v", err)
+	case status < 200 || status >= 300:
+		log.Printf("[account] 获取用户信息 HTTP %d（非致命，userId 留空）: %s", status, oauth.BodySnippet(rawMe))
+	default:
 		// me.id 可能 number → 用 FlexString
 		var me struct {
 			ID oauth.FlexString `json:"id"`
@@ -237,11 +312,16 @@ func (f *LoginFlow) complete(authorizationCode, suggestedName string) (*Account,
 		if json.Unmarshal(rawMe, &me) == nil {
 			userId = me.ID.String()
 		}
-	} // 失败非致命（单组织可能没有 teams）
+	}
 
 	teamId, teamName := "", ""
-	status, rawTeams, _ := oauth.Get(oauth.Base+"/api/teams", bearer)
-	if status >= 200 && status < 300 {
+	status, rawTeams, err := oauth.Get(oauth.Base+"/api/teams", bearer)
+	switch {
+	case err != nil:
+		log.Printf("[account] 获取组织信息失败（非致命，teamId 留空）: %v", err)
+	case status < 200 || status >= 300:
+		log.Printf("[account] 获取组织信息 HTTP %d（非致命，teamId 留空）: %s", status, oauth.BodySnippet(rawTeams))
+	default:
 		var teams teamsResponse
 		if json.Unmarshal(rawTeams, &teams) == nil {
 			if teams.CurrentTeamID != "" {
@@ -317,7 +397,9 @@ func (f *LoginFlow) complete(authorizationCode, suggestedName string) (*Account,
 	}
 	acct, _, err := f.registry.ActivateAccount(slug, nil)
 	if err != nil {
-		return &Account{Name: slug, UserID: userId, TeamName: teamName}, nil
+		// 修复：激活失败此前谎报成功——账号已保存但未激活（未写 codely-creds.json），
+		// 前端却弹「授权成功」。如实报错（账号已保留，可在账号页手动「设为主」）。
+		return nil, fmt.Errorf("账号 %s 已保存但激活失败（可在账号列表手动设为主账号）: %w", slug, err)
 	}
 	_ = acct
 	return &Account{Name: slug, UserID: userId, TeamName: teamName}, nil

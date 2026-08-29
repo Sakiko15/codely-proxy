@@ -266,12 +266,14 @@ func (l *ipLimiter) Fail(ip string) {
 		}
 	}
 	if len(l.fails) > loginMaxEntries {
-		// 驱逐一条最早失败的条目，保持 map 有界（单次驱逐，均摊可接受）
+		// 驱逐一条最早失败的条目，保持 map 有界（单次驱逐，均摊可接受）。
+		// 复审 P2：锁定中条目（stamps 已清空）以 lockedUntil 参与比较——零值时间戳
+		// 会让其被优先驱逐、攻击者的锁被自己的洪泛提前解除
 		oldestK := ""
 		var oldest time.Time
 		first := true
 		for k, e := range l.fails {
-			var t time.Time
+			t := e.lockedUntil
 			if len(e.stamps) > 0 {
 				t = e.stamps[0]
 			}

@@ -376,7 +376,9 @@ func (s *AccountState) FetchQuota(force bool) *QuotaSnapshot {
 	}
 	// 2. 首次冷启动或强制 → 同步拉取。单飞去重（审查记录 P2 #20）：运行期新增账号的
 	// 首波并发请求此前会各自打一轮上游 usage/summary；与后台刷新共用 "quota" 键，
-	// 后台刷新在途时冷启动直接共享其结果
+	// 后台刷新在途时冷启动直接共享其结果。
+	// 已知取舍（复审 P2）：force 与在途后台刷新合并时共享其结果——后台失败则 force
+	// 拿旧缓存且不重试（force 新鲜度弱化，无数据损坏；独立键的收益不抵复杂度）
 	v, err, _ := s.quotaFlight.Do("quota", func() (any, error) {
 		return doFetch(), nil
 	})

@@ -32,7 +32,12 @@ func (b *Balancer) ReloadPool() { b.syncPool() }
 
 // OnAccountRemoved 账号删除后清理配置中的残留引用（逻辑审查 P2：
 // disabledSlugs 残留已删 slug，会让同名重建的新账号无声继承禁用态）。
+// 复审 P2：读改写整体纳入 saveMu（锁序 saveMu→b.mu，与 UpdateConfig 一致）——
+// 此前"内存提交→锁外落盘旧快照"两段式下，与 UpdateConfig 并发会丢失更新。
 func (b *Balancer) OnAccountRemoved(slug string) {
+	saveMu.Lock()
+	defer saveMu.Unlock()
+
 	b.mu.Lock()
 	if !containsStr(b.config.DisabledSlugs, slug) {
 		b.mu.Unlock()
@@ -43,9 +48,7 @@ func (b *Balancer) OnAccountRemoved(slug string) {
 	snap.DisabledSlugs = append([]string(nil), b.config.DisabledSlugs...)
 	b.mu.Unlock()
 
-	saveMu.Lock()
 	_ = saveConfig(snap)
-	saveMu.Unlock()
 }
 
 // Preheat 启动预热（性能审计 P3）：为池内未禁用账号预热 sk- 密钥（key 文件命中零网络；
@@ -303,6 +306,20 @@ func (b *Balancer) MarkFailure(slug string, statusCode int, errorMsg string) {
 	if isQuotaOrRateLimit {
 		s.SetCooldown(fmt.Sprintf("HTTP %d: %s", statusCode, snippet))
 	}
+}
+
+// MarkFailureMetricsOnly 记失败指标但不判冷却。用于密钥类 401/403 的末次失败
+//（proxy RetryKey 路径）——MarkFailure 的冷却关键词按 body 文本判定，401/403 体
+// 含 "insufficient"/"rate limit" 等词会误冷却 5 分钟（复审 P2）。
+func (b *Balancer) MarkFailureMetricsOnly(slug string, statusCode int, errorMsg string) {
+	s := b.state(slug)
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.metrics.Total++
+	s.metrics.Fail++
+	s.mu.Unlock()
 }
 
 // GetConfig 返回当前配置（读）。

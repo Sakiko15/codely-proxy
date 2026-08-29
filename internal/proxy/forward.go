@@ -169,7 +169,9 @@ func (p *Proxy) AttemptForward(ctx context.Context, method, upPath string, reqHe
 		// 排空剩余 body 以复用 keep-alive 连接（审查记录 P2 #11）；>64KB 错误体实践中
 		// 不存在（见本文件头注释），截断漏判 denied 的残余风险已记录接受（审查记录 #8）
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyCap))
-		_, _ = io.Copy(io.Discard, resp.Body)
+		// 排空封顶 256KB（复审 P2）：慢滴超大错误体不再挂住 handler；Go transport 对
+		// 残留超限的连接本就弃用，排空更多毫无收益
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 256<<10))
 		resp.Body.Close()
 		if teamModelDeniedRE.Match(errBody) {
 			// 模型被团队权限拒绝：透传（换 key 无济于事），带上游真实头
@@ -180,7 +182,7 @@ func (p *Proxy) AttemptForward(ctx context.Context, method, upPath string, reqHe
 	case http.StatusPaymentRequired, http.StatusTooManyRequests:
 		// 402/429：额度耗尽/限流（读 body 上限同 64KB，§19.2-5）
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyCap))
-		_, _ = io.Copy(io.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 256<<10))
 		resp.Body.Close()
 		return ForwardResult{Kind: KindQuotaRateLimit, Status: resp.StatusCode, Body: errBody, Header: resp.Header.Clone(), Model: model}
 	default:

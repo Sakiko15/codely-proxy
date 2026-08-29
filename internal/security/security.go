@@ -223,15 +223,22 @@ type Status struct {
 // GetStatus 返回鉴权状态（供 WebUI /security/status）。对标 getSecurityStatus。
 func (s *Security) GetStatus() Status {
 	keys, err := s.ValidKeys()
-	if err != nil {
-		keys = nil // 状态未知时不泄露任何 key 信息
-	}
+	authRequired := false
 	source := "none"
-	envKey := strings.TrimSpace(os.Getenv("CODELY_PROXY_API_KEY"))
-	if envKey != "" {
-		source = "env"
-	} else if len(keys) > 0 {
-		source = "file"
+	if err != nil {
+		// 复审 P2：状态未知 → 与 Validate 的 fail-closed 一致地展示，
+		// 不再矛盾显示为"免密模式"（实际全部 401）
+		authRequired = s.AuthRequired()
+		source = "unknown"
+		keys = nil // 状态未知时不泄露任何 key 信息
+	} else {
+		envKey := strings.TrimSpace(os.Getenv("CODELY_PROXY_API_KEY"))
+		if envKey != "" {
+			source = "env"
+		} else if len(keys) > 0 {
+			source = "file"
+		}
+		authRequired = len(keys) > 0
 	}
 	masked := make([]string, 0, len(keys))
 	for _, k := range keys {
@@ -248,7 +255,7 @@ func (s *Security) GetStatus() Status {
 	}
 	return Status{
 		OK:                  true,
-		AuthRequired:        len(keys) > 0,
+		AuthRequired:        authRequired,
 		Source:              source,
 		ConfiguredKeysCount: len(keys),
 		MaskedKeys:          masked,

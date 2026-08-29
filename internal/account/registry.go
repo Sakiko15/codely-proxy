@@ -642,19 +642,6 @@ func (r *Registry) RemoveAccount(name string, pool PoolReloader) (removed bool, 
 		}
 	}
 	wasCurrent := idx.Current == slug
-	// 审查记录 P2 #15：文件删除失败（Windows 文件被占用/权限）不得静默——index 条目
-	// 随后会被移除，残留文件成为"半删除态"，至少要随 warning 告知调用方
-	var removeWarn error
-	if err := os.Remove(accountFilePath(slug)); err != nil && !os.IsNotExist(err) {
-		removeWarn = fmt.Errorf("账号文件删除失败: %v", err)
-	}
-	// 逻辑审查 P2：伴生文件一并清理——残留的 sk- key 会被同名重建的新账号静默复用
-	for _, side := range []string{slug + ".key", slug + ".session"} {
-		if err := os.Remove(filepath.Join(AccountsDir, side)); err != nil && !os.IsNotExist(err) && removeWarn == nil {
-			removeWarn = fmt.Errorf("伴生文件 %s 删除失败: %v", side, err)
-		}
-	}
-	r.invalidateSlugsCache() // 文件集合变更（P2 缓存失效）
 	delete(idx.Accounts, slug)
 	rest := make([]string, 0, len(idx.Accounts))
 	for k := range idx.Accounts {
@@ -668,10 +655,24 @@ func (r *Registry) RemoveAccount(name string, pool PoolReloader) (removed bool, 
 			idx.Current = ""
 		}
 	}
+	// 复审 P2：先提交 index 再删文件——反序在 saveIndex 失败时留下"文件已删+index 残留"
+	// 的半删除态（removed=false 谎报且幽灵条目）；此序失败无任何副作用，重试即可
 	if err := r.saveIndex(idx); err != nil {
 		r.mu.Unlock()
 		return false, "", err
 	}
+	// 文件删除（index 已提交；失败不得静默——审查记录 P2 #15，并入 warning，removed 恒 true）
+	var removeWarn error
+	if err := os.Remove(accountFilePath(slug)); err != nil && !os.IsNotExist(err) {
+		removeWarn = fmt.Errorf("账号文件删除失败: %v", err)
+	}
+	// 逻辑审查 P2：伴生文件一并清理——残留的 sk- key 会被同名重建的新账号静默复用
+	for _, side := range []string{slug + ".key", slug + ".session"} {
+		if err := os.Remove(filepath.Join(AccountsDir, side)); err != nil && !os.IsNotExist(err) && removeWarn == nil {
+			removeWarn = fmt.Errorf("伴生文件 %s 删除失败: %v", side, err)
+		}
+	}
+	r.invalidateSlugsCache() // 文件集合变更（P2 缓存失效）
 	r.mu.Unlock()
 
 	// 级联激活（锁外）。逻辑审查 P1：删除已成立（文件与 index 均已改），任何收尾失败

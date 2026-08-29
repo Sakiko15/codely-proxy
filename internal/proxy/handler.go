@@ -209,9 +209,10 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 						apiKey = newKey
 					}
 				} else {
-					// 审查记录 P2 #18：末次仍密钥失效 → 计入失败指标，面板可见坏账号
-					//（此前该路径不计 metrics）；401/403 不在冷却触发集，不会误冷却
-					h.Balancer.MarkFailure(slug, r.Status, string(r.Body))
+					// 审查记录 P2 #18：末次仍密钥失效 → 计入失败指标，面板可见坏账号。
+					// 复审 P2：改走仅计指标路径——冷却关键词按 body 文本判定，403
+					// "insufficient permissions" 类文案会误冷却（与状态码无关）
+					h.Balancer.MarkFailureMetricsOnly(slug, r.Status, string(r.Body))
 				}
 				// ⚠️ code-review #5：二次 401 后该账号已不可用，加入 excluded 防外层再选它
 				excluded[slug] = true

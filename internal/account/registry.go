@@ -507,6 +507,13 @@ func (r *Registry) SyncCurrentFromActivation() {
 	if readJSON(accountFilePath(cur), &perSlug) && perSlug.RefreshToken == act.RefreshToken {
 		return // 已一致
 	}
+	// 复审 P1-1 第二道防线：激活库与现存 per-slug 凭据身份不一致（历史分歧残留）时
+	// 拒绝覆盖——否则会把 B 的凭据整份写进 A 的 per-slug 文件（跨账号凭据损毁）
+	if perSlug.UserID != "" && act.UserID != "" && string(perSlug.UserID) != string(act.UserID) {
+		log.Printf("[account] 激活库与 %s 的凭据身份不一致（userID %s vs %s），跳过同步并保留原文件",
+			cur, perSlug.UserID, act.UserID)
+		return
+	}
 	act.Source = "" // loadCreds 的归一化元信息不落 per-slug 文件
 	act.SavedAt = time.Now().UTC().Format(time.RFC3339)
 	if err := writeJSON(accountFilePath(cur), act); err != nil {
@@ -573,6 +580,7 @@ func (r *Registry) ActivateAccount(name string, pool PoolReloader) (Account, str
 		return Account{}, "", fmt.Errorf("账号不存在或凭据无效: %s（先在 WebUI 添加账号）", name)
 	}
 	idx := r.loadIndex()
+	prevCurrent := idx.Current
 	idx.Accounts[slug] = metaFromCreds(creds, now())
 	// 删敏感缓存 + 写激活凭据 + 更新 current
 	r.clearCaches()
@@ -583,6 +591,11 @@ func (r *Registry) ActivateAccount(name string, pool PoolReloader) (Account, str
 	}
 	idx.Current = slug
 	if err := r.saveIndex(idx); err != nil {
+		// 复审 P1-1：与 SaveAccount 对齐——saveIndex 失败必须回滚激活凭据。
+		// 不回滚会留下"激活文件=B 而 index=A"的分歧，且会被 SyncCurrentFromActivation
+		// 在下次全局刷新时放大成跨账号凭据覆盖（数据丢失）
+		log.Printf("[account] saveIndex 失败，回滚激活凭据到 %q: %v", prevCurrent, err)
+		r.restoreActivationLocked(prevCurrent)
 		r.mu.Unlock()
 		return Account{}, "", err
 	}

@@ -366,8 +366,9 @@ func (s *AccountState) FetchQuota(force bool) *QuotaSnapshot {
 			// single-flight 去重：TTL 过期瞬间的并发请求只起一个后台刷新（否则并发 refresh 轮换竞争）
 			go func() {
 				_, _, _ = s.quotaFlight.Do("quota", func() (any, error) {
-					doFetch()
-					return nil, nil
+					// 复审 P2：返回真实快照而非 (nil, nil)——合并进来的冷启动/force
+					// 调用方对 v.(*QuotaSnapshot) 断言，nil 接口会 panic
+					return doFetch(), nil
 				})
 			}()
 		}
@@ -382,7 +383,9 @@ func (s *AccountState) FetchQuota(force bool) *QuotaSnapshot {
 	if err != nil {
 		return nil
 	}
-	return v.(*QuotaSnapshot)
+	// ok 形式双保险（复审 P2-1）：断言失败（如历史形态的 nil 结果）返回 nil 而非 panic
+	snap, _ := v.(*QuotaSnapshot)
+	return snap
 }
 
 // MetricsSnapshot 返回账号调用统计（线程安全读）。

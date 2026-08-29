@@ -81,6 +81,9 @@ func main() {
 	// 审查记录 P1-4：全局刷新成功后把激活库同步回 per-slug 库
 	//（oauth 不能 import account，经 hook 倒置依赖；未注入时全局刷新行为不变）
 	oauth.OnGlobalRefreshed = reg.SyncCurrentFromActivation
+	// 复审 P1-2：全局轮换被守卫拒绝（激活已切换）时，把新 refresh_token 救援到
+	// 身份所属的 per-slug 文件，防该账号被刷废
+	oauth.OnRotationRejected = reg.SyncCredsByIdentity
 	b := balancer.NewBalancer(reg)
 	sec := security.New()
 	q := quota.New(reg)

@@ -250,6 +250,38 @@ func TestOnGlobalRefreshedHook(t *testing.T) {
 	}
 }
 
+func TestOnRotationRejected(t *testing.T) {
+	// 复审 P1-2：全局刷新轮换成功、激活回写被拒（窗口内已切换）时——
+	// 含新 refresh_token 的凭据必须交给救援 hook（否则账号被刷废）
+	oldHook := OnRotationRejected
+	t.Cleanup(func() { OnRotationRejected = oldHook })
+	var got *Creds
+	OnRotationRejected = func(c *Creds) error { got = c; return nil }
+
+	base, cleanup := setup(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 模拟"刷新在途窗口内激活切到 B"：请求处理期间覆盖激活库
+		writeCreds(t, "tok-b", "ref-b", now()+3600_000)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"tok-n","refresh_token":"ref-2","expires_in":3600}`))
+	}))
+	defer cleanup()
+	oldBase := Base
+	defer func() { Base = oldBase }()
+	Base = base
+
+	writeCreds(t, "tok-old", "ref-1", now()-1000)
+	if _, err := RefreshAccessToken(); err != nil {
+		t.Fatalf("刷新不应报错（守卫分支消化）: %v", err)
+	}
+	if got == nil || got.RefreshToken != "ref-2" {
+		t.Fatalf("救援 hook 应收到新轮换凭据: %+v", got)
+	}
+	// B 的激活凭据不得被覆盖（防串号语义保持）
+	if c := LoadCreds(); c == nil || c.RefreshToken != "ref-b" {
+		t.Fatalf("新账号激活凭据不得被覆盖: %+v", c)
+	}
+}
+
 func TestRefreshAccessToken(t *testing.T) {
 	base, cleanup := setup(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/auth/refresh" {

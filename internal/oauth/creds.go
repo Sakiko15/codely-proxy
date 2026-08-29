@@ -190,6 +190,12 @@ func SaveCredsIfUnchanged(c *Creds, prevRefreshToken string) error {
 // oauth 不能 import account（会成环），故用 hook 倒置依赖；未注入（如单测）时无操作。
 var OnGlobalRefreshed func()
 
+// OnRotationRejected 全局刷新轮换成功、但激活回写被守卫拒绝（窗口内激活已切换）时触发，
+// 参数为含**新 refresh_token** 的完整凭据。main 装配注入 reg.SyncCredsByIdentity——
+// 把轮换结果落到其身份所属的 per-slug 文件，否则新 RT 随栈变量丢弃、旧 RT 已被上游作废，
+// 该账号将被刷废（复审 P1-2）。未注入时无操作（与 OnGlobalRefreshed 同样的倒置模式）。
+var OnRotationRejected func(*Creds) error
+
 // doRefresh 共享的单飞（审查记录 P2 #25）：以 refresh_token 为键——同一 token 的全局/
 // 按账号刷新去重合并（跨组件同账号并发轮换不再互踩、last-writer-wins 把败者 RT 落盘），
 // 不同 token 并行。结果统一 *Creds，避免共享时类型断言错位。
@@ -254,6 +260,13 @@ func refreshCredsFile(prevRT string) (*Creds, error) {
 	if err := SaveCredsIfUnchanged(c, prevRT); err != nil {
 		if errors.Is(err, ErrActivationChanged) {
 			log.Printf("[oauth] 激活账号已切换，跳过轮换凭据回写（防串号）")
+			// 复审 P1-2：被拒不等于可丢弃——新 refresh_token 必须落到身份所属账号，
+			// 否则旧 RT 已被上游作废，该账号下次刷新必败（刷废）
+			if OnRotationRejected != nil {
+				if rerr := OnRotationRejected(c); rerr != nil {
+					log.Printf("[oauth] 轮换凭据救援落盘失败: %v", rerr)
+				}
+			}
 			return c, nil
 		}
 		return nil, fmt.Errorf("保存刷新后凭据失败: %w", err)

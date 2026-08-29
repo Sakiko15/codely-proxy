@@ -736,6 +736,80 @@ func TestSyncCredsByIdentity(t *testing.T) {
 	}
 }
 
+func TestRestoreActivationLocked(t *testing.T) {
+	// 复审 P1-1 回滚本体：prevCurrent 非空 → 恢复其凭据；空 → 删除激活文件
+	r := setup(t)
+	if _, _, err := r.SaveAccount("a", fakeCreds("1", "A"), true, nil); err != nil {
+		t.Fatalf("SaveAccount a: %v", err)
+	}
+	// 模拟分歧态：激活文件已被写成 b 的凭据（a.json 仍是 A）
+	if err := fakeCreds("2", "B").SaveCreds(); err != nil {
+		t.Fatalf("写激活库: %v", err)
+	}
+	r.mu.Lock()
+	r.restoreActivationLocked("a")
+	r.mu.Unlock()
+	cur := oauth.LoadCreds()
+	if cur == nil || cur.UserID != "1" {
+		t.Fatalf("应回滚为 a: %+v", cur)
+	}
+
+	// prevCurrent 为空（此前无激活账号）→ 删除激活文件回到"未激活"一致态
+	r.mu.Lock()
+	r.restoreActivationLocked("")
+	r.mu.Unlock()
+	if _, err := os.Stat(oauth.CredsFile); !os.IsNotExist(err) {
+		t.Fatalf("空 prevCurrent 应删除激活文件")
+	}
+}
+
+func TestActivateAccountRollbackOnIndexFailure(t *testing.T) {
+	// 复审 P1-1：ActivateAccount 的 saveIndex 失败分支必须走到回滚
+	//（prevCurrent="" 场景 → 删除激活文件；否则留下"激活文件=B、index=A"分歧）
+	r := setup(t)
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatalf("blocker: %v", err)
+	}
+	oldIndex := IndexFile
+	IndexFile = filepath.Join(blocker, "sub", "index.json") // MkdirAll 撞文件 → saveIndex 必败
+	t.Cleanup(func() { IndexFile = oldIndex })
+
+	// 预置 b 凭据文件（直落磁盘，不经 index——绕过 loadIndex 的空 idx 判定）
+	if err := os.MkdirAll(AccountsDir, 0o755); err != nil {
+		t.Fatalf("mkdir accounts: %v", err)
+	}
+	if err := writeJSON(AccountsDir+"/b.json", fakeCreds("2", "B")); err != nil {
+		t.Fatalf("预置 b.json: %v", err)
+	}
+
+	if _, _, err := r.ActivateAccount("b", nil); err == nil {
+		t.Fatalf("saveIndex 失败应上报错误")
+	}
+	if _, err := os.Stat(oauth.CredsFile); !os.IsNotExist(err) {
+		t.Fatalf("回滚应删除激活文件（prevCurrent 为空）")
+	}
+}
+
+func TestSyncCurrentFromActivationIdentityGuard(t *testing.T) {
+	// 复审 P1-1 第二道防线：激活库与 per-slug 凭据身份不一致时拒绝覆盖
+	//（防历史分歧残留被放大成跨账号凭据损毁）
+	r := setup(t)
+	if _, _, err := r.SaveAccount("a", fakeCreds("1", "A"), true, nil); err != nil {
+		t.Fatalf("SaveAccount a: %v", err)
+	}
+	// 激活库被写成 B（模拟分歧残留），a.json 仍是 A
+	if err := fakeCreds("2", "B").SaveCreds(); err != nil {
+		t.Fatalf("写激活库: %v", err)
+	}
+
+	r.SyncCurrentFromActivation()
+	got := r.LoadAccountCreds("a")
+	if got == nil || got.UserID != "1" {
+		t.Fatalf("身份不一致时不得覆盖 per-slug 凭据: %+v", got)
+	}
+}
+
 func TestSlugifyReserveIndex(t *testing.T) {
 	// 稳定性审计 F5：slug "index" 会与注册表文件 accounts/index.json 同名互覆 → 预留拒绝
 	if got := Slugify("index"); got != "" {

@@ -1,0 +1,2 @@
+# shell 脚本必须 LF：CRLF 会让容器内 sh 报 "\r: not found"（entrypoint 卷权限自修复依赖）
+*.sh text eol=lf

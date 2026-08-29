@@ -21,7 +21,7 @@ go test -run TestHandlerRetryKeyTripwireSingleAccount ./internal/proxy/   # 跑�
 
 测试与源码同目录（12 个 `*_test.go`，约 85 个测试），纯 `testing` + `httptest` mock 上游，表驱动风格；测试内用 `SetDataDir(t.TempDir())` 并在 cleanup 中恢复包级 `DataDir`。
 
-Docker：多阶段 `Dockerfile`（golang:1.26-alpine → alpine:3.20 非 root，healthcheck `/healthz`）；`docker-compose.yml` 面向 1Panel 编排，拉取 `ghcr.io/sakiko15/codely-proxy:latest`，默认绑 `127.0.0.1:8790`（公网 HTTPS 交给反向代理，应用不做 TLS）。注意 `WEBUI_PASS` 不要给非空默认值——那会静默关闭随机密码保护。
+Docker：多阶段 `Dockerfile`（golang:1.26-alpine → alpine:3.20，healthcheck `/healthz`）；`entrypoint.sh` 以 root 起、`chown /app/data` 后经 `su-exec` 降权 codely 运行（bind mount 宿主目录属主不可预知的自修复，审查部署修复；运行时仍非 root）；`docker-compose.yml` 面向 1Panel 编排，拉取 `ghcr.io/sakiko15/codely-proxy:latest`，默认绑 `127.0.0.1:8790`（公网 HTTPS 交给反向代理，应用不做 TLS）。注意 `WEBUI_PASS` 不要给非空默认值——那会静默关闭随机密码保护。
 
 ## 架构
 

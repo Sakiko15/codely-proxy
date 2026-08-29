@@ -12,6 +12,10 @@ services:
       # 默认仅本机可达，公网由 1Panel 反向代理承担（WebUI 登录 + HTTPS）
       - "127.0.0.1:8790:8790"
     volumes:
+      # bind mount 的宿主目录属主不可预知（root/1Panel uid）——镜像内 chown 会被挂载覆盖。
+      # entrypoint 以 root 起动后自动 chown /app/data 再降权 codely 运行，无需手工 chown。
+      # 备选：加 user: "1000:1000" 以指定 uid 直跑（跳过自修复，需宿主目录属主匹配）；
+      #       或改 named volume（codely-data:/app/data，首用继承镜像属主）。
       - ./data:/app/data
     environment:
       - TZ=Asia/Shanghai

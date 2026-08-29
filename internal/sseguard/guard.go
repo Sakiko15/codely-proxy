@@ -109,7 +109,10 @@ func parseBlockIndexOK(data []byte) (int, bool) {
 
 // lineBufferCap 行缓冲上限（审查记录 P2 #4）：畸形上游持续输出无换行数据时防内存无界
 // 增长。超限视为流异常：清空缓冲；Anthropic 侧置 sawError（Finish 走 messageStopOnly
-// 安全收尾，不挂死），OpenAI 侧放弃 [DONE] 跟踪（Finish 补发，幂等）。
+// 安全收尾，不挂死），OpenAI 侧放弃 [DONE] 跟踪（Finish 仍补发，幂等）。复审 P2-9 曾议
+// 置 sawDone 与 sawError"对称"，已否决：补发是本包对 OpenAI 流的防挂死承诺，且 Anthropic
+// 侧对称物 messageStopOnly 仍是收尾事件而 sawDone 会一个事件都不发；重复 [DONE] 对 SDK
+// 无害（迭代器停在首个），缺失才会挂死。
 const lineBufferCap = 1 << 20
 
 // utf8BOM 首块剥离（审查记录 P2 #5）：仅跟踪侧剥离，透传字节不变——BOM 粘在首个
@@ -160,11 +163,17 @@ func (g *AnthropicGuard) Write(p []byte, w io.Writer) error {
 	if _, err := w.Write(p); err != nil {
 		return err
 	}
-	if !g.bomChecked {
-		g.bomChecked = true
-		p = bytes.TrimPrefix(p, utf8BOM)
-	}
+	// 复审 P2：BOM 可能被上游切在两个 chunk 之间（首 Read 恰 1-2 字节）——首块立即
+	// 判定会漏剥。先并入 lineBuffer，累计 ≥3 字节再一次性剥离（<3 字节时尚无完整事件
+	// 可判，推迟扫描无副作用）
 	g.lineBuffer = append(g.lineBuffer, p...)
+	if !g.bomChecked {
+		if len(g.lineBuffer) < len(utf8BOM) {
+			return nil
+		}
+		g.bomChecked = true
+		g.lineBuffer = bytes.TrimPrefix(g.lineBuffer, utf8BOM)
+	}
 	for {
 		idx := bytes.IndexByte(g.lineBuffer, '\n')
 		if idx < 0 {
@@ -227,11 +236,15 @@ func (g *OpenAIGuard) Write(p []byte, w io.Writer) error {
 	if _, err := w.Write(p); err != nil {
 		return err
 	}
-	if !g.bomChecked {
-		g.bomChecked = true
-		p = bytes.TrimPrefix(p, utf8BOM)
-	}
+	// 复审 P2：同 AnthropicGuard——BOM 跨 chunk 时先累计再一次性剥离
 	g.buf = append(g.buf, p...)
+	if !g.bomChecked {
+		if len(g.buf) < len(utf8BOM) {
+			return nil
+		}
+		g.bomChecked = true
+		g.buf = bytes.TrimPrefix(g.buf, utf8BOM)
+	}
 	for {
 		idx := bytes.IndexByte(g.buf, '\n')
 		if idx < 0 {

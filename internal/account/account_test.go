@@ -61,7 +61,12 @@ func TestSlugify(t *testing.T) {
 		{"COM1", ""}, // 大小写不敏感（Slugify 已 lowercase）
 		{"lpt9", ""},
 		{"nul", ""},
-		{"con-x", "con-x"}, // 非保留名不受影响
+		{"con.json", ""},   // 复审 P2：带点形态同样被 Win32 解析为设备
+		{"con.", ""},       // 复审 P2：尾点形态
+		{"con.work", ""},   // 复审 P2：任意扩展名
+		{"aux.tar.gz", ""}, // 复审 P2：首个点前 base 命中即可
+		{"my.con", "my.con"}, // 点前 base 非保留名，不受影响
+		{"con-x", "con-x"},   // 非保留名不受影响
 	}
 	for _, c := range cases {
 		if got := Slugify(c.in); got != c.want {

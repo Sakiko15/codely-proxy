@@ -186,8 +186,11 @@ func Slugify(name string) string {
 		return ""
 	}
 	// 审查记录 P2 #13：Windows 保留设备名（con.json 等在 Win32 解析为设备，OpenFile 必败
-	// 且报错晦涩）→ 返回空走 AutoName 兜底；Slugify 已 lowercase，比较天然大小写不敏感
-	switch s {
+	// 且报错晦涩）→ 返回空走 AutoName 兜底；Slugify 已 lowercase，比较天然大小写不敏感。
+	// 复审 P2：取首个 '.' 前的 base 比对——带点/尾点形态（con.x、con.）同样被 Win32
+	// 解析为设备；整串无点时 base 即 s，与旧整串比对语义一致
+	base, _, _ := strings.Cut(s, ".")
+	switch base {
 	case "con", "prn", "aux", "nul",
 		"com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
 		"lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9":

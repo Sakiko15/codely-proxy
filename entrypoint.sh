@@ -9,7 +9,15 @@
 set -e
 
 if [ "$(id -u)" = "0" ]; then
-    chown -R codely:codely /app/data
+    # 复审 P2：数据目录可被 CODELY_DATA_DIR 重定位（Dockerfile 默认 /app/data），
+    # chown 必须跟随而非硬编码；先 mkdir 保证自定义路径存在。
+    # chown 失败（只读卷等）仅告警后继续降权（B-P2-3：ro 卷无回退）——应用首写失败的
+    # 完整报错仍会进容器日志，比容器静默退出更可诊断
+    data_dir="${CODELY_DATA_DIR:-/app/data}"
+    mkdir -p "$data_dir" 2>/dev/null || true
+    if ! chown -R codely:codely "$data_dir" 2>/dev/null; then
+        echo "entrypoint: chown $data_dir 失败（只读卷？），继续降权运行" >&2
+    fi
     exec su-exec codely:codely /usr/local/bin/codely-proxy "$@"
 fi
 

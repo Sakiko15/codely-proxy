@@ -167,6 +167,23 @@ func TestAnthropicBOMStrippedForTracking(t *testing.T) {
 	}
 }
 
+func TestAnthropicBOMSplitAcrossChunks(t *testing.T) {
+	// 复审 P2：BOM 被切在两个 chunk 之间（首 Read 恰 1-2 字节）且紧贴首个 data: 行——
+	// 首块立即判定会漏剥，首个事件漏判 → 开放块失联、Finish 漏合成 stop
+	bom := "\xef\xbb\xbf"
+	out := runAnthropic(t,
+		bom[:1],
+		bom[1:]+`data: {"type":"content_block_start","index":2}`+"\n\n",
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	)
+	if !strings.HasPrefix(out, bom) {
+		t.Fatalf("透传应保留原始 BOM 字节")
+	}
+	if n := strings.Count(out, `"type":"content_block_stop"`); n != 1 {
+		t.Fatalf("跨 chunk BOM 应被剥离、start 应被识别（恰合成 1 个 stop）: %d", n)
+	}
+}
+
 func TestOpenAIOversizedLineBounded(t *testing.T) {
 	// 审查记录 P2 #4：OpenAI 侧行缓冲同样有界；Finish 幂等补发 [DONE]
 	var out bytes.Buffer
@@ -180,6 +197,25 @@ func TestOpenAIOversizedLineBounded(t *testing.T) {
 	}
 	if !strings.HasSuffix(out.String(), "data: [DONE]\n\n") {
 		t.Fatalf("超限流 Finish 应补发 [DONE]")
+	}
+}
+
+func TestOpenAIBOMSplitAcrossChunks(t *testing.T) {
+	// 复审 P2：OpenAI 侧同样累计剥离——BOM 跨 chunk 不漏判首个 [DONE]（不重发）
+	bom := "\xef\xbb\xbf"
+	var out bytes.Buffer
+	g := &OpenAIGuard{}
+	if err := g.Write([]byte(bom[:2]), &out); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := g.Write([]byte(bom[2:]+"data: [DONE]\n\n"), &out); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := g.Finish(&out); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if n := strings.Count(out.String(), "[DONE]"); n != 1 {
+		t.Fatalf("跨 chunk BOM 剥离后应识别首个 [DONE]（不重发）: %d", n)
 	}
 }
 

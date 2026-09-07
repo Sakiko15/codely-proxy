@@ -79,6 +79,12 @@ func (s *Server) serveAsset(rw http.ResponseWriter, req *http.Request, name stri
 	rw.Header().Set("ETag", f.etag)
 	rw.Header().Set("Cache-Control", "no-cache")
 	rw.Header().Set("X-Content-Type-Options", "nosniff")
+	// WebUI 重构 C6：前端已无内联事件/内联样式（脚本样式全部走 /web/assets/*），
+	// 可整体收紧为 self-only；外开授权链接是用户触发的顶层导航，不受 CSP 限制
+	rw.Header().Set("Content-Security-Policy",
+		"default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; "+
+			"img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+	rw.Header().Set("Referrer-Policy", "no-referrer")
 	if req.Header.Get("If-None-Match") == f.etag {
 		rw.WriteHeader(http.StatusNotModified)
 		return

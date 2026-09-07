@@ -26,6 +26,11 @@ func TestStaticIndexServed(t *testing.T) {
 		t.Fatalf("应 nosniff")
 	}
 
+	// C6 安全响应头：CSP self-only + Referrer-Policy（index 与静态资源同路径输出）
+	if rw.Header().Get("Content-Security-Policy") == "" || rw.Header().Get("Referrer-Policy") != "no-referrer" {
+		t.Fatalf("应带 CSP 与 Referrer-Policy: %v", rw.Header())
+	}
+
 	// 命中 ETag → 304 且无 body
 	rw2 := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/", nil)

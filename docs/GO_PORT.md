@@ -528,6 +528,8 @@ exchange → POST /auth/device/exchange {authorization_code} → {access_token, 
 
 > **关键**：`codely-core` 真实后端是 GLM-5 系 128K（`/v1/models` 声明 1M 不可信），窗口必须按探测实测为准
 > （供 `codely-proxy models` / WebUI 模型列表展示，不再写客户端 dsh 配置）。
+> 代理转发侧已对 `GET /v1/models` 200 响应覆写虚标 `max_model_len`（`proxy.OverrideModelsMeta`，
+> 2026-09-07 实测新增，见 §19.3）。
 
 ---
 
@@ -897,6 +899,8 @@ dsh 场景下它写 `~/.dsh/settings.yaml` + 插件装配——**VPS 网关不�
   - **非流式**（`internal/proxy/stoptrim.go`，仅 200+JSON，缓冲上限 16MB 超限回退透传）：Anthropic 按全部 text 块拼接全文找最早命中（同位置按请求序），命中块截断、其后块丢弃，覆写 `stop_reason:"stop_sequence"`+`stop_sequence:<命中词>`；OpenAI 截断各 `choices[].message.content` 并置 `finish_reason:"stop"`。RawMessage 手术保留未触字段值字节（usage 不失真）。
   - **流式**（`internal/sseguard` trim 模式，`PipeAnthropicStop`/`PipeOpenAIStop`，仅 stops 非空启用——空则与原 `PipeAnthropic`/`PipeOpenAI` 字节级等价，golden 契约零风险）：text_delta/content 增量进 rune holdback（保留尾部 `maxStopRunes-1` 个 rune 防停词跨事件/跨 chunk 漏检），命中→发出净前缀 + Anthropic 合成 `content_block_stop`/`message_delta(stop_reason:"stop_sequence")`/`message_stop` 三件套、OpenAI 改写当前 chunk `finish_reason:"stop"`+合成 `[DONE]`，其后上游输出排空；上游自然结束/EOF 则冲出待定残文再走既有收尾。
   - **已知边界**：仅截 text 输出，不对 `tool_use` 的 input JSON 内文本截断；流式按各 text 块内文本匹配（跨块命中仅在"前块末尾+后块开头"拼接意义上成立，逐事件 holdback 已覆盖）；holdback 会把连续文本切分到多个事件送达（客户端按拼接语义无感）；截断后的 usage `output_tokens` 不实（沿用合成路径 output_tokens:0 约定）。
+- **`/v1/models` 虚标 `max_model_len` 覆写** `[增强·2026-09-07 实测新增]`：上游对 `codely-core` 声明 `max_model_len:1048576`（1M），真实后端是 128K 窗口的 `glm-5-fp8-128k`（PROTOCOL.md §4.0：窗口以 backend-probe 实测为准，上游声明不可信）。代理对 `GET /v1/models` 200 响应按 alias→真实窗口静态表覆写该字段（`proxy.OverrideModelsMeta`：core/vl=131072，flash/air/basic=1048576，值取自 `oauth.BackendMeta`）；仅覆写表中 alias 已携带该字段的条目（修虚标不新增字段），解析失败/无命中原样透传。上游若改 alias→后端映射需同步静态表。
+- **思考等级参数不生效与隐藏思考计费** `[已知限制·2026-09-07 实测，代理无法修复]`：全部思考控制参数被上游接受（不报 400）但对后端思考量**零调制**——OpenAI 侧 `reasoning_effort` minimal/low/medium/high 同题对比（minimal 三次复测 403/262/403 思考 token 反而最重度；codely-flash 上 minimal 148 vs high 139 同样无差异），GLM/Qwen 系 `enable_thinking:false` 也被忽略（仍输出 200 思考 token）；Anthropic 侧 `thinking:{enabled,budget_tokens}`/`{adaptive}`/`output_config.effort` 全形态同理，且思考**从不呈现**（无 `thinking_delta` 块）却**照常计费**（10 字回答 341 output_tokens）。客户端须自适应：① 不要依赖思考参数控制成本/时延；② GLM-5 系默认即混合推理，`max_tokens` 需留 ≥1.5k 余量给隐形思考，否则拿到空文本 + `stop_reason:max_tokens`；③ OpenAI 侧思考经 `reasoning_content` 可见（`completion_tokens_details.reasoning_tokens` 计数），Anthropic 侧完全不可见。
 
 ### 19.4 WebUI（美观 + 实用）
 

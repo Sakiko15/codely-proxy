@@ -13,8 +13,6 @@ package proxy
 
 import (
 	"encoding/json"
-	"io"
-	"net/http"
 	"strings"
 )
 
@@ -202,21 +200,5 @@ func trimOpenAIStops(body []byte, stops []string) []byte {
 	return res
 }
 
-// pipeTrimmed 非流式 200 JSON 响应的停词截断写出（handler.pipeResponse 非 SSE 分支调用）：
-// 缓冲（maxTrimBody 上限）→ TrimStopBody → 写出。读取失败/超限时回退原样透传——
-// 已读到的部分不丢，超限时剩余 body 顺序续写（copyHeaders 已恒删 Content-Length，长度自洽）。
-func pipeTrimmed(rw http.ResponseWriter, urlPath string, resp *http.Response, stops []string) {
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTrimBody+1))
-	over := len(body) > maxTrimBody
-	if err == nil && !over {
-		if trimmed := TrimStopBody(urlPath, body, stops); len(trimmed) > 0 {
-			body = trimmed
-		}
-	}
-	rw.WriteHeader(resp.StatusCode)
-	_, _ = rw.Write(body)
-	if over {
-		_, _ = io.Copy(rw, resp.Body)
-	}
-	resp.Body.Close()
-}
+// pipeTrimmed 的缓冲改写逻辑已泛化为 handler.bufferRewrite（stop 截断与 models 元数据
+// 覆写共用）；本文件保留纯函数 TrimStopBody，由 handler 接线调用。

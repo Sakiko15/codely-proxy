@@ -352,11 +352,37 @@ func (h *Handler) pipeResponse(rw http.ResponseWriter, req *http.Request, r Forw
 
 	// 非 SSE：带停词的 200 JSON 先缓冲截断（P2），否则完整透传
 	if len(stops) > 0 && resp.StatusCode == http.StatusOK && strings.Contains(contentType, "json") {
-		pipeTrimmed(rw, req.URL.Path, resp, stops)
+		bufferRewrite(rw, resp, func(b []byte) []byte { return TrimStopBody(req.URL.Path, b, stops) })
+		return
+	}
+	// P4：GET /v1/models 200 响应覆写虚标 max_model_len（见 modelsmeta.go）
+	if req.Method == http.MethodGet && req.URL.Path == "/v1/models" &&
+		resp.StatusCode == http.StatusOK && strings.Contains(contentType, "json") {
+		bufferRewrite(rw, resp, OverrideModelsMeta)
 		return
 	}
 	rw.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(rw, resp.Body)
+	resp.Body.Close()
+}
+
+// bufferRewrite 缓冲读取非流式 200 响应体（maxTrimBody 上限），经 rewriter 改写后写出
+// （stop 截断 / models 元数据覆写共用）。读取失败/超限时已读部分原样写出、超限剩余
+// 顺序续写（copyHeaders 已恒删 Content-Length，长度自洽）——缓冲改写是增强，不得引入
+// 新失败模式。
+func bufferRewrite(rw http.ResponseWriter, resp *http.Response, rewriter func([]byte) []byte) {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTrimBody+1))
+	over := len(body) > maxTrimBody
+	if err == nil && !over {
+		if nb := rewriter(body); len(nb) > 0 {
+			body = nb
+		}
+	}
+	rw.WriteHeader(resp.StatusCode)
+	_, _ = rw.Write(body)
+	if over {
+		_, _ = io.Copy(rw, resp.Body)
+	}
 	resp.Body.Close()
 }
 

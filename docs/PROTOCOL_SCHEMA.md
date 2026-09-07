@@ -356,12 +356,16 @@ type ModelsResponse struct {
         Created     int64  `json:"created,omitempty"`
         OwnedBy     string `json:"owned_by,omitempty"`
         IsAlias     bool   `json:"is_alias,omitempty"`
-        MaxModelLen *int   `json:"max_model_len,omitempty"` // ⚠️ 不可信：core 声明 1M，实测 GLM-5 系 128K
+        MaxModelLen *int   `json:"max_model_len,omitempty"` // 上游声明不可信（core 虚标 1M）；代理转发侧已覆写为真实窗口（见下）
     } `json:"data"`
 }
 ```
 
 > ⚠️ 窗口信息以 `backend-probe` 实测为准（§12），不以上游 `max_model_len` 声明为准（PROTOCOL.md §4.0）。
+> **2026-09-07 起代理在转发侧覆写**：`GET /v1/models` 200 响应经 `proxy.OverrideModelsMeta` 按
+> alias→真实窗口静态表改写该字段（core/vl=131072，flash/air/basic=1048576，值同源
+> `oauth.BackendMeta`）；仅覆写表中 alias 已携带字段的条目，解析失败/无命中原样透传。
+> 客户端读到的 `max_model_len` 即真实窗口，不再虚标。
 
 ---
 

@@ -70,12 +70,21 @@ var sseTypeRE = regexp.MustCompile(`"type"\s*:\s*"([a-z_]+)"`)
 // dataPrefix SSE data 行前缀（`data:` 后空格可选）。
 var dataPrefix = []byte("data:")
 
+// 优化轮 2026-09-07：trim 模式逐行热路径的包级常量——writeLine/writeDataLine/isEventLine
+// 的换行与前缀参数不再逐行分配（调用方只读，禁止改写内容）。
+var (
+	newlineByte     = []byte{'\n'}
+	dataLinePrefix  = []byte("data: ")
+	eventLinePrefix = []byte("event:")
+)
+
 // eventType 提取 data 行的事件 type；无匹配返回空串。
 // []byte 扫描（性能审计 P6）：避免每 data 行的整行 string 分配，仅类型 token 拷贝；
-// 匹配语义与 string 版完全一致。
+// 匹配语义与 string 版完全一致。FindSubmatchIndex（优化轮 2026-09-07）：
+// 子串切片立即 string 拷贝，不别名 data，仅省去匹配数组的第三次分配。
 func eventType(data []byte) string {
-	if m := sseTypeRE.FindSubmatch(data); m != nil {
-		return string(m[1])
+	if i := sseTypeRE.FindSubmatchIndex(data); i != nil {
+		return string(data[i[2]:i[3]])
 	}
 	return ""
 }
@@ -306,7 +315,7 @@ func (g *AnthropicGuard) trimLine(line []byte, w io.Writer) error {
 
 // isEventLine 判断一行（可含首尾空白）是否为 `event: <name>` 行（冒号后空格可选）。
 func isEventLine(trimmed []byte, name string) bool {
-	rest, ok := bytes.CutPrefix(trimmed, []byte("event:"))
+	rest, ok := bytes.CutPrefix(trimmed, eventLinePrefix)
 	if !ok {
 		return false
 	}
@@ -402,7 +411,7 @@ func writeLine(w io.Writer, line []byte) error {
 	if _, err := w.Write(line); err != nil {
 		return err
 	}
-	_, err := w.Write([]byte{'\n'})
+	_, err := w.Write(newlineByte)
 	return err
 }
 
@@ -653,7 +662,7 @@ func (g *OpenAIGuard) emitHit(data []byte, prefix string, w io.Writer) error {
 
 // writeDataLine 把（可能已改写的）data 载荷按 SSE data 行写出（补回 `data: ` 前缀）。
 func writeDataLine(w io.Writer, data []byte) error {
-	if _, err := w.Write([]byte("data: ")); err != nil {
+	if _, err := w.Write(dataLinePrefix); err != nil {
 		return err
 	}
 	return writeLine(w, data)

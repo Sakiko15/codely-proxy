@@ -49,6 +49,13 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		http.NotFound(rw, req)
 		return
 	}
+	// 优化轮 2026-09-07：带声明长度的超大请求早拒——此前 >32MB 的请求仍要白读满
+	// 32MB 才被 MaxBytesReader 掐断；错误体与读路径超限分支逐字节一致。
+	// chunked（ContentLength -1）/未知长度不受此判定影响，照旧走读路径。
+	if req.ContentLength > 32<<20 {
+		WriteError(rw, req, http.StatusRequestEntityTooLarge, "request body too large", "request_too_large")
+		return
+	}
 	// 读 body（限制大小，防 OOM；模型推理一般 < 16MB）
 	req.Body = http.MaxBytesReader(rw, req.Body, 32<<20)
 	var buf bytes.Buffer
@@ -157,7 +164,9 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 	// probe 请求不入环。各终止分支经 logDone 补齐分类字段，defer 统一算耗时并入环。
 	var entry *RequestLogEntry
 	if h.Log != nil && !isProbe {
-		entry = &RequestLogEntry{TS: started, Method: req.Method, Path: req.URL.Path}
+		// 优化轮 2026-09-07：Path 入环截断——Path 客户端可控且无长度上限，1MB 恶意路径
+		// × 256 条环形容量 ≈ 256MB 驻留；256 字节与 Error 字段同一上限
+		entry = &RequestLogEntry{TS: started, Method: req.Method, Path: truncateReason(req.URL.Path, 256)}
 		defer func() {
 			entry.DurationMs = time.Since(started).Milliseconds()
 			h.Log.Push(entry)
@@ -354,6 +363,11 @@ func (h *Handler) pipeResponse(rw http.ResponseWriter, req *http.Request, r Forw
 	// 上游体空闲超时兜底（稳定性审计 F1）：headers 已到但上游挂起零字节时，
 	// 无此兜底会永久占用 goroutine 与连接。SSE 与非 SSE 都生效。
 	resp.Body = newIdleBody(resp.Body, upstreamIdleTimeout)
+	// 优化轮 2026-09-07：统一 defer 关闭（关闭的是包装层：先停定时器再关底层体；
+	// idleBody 与 http 响应体的 Close 均可重入，双关安全）。此前三条路径各自显式
+	// Close，中途 panic 会泄漏上游 body 与连接。ForwardResult.Resp 全仓仅此处消费，
+	// 不存在 close 后再读路径。
+	defer resp.Body.Close()
 	// 复制响应头
 	copyHeaders(rw, resp.Header)
 	rw.Header().Set("x-codely-routed-account", slug)
@@ -387,7 +401,6 @@ func (h *Handler) pipeResponse(rw http.ResponseWriter, req *http.Request, r Forw
 				_ = sseguard.PipeOpenAI(fw, resp.Body)
 			}
 		}
-		resp.Body.Close()
 		return
 	}
 
@@ -404,7 +417,6 @@ func (h *Handler) pipeResponse(rw http.ResponseWriter, req *http.Request, r Forw
 	}
 	rw.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(rw, resp.Body)
-	resp.Body.Close()
 }
 
 // bufferRewrite 缓冲读取非流式 200 响应体（maxTrimBody 上限），经 rewriter 改写后写出
@@ -424,7 +436,7 @@ func bufferRewrite(rw http.ResponseWriter, resp *http.Response, rewriter func([]
 	if over {
 		_, _ = io.Copy(rw, resp.Body)
 	}
-	resp.Body.Close()
+	// body 关闭由 pipeResponse 的统一 defer 负责（本函数仅 pipeResponse 调用）
 }
 
 // writePassthrough 透传上游错误体（复制上游真实头，删 content-length，加 routed-account）。

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
@@ -74,10 +75,18 @@ type Proxy struct {
 func New() *Proxy {
 	transport := &http.Transport{
 		MaxIdleConns:        64,
-		MaxIdleConnsPerHost: 16,
+		MaxIdleConnsPerHost: 64,
 		IdleConnTimeout:     60 * time.Second,
 		// 首字节等待上限（对标 JS httpsAgent timeout: 120s），体读取不受此限
 		ResponseHeaderTimeout: 120 * time.Second,
+		// 优化轮 2026-09-07：补齐拨号/TLS 握手超时（零值=无限等待，上游黑洞时 goroutine
+		// 只能靠客户端 ctx 取消解锁）。⚠️ ForceAttemptHTTP2 是承重项：net/http 仅在
+		// 拨号/TLS 配置全零值时自动启用 h2，显式设 DialContext 后必须显式置 true，
+		// 否则会静默回退 HTTP/1.1 改变现有传输行为。
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
 	return &Proxy{
 		UpstreamBase: "https://codely-litellm.tuanjie.cn",

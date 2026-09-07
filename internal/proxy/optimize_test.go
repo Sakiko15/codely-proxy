@@ -155,6 +155,9 @@ func TestForwardTransportFields(t *testing.T) {
 	if tr.ExpectContinueTimeout != 1*time.Second {
 		t.Fatalf("ExpectContinueTimeout = %v, want 1s", tr.ExpectContinueTimeout)
 	}
+	if tr.Proxy == nil {
+		t.Fatalf("Proxy 必须走 ProxyFromEnvironment（线上排障 2026-09-07：自定义 Transport 零值不走环境代理，受限出口部署无法经 HTTPS_PROXY 自救）")
+	}
 	if tr.ResponseHeaderTimeout != 120*time.Second {
 		t.Fatalf("ResponseHeaderTimeout = %v, want 120s（首字节兜底契约）", tr.ResponseHeaderTimeout)
 	}

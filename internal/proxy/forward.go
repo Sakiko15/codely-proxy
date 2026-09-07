@@ -74,6 +74,10 @@ type Proxy struct {
 // Transport 的 ResponseHeaderTimeout 兜底，SSE 体读取不设上限。
 func New() *Proxy {
 	transport := &http.Transport{
+		// 线上排障 2026-09-07：自定义 Transport 零值不走环境代理（仅 http.DefaultTransport
+		// 默认带 ProxyFromEnvironment）——受限出口部署设 HTTPS_PROXY 对转发流量无效。
+		// 补上标准语义：未设相关环境变量时行为完全不变（含 NO_PROXY 约定）。
+		Proxy:               http.ProxyFromEnvironment,
 		MaxIdleConns:        64,
 		MaxIdleConnsPerHost: 64,
 		IdleConnTimeout:     60 * time.Second,

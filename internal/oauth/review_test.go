@@ -6,6 +6,15 @@ import (
 	"testing"
 )
 
+func TestUpstreamTransportHonorsProxyEnv(t *testing.T) {
+	// 线上排障 2026-09-07：自定义 Transport 零值不走环境代理——受限出口部署（服务器到
+	// codely.tuanjie.cn 丢包超时、设备码登录卡死）设 HTTPS_PROXY 也无效。两处出站
+	// Transport（控制面/转发）必须显式 ProxyFromEnvironment。
+	if upstreamTransport.Proxy == nil {
+		t.Fatalf("控制面 Transport 必须走 ProxyFromEnvironment")
+	}
+}
+
 func TestProbeBackendsWorkerPanicRecovered(t *testing.T) {
 	// F12：models_handlers 的 recover 管不到 ProbeBackends 内部嵌套 goroutine。
 	// 注入：单 alias 的 probeOnce panic → 该 alias 记为错误结果、进程不崩、

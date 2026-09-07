@@ -356,6 +356,18 @@ func TestWebUILoginPollFeedback(t *testing.T) {
 	}
 }
 
+func TestWebUIQuotaForceRefreshGET(t *testing.T) {
+	// 审查记录 2026-09-07 P1-A：强制刷新曾被误改为 apiPost('/api/quota?force=1')，
+	// 但路由仅注册 GET /api/quota → 405，按钮 100% 失效。钉死 GET 意图防回归。
+	s := webSource(t)
+	if !strings.Contains(s, "apiGet('/api/quota?force=1')") {
+		t.Fatalf("静态资源应包含 apiGet('/api/quota?force=1')（强制刷新 405 回归）")
+	}
+	if strings.Contains(s, "apiPost('/api/quota") {
+		t.Fatalf("静态资源不应再以 apiPost 调 /api/quota（路由仅 GET，必 405）")
+	}
+}
+
 func TestAuthPartialEnv(t *testing.T) {
 	// 逻辑审查 P1：WEBUI_USER/WEBUI_PASS 只设其一不再整体回退随机
 	a := NewAuth("", "mypass")

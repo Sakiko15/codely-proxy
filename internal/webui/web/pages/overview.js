@@ -1,7 +1,7 @@
 // 总览页（WebUI 重构 C4）：池状态统计卡 + 聚合额度进度 + 冷却警示 + 当前账号配额快照。
 // 数据复用 /api/balancer/status + /api/quota（api.js 在途去重，消除旧版重复请求）。
 
-import { apiGet, apiPost } from '../assets/api.js';
+import { apiGet } from '../assets/api.js';
 import { esc, formatNum, renderError, showToast, isDirty, clearDirty } from '../assets/ui.js';
 import { icon } from '../assets/icons.js';
 
@@ -54,7 +54,8 @@ export const page = {
       '<div id="ov-body"></div>';
     el.querySelector('#ov-refresh').addEventListener('click', async () => {
       try {
-        await apiPost('/api/quota?force=1');
+        // 强刷走 GET（路由仅注册 GET /api/quota，POST 会 405——审查记录 2026-09-07 P1-A）
+        await apiGet('/api/quota?force=1');
         showToast('已强制刷新额度快照');
         load();
       } catch (e) {

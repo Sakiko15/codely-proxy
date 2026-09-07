@@ -34,6 +34,9 @@ type Handler struct {
 	Balancer *balancer.Balancer
 	Registry *account.Registry
 	Security *security.Security
+	// Log 请求环形日志（reqlog.go，/api/logs 数据源）；绕过 NewHandler 构造时为零值，
+	// 写读均含 nil 守卫。
+	Log *RequestLog
 	// Logger 输出标签日志（nil 用标准 log）。
 	Logger *log.Logger
 }
@@ -72,7 +75,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 // NewHandler 组装 handler。
 func NewHandler(p *Proxy, b *balancer.Balancer, reg *account.Registry, sec *security.Security) *Handler {
-	return &Handler{Proxy: p, Balancer: b, Registry: reg, Security: sec, Logger: log.Default()}
+	return &Handler{Proxy: p, Balancer: b, Registry: reg, Security: sec, Log: NewRequestLog(), Logger: log.Default()}
 }
 
 func (h *Handler) logf(tag, format string, args ...any) {
@@ -150,11 +153,32 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 	started := time.Now()
 	isProbe := req.Header.Get("x-codely-probe") == "1"
 
+	// 请求环形日志（reqlog.go，WebUI /api/logs 数据源）：一次请求一条最终结果，
+	// probe 请求不入环。各终止分支经 logDone 补齐分类字段，defer 统一算耗时并入环。
+	var entry *RequestLogEntry
+	if h.Log != nil && !isProbe {
+		entry = &RequestLogEntry{TS: started, Method: req.Method, Path: req.URL.Path}
+		defer func() {
+			entry.DurationMs = time.Since(started).Milliseconds()
+			h.Log.Push(entry)
+		}()
+	}
+	logDone := func(kind, account string, status int, model, errMsg string) {
+		if entry == nil {
+			return
+		}
+		entry.Kind, entry.Account, entry.Status, entry.Model = kind, account, status, model
+		if errMsg != "" {
+			entry.Error = truncateReason(errMsg, 256)
+		}
+	}
+
 	// 1. 客户端 API Key 鉴权（仅保护 /v1/* 推理接口，未设置 Key 免密放行）
 	if !h.Security.Validate(req) {
 		if !isProbe {
 			h.logf("proxy", "%s %s -> 401 (API Key 鉴权未通过)", req.Method, req.URL.Path)
 		}
+		logDone(LogKindAuth, "", http.StatusUnauthorized, "", "API Key 鉴权未通过")
 		WriteError(rw, req, http.StatusUnauthorized, "Incorrect API key provided.", "invalid_api_key")
 		return
 	}
@@ -167,6 +191,7 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 		if !isProbe {
 			h.logf("proxy", "%s %s -> 400 (图片块在 Anthropic 端点不可用，见 HasImageBlocks 注释)", req.Method, req.URL.Path)
 		}
+		logDone(LogKindRejected, "", http.StatusBadRequest, "", "图片块在 Anthropic 端点不可用")
 		WriteError(rw, req, http.StatusBadRequest,
 			"image input is not supported on the Anthropic endpoint (upstream limitation); use /v1/chat/completions with image_url for vision",
 			"invalid_request_error")
@@ -198,6 +223,7 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 	for acctTry := 0; acctTry < maxTries; acctTry++ {
 		state, err := h.Balancer.Pick(preferredSlug, excluded)
 		if err != nil {
+			logDone(LogKindError, "", http.StatusBadGateway, "", err.Error())
 			WriteError(rw, req, http.StatusBadGateway, "codely-proxy: 调度账号失败 ("+err.Error()+")", "bad_gateway")
 			return
 		}
@@ -255,6 +281,7 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 				if !isProbe {
 					h.logf("proxy", "[%s] %s %s -> %d (%dms%s)", slug, req.Method, req.URL.Path, status, time.Since(started).Milliseconds(), modelSuffix(r.Model))
 				}
+				logDone(LogKindQuota, slug, status, r.Model, text)
 				writePassthrough(rw, r, slug)
 				return
 
@@ -263,6 +290,7 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 				if !isProbe {
 					h.logf("proxy", "[%s] %s %s -> %d (%dms, 模型被拒透传%s)", slug, req.Method, req.URL.Path, r.Status, time.Since(started).Milliseconds(), modelSuffix(r.Model))
 				}
+				logDone(LogKindDenied, slug, r.Status, r.Model, "")
 				writePassthrough(rw, r, slug)
 				return
 
@@ -272,6 +300,7 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 				if !isProbe {
 					h.logf("proxy", "[%s] %s %s -> %d (%dms%s)", slug, req.Method, req.URL.Path, r.Status, time.Since(started).Milliseconds(), modelSuffix(r.Model))
 				}
+				logDone(LogKindOK, slug, r.Status, r.Model, "")
 				h.pipeResponse(rw, req, r, slug, stops)
 				return
 
@@ -300,6 +329,7 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 		}
 		// 性能审计 P5：错误体（≤64KB）不再整段进客户端 502 消息
 		reason = truncateReason(reason, 512)
+		logDone(LogKindError, "", http.StatusBadGateway, "", reason)
 		WriteError(rw, req, http.StatusBadGateway, "codely-proxy: 上游请求失败 ("+reason+")", "bad_gateway")
 	}
 }

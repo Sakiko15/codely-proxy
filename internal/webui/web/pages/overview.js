@@ -106,7 +106,7 @@ async function load() {
     statCard('账号总数', String(st.totalAccounts ?? 0), 'users') +
     statCard('活跃账号', String(st.activeAccounts ?? 0), 'check') +
     statCard('冷却账号', String(st.coolingAccounts ?? 0), 'clock') +
-    statCard('负载模式', st.mode === 'quota' ? '额度优先' : '轮询', 'layers') +
+    statCard('负载模式', st.mode === 'quota-first' ? '额度优先' : '轮询', 'layers') +
     '</div>';
 
   // 聚合额度（池合计只列数值：与单账号窗口不可比，不做进度条）

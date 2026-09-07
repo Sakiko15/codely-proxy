@@ -54,8 +54,9 @@ export function wireDevLogin() {
   btn.addEventListener('click', async () => {
     const name = (nameInput.value || '').trim();
 
-    // F7+P2#34：备注名预校验（与后端 Slugify 规则一致：字母数字/连字符/下划线，保留字与长度）
-    const vErr = validateName(name);
+    // F7+P2#34：备注名预校验（与后端 Slugify 规则一致：字母数字/点号/连字符/下划线，
+    // 保留字与长度）；备注名可选，留空不校验（复审 2026-09-07：空串必败导致无法发起登录）
+    const vErr = name ? validateName(name) : '';
     if (vErr) {
       showToast(vErr, 'err');
       return;
@@ -77,8 +78,9 @@ export function wireDevLogin() {
 }
 
 function validateName(name) {
-  if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
-    return '备注名仅支持字母数字、连字符与下划线（≤64 字符）';
+  // 字符集对齐后端 Slugify（registry.go slugSepRe：._- 均保留，21ea933）
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) {
+    return '备注名仅支持字母数字、点号、连字符与下划线（≤64 字符）';
   }
   if (name === 'index') {
     return '备注名 index 为保留字，请换一个';

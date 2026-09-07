@@ -44,14 +44,18 @@ export const page = {
       const patch = {};
       if (e.target.id === 'bal-enabled') patch.enabled = e.target.checked;
       else patch.mode = e.target.value;
+      // 复审 2026-09-07：脏标记打在 [data-form] 卡片上（initDirtyTracking 的 closest），
+      // 成败都必须清脏 + 回读——成功不清脏会让 15s 轮询被 isDirty 永久挡住（load 早退），
+      // 失败时旧实现清错元素（#bal-body 从未被打脏）同样无效
+      const form = body.querySelector('[data-form]');
       try {
         await apiPost('/api/balancer/config', patch);
         showToast('配置已生效');
       } catch (err) {
         showToast(err.message || '保存失败', 'err');
-        clearDirty(body);
-        load();
       }
+      clearDirty(form);
+      load(); // 回读真实状态（成功失败都刷新）
     });
 
     load();
@@ -64,11 +68,15 @@ async function load() {
   const body = document.getElementById('bal-body');
   if (!body) return;
 
+  // 脏检查提前到错误路径之前（复审 2026-09-07：轮询瞬时失败 renderError 会整页覆盖，
+  // 用户正在编辑的表单不能丢——与成功路径同一守卫）
+  const form = body.querySelector('[data-form]');
   let st;
   try {
     st = await apiGet('/api/balancer/status');
   } catch (e) {
     if (e.message === '未登录') return;
+    if (isDirty(form)) return;
     renderError(body, e.message, load);
     return;
   }
@@ -78,7 +86,6 @@ async function load() {
   const inPool = accounts.filter((a) => a.inPool);
 
   // 脏检查：用户正在编辑表单时不覆写（修"轮询覆写正在编辑的表单"缺陷）
-  const form = body.querySelector('[data-form]');
   if (isDirty(form)) return;
 
   body.innerHTML =

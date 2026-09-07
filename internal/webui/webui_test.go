@@ -341,6 +341,26 @@ func TestWebUIFrontendStateFixes(t *testing.T) {
 	}
 }
 
+func TestWebUIFrontendReviewFixes20260907(t *testing.T) {
+	// 复审 2026-09-07 前端四处修复（F4/F5/F6/F9）：以 embed 内容钉死新契约语义防回归
+	s := webSource(t)
+	for _, c := range []struct{ needle, why string }{
+		{"name ? validateName(name) : ''", "复审 F4 备注名可选——留空不校验（旧实现空串必败无法发起登录）"},
+		{"[A-Za-z0-9._-]{1,64}", "复审 F4 备注名字符集对齐 Slugify（点号保留）"},
+		{"statCard('负载模式', st.mode === 'quota-first'", "复审 F5 总览负载模式取真实值（旧 'quota' 恒假恒显轮询）"},
+		{"脏标记打在 [data-form] 卡片上", "复审 F6 配置变更监听器对 [data-form] 清脏（旧实现成功不清脏冻结轮询/失败清错元素）"},
+	} {
+		if !strings.Contains(s, c.needle) {
+			t.Fatalf("静态资源应包含 %q（%s 回归）", c.needle, c.why)
+		}
+	}
+	// 复审 F9：balancer load() 错误路径与成功路径同守卫（isDirty(form) 恰 2 处，
+	// 其余页面均用 isDirty(body) 不计入）
+	if got := strings.Count(s, "if (isDirty(form)) return;"); got != 2 {
+		t.Fatalf("isDirty(form) 守卫应恰 2 处（load 错误路径 + 成功路径，复审 F9），got %d", got)
+	}
+}
+
 func TestWebUILoginPollFeedback(t *testing.T) {
 	// 登录轮询修复（授权后无限等待）：pending 分支必须消费后端 message
 	//（此前死文案"等待授权中"掩盖 slow_down/429），轮询为 setTimeout 链防在途叠加

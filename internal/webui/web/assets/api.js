@@ -15,10 +15,13 @@ export class ApiError extends Error {
   }
 }
 
-// 在途请求去重：同 method+path 并发只有一个真实请求共享结果
+// 在途请求去重：仅对幂等的 GET 生效——key 不含 body，若非 GET 也去重，
+// 并发 POST 不同参数（如连删两个账号）第二个请求会被静默吞掉
+//（审查记录 2026-09-07 P2-C2）。
 const inflight = new Map();
 
 async function request(method, path, body, opts = {}) {
+  if (method !== 'GET') return doRequest(method, path, body, opts);
   const key = method + ' ' + path;
   const hit = inflight.get(key);
   if (hit) return hit;

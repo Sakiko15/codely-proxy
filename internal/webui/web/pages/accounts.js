@@ -20,24 +20,37 @@ function clearPoll() {
   }
 }
 
+// 弹窗常驻按钮是否已绑定（modal 常驻 shell，跨页面存续；重复绑定会在每次进账号页时
+// 累积一份监听器 → N 次访问后一次复制弹 N 个 toast，审查记录 2026-09-07 P2-C）
+let devModalWired = false;
+
 export function wireDevLogin() {
   const btn = document.getElementById('dev-start-btn');
   const nameInput = document.getElementById('dev-name');
   const modal = document.getElementById('dev-login-modal');
   if (!btn || !modal) return;
 
-  // 复制/外开按钮只绑一次（modal 常驻 shell，点击时再读当前链接值）
-  modal.querySelector('#dev-copy-btn').addEventListener('click', async () => {
-    const url = modal.querySelector('#dev-url-text').value;
-    if (!url) return;
-    const ok = await copyText(url);
-    showToast(ok ? '已复制授权链接' : '复制失败，请手动复制', ok ? 'ok' : 'err');
-  });
-  modal.querySelector('#dev-open-btn').addEventListener('click', () => {
-    const url = modal.querySelector('#dev-url-text').value;
-    if (url) window.open(url, '_blank', 'noopener');
-  });
+  // 复制/外开/关闭按钮随 modal 常驻，只绑一次（点击时再读当前链接值）
+  if (!devModalWired) {
+    modal.querySelector('#dev-copy-btn').addEventListener('click', async () => {
+      const url = modal.querySelector('#dev-url-text').value;
+      if (!url) return;
+      const ok = await copyText(url);
+      showToast(ok ? '已复制授权链接' : '复制失败，请手动复制', ok ? 'ok' : 'err');
+    });
+    modal.querySelector('#dev-open-btn').addEventListener('click', () => {
+      const url = modal.querySelector('#dev-url-text').value;
+      if (url) window.open(url, '_blank', 'noopener');
+    });
+    modal.querySelectorAll('[data-close]').forEach((el) => {
+      el.addEventListener('click', () => {
+        closeDevModal(modal);
+      });
+    });
+    devModalWired = true;
+  }
 
+  // 发起按钮在 outlet 内，每次 mount 重建，须随 mount 重绑
   btn.addEventListener('click', async () => {
     const name = (nameInput.value || '').trim();
 
@@ -60,13 +73,6 @@ export function wireDevLogin() {
     } finally {
       btn.disabled = false;
     }
-  });
-
-  // 关闭按钮 + 取消：best-effort cancel + 停轮询
-  modal.querySelectorAll('[data-close]').forEach((el) => {
-    el.addEventListener('click', () => {
-      closeDevModal(modal);
-    });
   });
 }
 

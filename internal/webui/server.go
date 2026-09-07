@@ -187,6 +187,8 @@ func (s *Server) handleLogout(rw http.ResponseWriter, req *http.Request) {
 
 // handleAuthStatus GET /api/auth-status：登录态 + 是否自动生成密码（首屏提示）。
 func (s *Server) handleAuthStatus(rw http.ResponseWriter, req *http.Request) {
+	// 该响应可能含生成密码（首登前），禁止中间代理缓存（审查记录 2026-09-07 P3-2）
+	rw.Header().Set("Cache-Control", "no-store")
 	tok := SessionTokenFromRequest(req)
 	authed := s.Auth.ValidSession(tok)
 	resp := map[string]any{

@@ -17,6 +17,7 @@ const KINDS = {
   auth: { label: '鉴权', badge: 'badge-danger' },
   rejected: { label: '已拒', badge: 'badge-warning' },
   error: { label: '错误', badge: 'badge-danger' },
+  aborted: { label: '客户端中断', badge: 'badge-muted' },
 };
 
 let kindFilter = '';  // 空 = 全部

@@ -54,6 +54,10 @@ registerRoute('logs', logs);
 
 const THEME_KEY = 'codely-theme';
 
+// MediaQueryList 单实例复用（审查记录 2026-09-07 P2-D）：每次 matchMedia() 返回新实例，
+// 对新实例 removeEventListener 永远移不掉旧监听器，手动切换一次主题泄漏一个监听器
+const prefersLight = matchMedia('(prefers-color-scheme: light)');
+
 function themeMode() {
   try {
     const m = localStorage.getItem(THEME_KEY);
@@ -65,7 +69,7 @@ function themeMode() {
 function applyTheme(mode) {
   const resolved = mode === 'light' || mode === 'dark'
     ? mode
-    : (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    : (prefersLight.matches ? 'light' : 'dark');
   document.documentElement.setAttribute('data-theme', resolved);
   return resolved;
 }
@@ -92,14 +96,14 @@ function renderTheme(mode) {
   }[mode];
   btn.innerHTML = icon(meta.icon, 'icon icon-sm') + '<span>' + meta.label + '（' + resolved + '）</span>';
 
-  // auto 模式跟随系统切换；手动模式挂起监听
+  // auto 模式跟随系统切换；手动模式挂起监听（同一 MQL 实例上摘挂，见 prefersLight 注释）
   if (mediaHandler) {
-    matchMedia('(prefers-color-scheme: light)').removeEventListener('change', mediaHandler);
+    prefersLight.removeEventListener('change', mediaHandler);
     mediaHandler = null;
   }
   if (mode === 'auto') {
     mediaHandler = () => applyTheme('auto');
-    matchMedia('(prefers-color-scheme: light)').addEventListener('change', mediaHandler);
+    prefersLight.addEventListener('change', mediaHandler);
   }
 }
 

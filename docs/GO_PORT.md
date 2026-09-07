@@ -886,12 +886,17 @@ dsh 场景下它写 `~/.dsh/settings.yaml` + 插件装配——**VPS 网关不�
 - **Anthropic 历史 thinking 剔除 ≠ thinking 配置透传**：剔除只作用于上一轮 **assistant 历史**里已固化的 `thinking`/`redacted_thinking`/`signature_delta` 块；`thinking: {type: enabled, budget_tokens}` 是**本轮请求参数**，原样透传，二者不冲突。
 - **OpenAI `[DONE]` 合成**：仅当上游返回 `text/event-stream` 且流结束但没发 `data: [DONE]` 时补发；若客户端已断连则跳过。这是纯幂等增强，不会发重复内容。
 - **双协议错误格式对齐最新**：Anthropic `{type:"error", error:{type, message}}`，`error.type` 按状态映射官方集合（`anthropicErrType`：400 invalid_request_error / 401 authentication_error / 402 billing_error / 403 permission_error / 404 not_found_error / 413 request_too_large / 429 rate_limit_error / 503·529 overloaded_error / 其余 api_error）`[增强]`；OpenAI `{error:{message, type, param, code}}`，type 按状态映射（429 rate_limit_error / ≥500 server_error / 其余 invalid_request_error），code 调用方值优先、为空时按状态派生 `[增强]`。
-- **非流式两条路径**：OpenAI completion 与 Anthropic messages 非流式响应都是纯透传，不 parse、不合成。
+- **非流式两条路径**：OpenAI completion 与 Anthropic messages 非流式响应都是纯透传，不 parse、不合成。**例外**：请求带 `stop`/`stop_sequences` 时做响应侧截断（见下条）。
 - **`anthropic-beta` / `anthropic-version` 头透传** `[增强·偏离 JS]`：JS 重建上游头集合时丢弃客户端 Anthropic 头，beta-only 新特性无法激活；Go 版原样透传（多值全透、大小写规范化）。
 - **`?beta=1` 精确路径** `[增强·偏离 JS]`：JS `includes("/messages")` 子串匹配会误伤 `/v1/messages/*` 子路径（如 count_tokens）；Go 版仅对路径恰为 `/v1/messages` 时注入。
 - **sseguard 宽松匹配与多块闭合** `[增强]`：事件 type 容忍 JSON 冒号后空白（上游 LiteLLM 为 Python，`json.dumps` 默认带空格，精确子串匹配会漏判而误合成）、`data:` 后空格可选；开放块按集合跟踪，断流时升序全部闭合（合成字节不变，`TestAnthropicSynthesizedBytesGolden` 字节级钉死）。上游 `error` 事件后仅补 `message_stop`，不再合成假 `end_turn`/`output_tokens:0`（有意偏离 JS：失败不应被美化成正常结束）。
 - **SSE 逐事件 Flush** `[增强]`：`flushWriter` 每次写入后立即 Flush，避免 Go http ~4KB 缓冲攒批小事件（§19.2-3）。
 - **`/messages` 图片块早拒** `[增强·2026-09-07 实测新增]`：上游 Anthropic 兼容端点图片链路整体损坏——Anthropic base64/url 源 image 块 → 500「图片输入格式/解析错误」；改写为 OpenAI image_url 块 → 200 但**静默丢图**；根因是 `/v1/messages` 侧 codely-vl 连纯文本都路由到纯文本 GLM 部署（`glm-5.3-flash`），与 `/v1/chat/completions` 侧（→ qwen3.5 视觉，实测正确识别）不同源，翻译桥救不了路由。代理在鉴权后检出 image 块（含 tool_result 内嵌 content）即早拒 `400 invalid_request_error` 并指引走 OpenAI 端点（`sanitize.HasImageBlocks`）。
+- **`stop`/`stop_sequences` 响应侧强制执行** `[增强·2026-09-07 实测新增]`：上游两端口径皆坏（实测：Anthropic 侧 `stop_sequences` 被接受但完全不生效——输出穿过停词、`stop_reason` 恒非 `stop_sequence`；OpenAI 侧 `stop` 命中即**吞空整个可见输出**且 `finish_reason` 伪报 `"stop"`）。代理自执行：
+  - **请求侧**：`sanitize.ExtractStops` 重试循环前一次性提取停词（`/messages` 取 `stop_sequences`、`/chat/completions` 取 `stop`，string/array 双形态，保序去重）；`TransformBody` 对 OpenAI 请求**剥离 `stop` 字段**（防上游毒化吞空输出），`stop_sequences` 保留透传（上游不生效但也无害）。
+  - **非流式**（`internal/proxy/stoptrim.go`，仅 200+JSON，缓冲上限 16MB 超限回退透传）：Anthropic 按全部 text 块拼接全文找最早命中（同位置按请求序），命中块截断、其后块丢弃，覆写 `stop_reason:"stop_sequence"`+`stop_sequence:<命中词>`；OpenAI 截断各 `choices[].message.content` 并置 `finish_reason:"stop"`。RawMessage 手术保留未触字段值字节（usage 不失真）。
+  - **流式**（`internal/sseguard` trim 模式，`PipeAnthropicStop`/`PipeOpenAIStop`，仅 stops 非空启用——空则与原 `PipeAnthropic`/`PipeOpenAI` 字节级等价，golden 契约零风险）：text_delta/content 增量进 rune holdback（保留尾部 `maxStopRunes-1` 个 rune 防停词跨事件/跨 chunk 漏检），命中→发出净前缀 + Anthropic 合成 `content_block_stop`/`message_delta(stop_reason:"stop_sequence")`/`message_stop` 三件套、OpenAI 改写当前 chunk `finish_reason:"stop"`+合成 `[DONE]`，其后上游输出排空；上游自然结束/EOF 则冲出待定残文再走既有收尾。
+  - **已知边界**：仅截 text 输出，不对 `tool_use` 的 input JSON 内文本截断；流式按各 text 块内文本匹配（跨块命中仅在"前块末尾+后块开头"拼接意义上成立，逐事件 holdback 已覆盖）；holdback 会把连续文本切分到多个事件送达（客户端按拼接语义无感）；截断后的 usage `output_tokens` 不实（沿用合成路径 output_tokens:0 约定）。
 
 ### 19.4 WebUI（美观 + 实用）
 

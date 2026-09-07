@@ -177,6 +177,12 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 	excluded := map[string]bool{}
 	var lastErr error
 
+	// P2 停词提取（重试循环前一次；见 sanitize.ExtractStops 与 stoptrim.go 注释）：
+	// 上游对 stop/stop_sequences 的实现不可用（OpenAI 侧命中即吞空整个输出，Anthropic 侧
+	// 完全不生效），代理留存停词做响应侧截断；TransformBody 同步剥离 OpenAI 请求 `stop`。
+	// stops 为空时全链路零影响（非 SSE 直通、SSE 走原透传模式，字节级不变）。
+	stops := sanitize.ExtractStops(req.URL.Path, body)
+
 	// 单请求最多尝试池中不同账号（上限 3 次，与 JS 一致以控延迟）。
 	// ⚠️ code-review #3 修正点：上限应是"不同的账号"——每次 Pick 带上 excluded，
 	// 已失败的账号不会再被选中，因此 N>3 时第 4 个健康账号理论上轮不到（3 次上限内），
@@ -266,7 +272,7 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 				if !isProbe {
 					h.logf("proxy", "[%s] %s %s -> %d (%dms%s)", slug, req.Method, req.URL.Path, r.Status, time.Since(started).Milliseconds(), modelSuffix(r.Model))
 				}
-				h.pipeResponse(rw, req, r, slug)
+				h.pipeResponse(rw, req, r, slug, stops)
 				return
 
 			case KindError:
@@ -299,7 +305,8 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 }
 
 // pipeResponse 把上游 200 响应透传给客户端（SSE 加头 + 可选流式守护；非 SSE 完整透传）。
-func (h *Handler) pipeResponse(rw http.ResponseWriter, req *http.Request, r ForwardResult, slug string) {
+// stops 非空时启用 P2 停词响应侧截断（流式 holdback / 非流式缓冲截断）。
+func (h *Handler) pipeResponse(rw http.ResponseWriter, req *http.Request, r ForwardResult, slug string, stops []string) {
 	resp := r.Resp
 	activeStreams.Add(1)
 	defer activeStreams.Add(-1)
@@ -326,16 +333,28 @@ func (h *Handler) pipeResponse(rw http.ResponseWriter, req *http.Request, r Forw
 		fw := flushWriter{ResponseWriter: rw}
 		if strings.Contains(req.URL.Path, "/messages") {
 			// Anthropic：行缓冲状态机守护闭环（§4，防 Claude Code 挂死）
-			_ = sseguard.PipeAnthropic(fw, resp.Body)
+			if len(stops) > 0 {
+				_ = sseguard.PipeAnthropicStop(fw, resp.Body, stops) // P2 停词截断
+			} else {
+				_ = sseguard.PipeAnthropic(fw, resp.Body)
+			}
 		} else {
 			// OpenAI：逐块透传 + [DONE] 合成（§19.3 增强）
-			_ = sseguard.PipeOpenAI(fw, resp.Body)
+			if len(stops) > 0 {
+				_ = sseguard.PipeOpenAIStop(fw, resp.Body, stops) // P2 停词截断
+			} else {
+				_ = sseguard.PipeOpenAI(fw, resp.Body)
+			}
 		}
 		resp.Body.Close()
 		return
 	}
 
-	// 非 SSE：完整透传
+	// 非 SSE：带停词的 200 JSON 先缓冲截断（P2），否则完整透传
+	if len(stops) > 0 && resp.StatusCode == http.StatusOK && strings.Contains(contentType, "json") {
+		pipeTrimmed(rw, req.URL.Path, resp, stops)
+		return
+	}
 	rw.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(rw, resp.Body)
 	resp.Body.Close()

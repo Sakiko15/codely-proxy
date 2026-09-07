@@ -303,6 +303,19 @@ func TransformBody(urlPath string, body []byte, sessionID string) (payload []byt
 		}
 	}
 
+	// 4. OpenAI `stop` 剥离（仅 /chat/completions，且停词实际有效时；P2·2026-09-07 实测新增）：
+	//    上游 /chat/completions 对 stop 的实现有毒化缺陷——命中时整个可见输出被吞空
+	//    （finish_reason 仍假称 "stop"；对照组未命中时输出正常），原样透传会随机丢失整段
+	//    回复。代理自执行：请求侧剥离 stop 让上游自由输出，响应侧由 handler/sseguard 按
+	//    官方语义截断（见 proxy/stoptrim.go 与 sseguard 流式 holdback）。Anthropic 端点的
+	//    stop_sequences 无毒化，照常透传（仅响应侧截断兜底）。
+	if strings.Contains(urlPath, "/chat/completions") {
+		if raw, ok := j["stop"]; ok && len(stopsFromRaw(raw)) > 0 {
+			delete(j, "stop")
+			changed = true
+		}
+	}
+
 	if !changed {
 		return body, model, false // 零拷贝直通
 	}
@@ -372,6 +385,81 @@ func contentHasImage(content json.RawMessage) bool {
 		}
 	}
 	return false
+}
+
+// ExtractStops 从请求体提取停用词列表（响应侧强制执行用，见 proxy/stoptrim.go）。
+//
+// 背景（2026-09-07 线上实测）：上游对停用词两端口径皆坏——
+//   - Anthropic `stop_sequences`：接受但**完全不生效**（输出原样穿过停词，stop_reason 恒非
+//     stop_sequence），无输出毒化；
+//   - OpenAI `stop`：更糟，**停词命中时整个可见输出被吞空**（finish_reason 仍假称 "stop"；
+//     对照组：stop 未命中时输出正常）。
+// 因此代理自执行：handler 在转发前调本函数留存停词，OpenAI 侧由 TransformBody 剥离请求
+// `stop`（见下），两侧响应再由 proxy/sseguard 按官方语义截断。
+//
+// 返回归一化去重后的停词（保序）；无/畸形/空 → nil。
+func ExtractStops(urlPath string, body []byte) []string {
+	if len(body) == 0 {
+		return nil
+	}
+	key := "stop"
+	if strings.Contains(urlPath, "/messages") {
+		key = "stop_sequences"
+	} else if !strings.Contains(urlPath, "/chat/completions") {
+		return nil // 其他 /v1/* 路径无停词语义
+	}
+	if !bytes.Contains(body, []byte(`"`+key+`"`)) {
+		return nil // 廉价预检
+	}
+	var j map[string]json.RawMessage
+	if json.Unmarshal(body, &j) != nil {
+		return nil
+	}
+	return stopsFromRaw(j[key])
+}
+
+// stopsFromRaw 解析停词字段的原始值（OpenAI string 形态 / 两协议数组形态），保序去重、
+// 丢弃空项。值缺失（nil）/畸形（数字/对象）/全空 → nil。ExtractStops 与 TransformBody
+// 的 stop 剥离共用（后者手头已有顶层 map，免二次整包解码）。
+func stopsFromRaw(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var out []string
+	var s string
+	if json.Unmarshal(raw, &s) == nil { // OpenAI string 形态
+		if s != "" {
+			out = append(out, s)
+		}
+		return dedupStops(out)
+	}
+	var arr []json.RawMessage
+	if json.Unmarshal(raw, &arr) != nil {
+		return nil // 非法形态（数字/对象）→ 不启用停词
+	}
+	for _, el := range arr {
+		var e string
+		if json.Unmarshal(el, &e) == nil && e != "" {
+			out = append(out, e)
+		}
+	}
+	return dedupStops(out)
+}
+
+// dedupStops 保序去重。
+func dedupStops(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(in))
+	out := in[:0]
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // rawOf 序列化为 RawMessage（本包输入均为内置类型，不会失败；失败时以 null 占位防写入 nil）。

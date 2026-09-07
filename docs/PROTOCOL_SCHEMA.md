@@ -219,6 +219,7 @@ type FlexContent struct {
 | 历史 thinking 块剔除 | `messages[]` 中 role=assistant 且 content 为数组 | 剔除 `thinking`/`redacted_thinking`；过滤后仅 1 个 text 块 → 折叠为 content=string；否则留数组（空则 `""`） |
 | model 提取 | 顶层 `model` | 原样取出用于日志/错误判定，**不修改** |
 | 图片块早拒（`HasImageBlocks`） | `/messages` 路径请求，message content 数组含 `type:"image"` 块（含 tool_result 内嵌） | **2026-09-07 实测新增**：上游 Anthropic 端点图片链路整体损坏（base64/url→500；image_url→静默丢图；codely-vl 在该端点路由到纯文本 GLM 部署），代理鉴权后早拒 400 并指引走 `/v1/chat/completions`；OpenAI 端点 image_url 不受影响 |
+| 停词提取（`ExtractStops`）+ OpenAI `stop` 剥离 | 顶层 `stop`（`/chat/completions`，string/array 双形态）/ `stop_sequences`（`/messages`，array）；保序去重、丢空项、畸形→nil | **2026-09-07 实测新增**：上游停词两端口径皆坏（Anthropic 完全不生效；OpenAI 命中即吞空整个可见输出）。代理重试循环前提取留存；OpenAI 请求 `stop` 字段从转发体中**删除**（防上游毒化），`stop_sequences` 原样透传；响应侧截断见 §7.3 |
 
 ---
 
@@ -280,6 +281,20 @@ type MessageStop struct {
     Type string `json:"type"` // "message_stop"
 }
 ```
+
+### 7.3 停词响应侧截断（请求带 `stop`/`stop_sequences` 时代理自执行，2026-09-07 实测新增）
+
+> 上游不执行停词（Anthropic）或命中即吞空输出（OpenAI），代理按官方语义自行截断；无停词请求零影响（纯透传不变）。
+
+- **非流式**（`TrimStopBody`，仅 200+JSON，16MB 上限超限回退透传）：
+  - Anthropic：全部 text 块文本**拼接全文**找最早命中（同位置按请求序），命中块截断、其后块丢弃；覆写 `stop_reason:"stop_sequence"` + `stop_sequence:<命中词>`（这两个键官方命中时携带，上游从未发过）。
+  - OpenAI：各 `choices[].message.content` 独立截断，`finish_reason:"stop"`；`content:null`（tool_calls）不动。
+  - RawMessage 手术：未触字段值字节保留（usage 大整数不失真）；顶层重序列化键字母序（既有约定）。
+- **流式**（sseguard trim 模式，仅 stops 非空启用）：text_delta/content 增量做 rune holdback（保留尾部 `maxStopRunes-1` rune 防跨事件命中），命中后——
+  - Anthropic：净前缀（可拆多个 `text_delta` 送达）+ 合成 `content_block_stop` + `message_delta(stop_reason:"stop_sequence", stop_sequence:<命中词>)` + `message_stop`，其后排空。合成 `message_delta` 的 `stop_reason` 为 **`"stop_sequence"`**（非 §7.2 断流合成的 `"end_turn"`），且 `stop_sequence` 为命中词字符串（非 null）。
+  - OpenAI：净前缀 chunk（`finish_reason:null`）+ 改写 `finish_reason:"stop"` + 合成 `data: [DONE]`，其后排空。
+  - 上游自然结束/EOF：冲出 holdback 残文（拼接语义完整）后再走既有收尾。
+- **已知边界**：仅截 text 输出，不截 `tool_use` input JSON 内文本；截断后 usage `output_tokens` 不实（output_tokens:0 约定）。
 
 ---
 

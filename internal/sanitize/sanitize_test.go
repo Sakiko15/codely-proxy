@@ -431,10 +431,10 @@ func TestNumbersPreservedOnZeroCopy(t *testing.T) {
 }
 func TestHasImageBlocks(t *testing.T) {
 	cases := []struct {
-		name   string
-		path   string
-		body   string
-		want   bool
+		name string
+		path string
+		body string
+		want bool
 	}{
 		{"base64图片块", "/v1/messages", `{"model":"m","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}},{"type":"text","text":"这是什么"}]}]}`, true},
 		{"url源图片块", "/v1/messages", `{"model":"m","messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]}]}`, true},
@@ -450,5 +450,74 @@ func TestHasImageBlocks(t *testing.T) {
 		if got := HasImageBlocks(c.path, []byte(c.body)); got != c.want {
 			t.Errorf("%s: HasImageBlocks = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+func TestExtractStops(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		body string
+		want []string
+	}{
+		{"Anthropic数组", "/v1/messages", `{"model":"m","stop_sequences":["END","STOP"]}`, []string{"END", "STOP"}},
+		{"OpenAI数组", "/v1/chat/completions", `{"model":"m","stop":["A","B"]}`, []string{"A", "B"}},
+		{"OpenAI字符串形态", "/v1/chat/completions", `{"model":"m","stop":"XYZ"}`, []string{"XYZ"}},
+		{"保序去重", "/v1/chat/completions", `{"model":"m","stop":["A","B","A"]}`, []string{"A", "B"}},
+		{"空项丢弃", "/v1/chat/completions", `{"model":"m","stop":["A","","A"]}`, []string{"A"}},
+		{"空数组", "/v1/chat/completions", `{"model":"m","stop":[]}`, nil},
+		{"空字符串", "/v1/chat/completions", `{"model":"m","stop":""}`, nil},
+		{"缺键", "/v1/messages", `{"model":"m","messages":[]}`, nil},
+		{"非法形态数字", "/v1/chat/completions", `{"model":"m","stop":3}`, nil},
+		{"畸形body", "/v1/chat/completions", `{not-json`, nil},
+		{"其他路径无停词语义", "/v1/models", `{"stop":["A"]}`, nil},
+		{"预检未命中", "/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"stop it"}]}`, nil},
+		{"空body", "/v1/chat/completions", ``, nil},
+		{"Anthropic正文出现stop字段不误取", "/v1/messages", `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"stop"}]}]}`, nil},
+	}
+	for _, c := range cases {
+		got := ExtractStops(c.path, []byte(c.body))
+		if len(got) != len(c.want) {
+			t.Errorf("%s: ExtractStops = %v, want %v", c.name, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("%s: ExtractStops[%d] = %q, want %q", c.name, i, got[i], c.want[i])
+			}
+		}
+	}
+}
+
+func TestTransformBodyStripsOpenAIStop(t *testing.T) {
+	// P2：上游 /chat/completions 对 stop 有毒化（命中即吞空输出）→ 请求侧剥离
+	in := `{"model":"m","stop":["CD"],"messages":[{"role":"user","content":"输出 ABCDEF"}]}`
+	payload, _, changed := TransformBody("/v1/chat/completions", []byte(in), "sid")
+	if !changed {
+		t.Fatalf("剥离 stop 应标记 changed")
+	}
+	j := mustObj(t, payload)
+	if _, ok := j["stop"]; ok {
+		t.Fatalf("stop 应被剥离: %s", payload)
+	}
+	if j["model"] != "m" {
+		t.Fatalf("其余字段应保留: %v", j["model"])
+	}
+
+	// 空数组 stop 无效 → 不剥离（零干预）
+	in2 := `{"model":"m","stop":[],"messages":[{"role":"user","content":"hi"}]}`
+	payload2, _, _ := TransformBody("/v1/chat/completions", []byte(in2), "sid")
+	if strings.Contains(string(payload2), `"stop"`) && mustObj(t, payload2)["stop"] == nil {
+		t.Fatalf("不应误删")
+	}
+	if _, ok := mustObj(t, payload2)["stop"]; !ok {
+		t.Fatalf("空 stop 应原样保留: %s", payload2)
+	}
+
+	// Anthropic 端点 stop_sequences 无毒化 → 照常透传
+	in3 := `{"model":"m","stop_sequences":["CD"],"messages":[{"role":"user","content":"hi"}]}`
+	payload3, _, _ := TransformBody("/v1/messages", []byte(in3), "sid")
+	if _, ok := mustObj(t, payload3)["stop_sequences"]; !ok {
+		t.Fatalf("Anthropic stop_sequences 应透传: %s", payload3)
 	}
 }

@@ -86,6 +86,9 @@ func main() {
 	// 身份所属的 per-slug 文件，防该账号被刷废
 	oauth.OnRotationRejected = reg.SyncCredsByIdentity
 	b := balancer.NewBalancer(reg)
+	// 复审 2026-09-07 F7/F10：重登保存成功后清该账号的密钥负缓存并补池
+	//（account 不能 import balancer，经 hook 倒置依赖）
+	account.OnAccountSaved = b.OnAccountSaved
 	sec := security.New()
 	q := quota.New(reg)
 	lf := account.NewLoginFlow(reg)

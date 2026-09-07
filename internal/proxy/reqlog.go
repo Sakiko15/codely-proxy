@@ -52,8 +52,15 @@ type RequestLog struct {
 	dropped atomic.Uint64
 }
 
-// NewRequestLog 构造空日志。
-func NewRequestLog() *RequestLog { return &RequestLog{} }
+// NewRequestLog 构造空日志。Seq 以 UnixNano 为基准（复审 2026-09-07 F8）：日志页跨重启
+// 保留 lastSeq 游标，若每进程从 1 起计，重启后新条目恒 ≤ 旧游标、Snapshot 的增量过滤
+// 会把全部新条目挡掉（页面永久冻结）。纳秒基准跨进程单调：uint64 纳秒 ≈1.7e18 < 2^63，
+// 进程寿命内的条目数远小于两次启动间隔的纳秒增量，不会回绕；前端零改动（游标本就透明）。
+func NewRequestLog() *RequestLog {
+	l := &RequestLog{}
+	l.seq.Store(uint64(time.Now().UnixNano()))
+	return l
+}
 
 // Push 入环一条记录（取 e 的值拷贝，补齐 Seq/耗时由调用方的 defer 闭包负责填好）；
 // 写满时逐出最旧并累计 dropped。Seq 为完成序单调递增。

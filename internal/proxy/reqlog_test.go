@@ -13,6 +13,8 @@ import (
 func TestRequestLogRingEviction(t *testing.T) {
 	// 写满后逐出最旧：dropped 累计、新→旧严格递减、最旧保留位对齐
 	l := NewRequestLog()
+	// 复审 2026-09-07 F8：Seq 基准 = UnixNano（跨进程单调），断言取相对基准
+	base := l.seq.Load()
 	const extra = 44
 	for i := 0; i < requestLogCapacity+extra; i++ {
 		l.Push(&RequestLogEntry{TS: time.Now(), Method: "POST", Path: "/v1/x", Status: 200, Kind: LogKindOK})
@@ -21,11 +23,11 @@ func TestRequestLogRingEviction(t *testing.T) {
 	if len(entries) != requestLogCapacity {
 		t.Fatalf("读端应恒为容量 %d, got %d", requestLogCapacity, len(entries))
 	}
-	if entries[0].Seq != requestLogCapacity+extra {
-		t.Fatalf("最新条目应为 seq %d, got %d", requestLogCapacity+extra, entries[0].Seq)
+	if entries[0].Seq != base+requestLogCapacity+extra {
+		t.Fatalf("最新条目应为 seq %d, got %d", base+requestLogCapacity+extra, entries[0].Seq)
 	}
-	if entries[len(entries)-1].Seq != uint64(extra+1) {
-		t.Fatalf("最旧保留应为 seq %d, got %d", extra+1, entries[len(entries)-1].Seq)
+	if entries[len(entries)-1].Seq != base+uint64(extra+1) {
+		t.Fatalf("最旧保留应为 seq %d, got %d", base+extra+1, entries[len(entries)-1].Seq)
 	}
 	for i := 1; i < len(entries); i++ {
 		if entries[i].Seq != entries[i-1].Seq-1 {
@@ -40,23 +42,25 @@ func TestRequestLogRingEviction(t *testing.T) {
 
 func TestRequestLogSnapshotLimitSince(t *testing.T) {
 	l := NewRequestLog()
+	// 复审 2026-09-07 F8：Seq 基准 = UnixNano（跨进程单调），断言取相对基准
+	base := l.seq.Load()
 	for i := 0; i < 10; i++ {
 		l.Push(&RequestLogEntry{Path: fmt.Sprintf("/p%d", i)})
 	}
 	// limit 截断（新→旧）
-	if got := l.Snapshot(3, 0); len(got) != 3 || got[0].Seq != 10 || got[2].Seq != 8 {
+	if got := l.Snapshot(3, 0); len(got) != 3 || got[0].Seq != base+10 || got[2].Seq != base+8 {
 		t.Fatalf("limit=3 应取最新 3 条: %+v", got)
 	}
-	// since 增量游标：只取 seq>7
-	if got := l.Snapshot(0, 7); len(got) != 3 || got[0].Seq != 10 || got[2].Seq != 8 {
-		t.Fatalf("since=7 应只含 seq 8..10: %+v", got)
+	// since 增量游标：只取 seq>base+7
+	if got := l.Snapshot(0, base+7); len(got) != 3 || got[0].Seq != base+10 || got[2].Seq != base+8 {
+		t.Fatalf("since=base+7 应只含 seq base+8..base+10: %+v", got)
 	}
 	// limit<=0 按容量取全部
 	if got := l.Snapshot(0, 0); len(got) != 10 {
 		t.Fatalf("limit=0 应取全部: %d", len(got))
 	}
 	// since 超过最新 seq → 空（前端轮询无新增时的常态）
-	if got := l.Snapshot(0, 99); len(got) != 0 {
+	if got := l.Snapshot(0, base+99); len(got) != 0 {
 		t.Fatalf("since 超前应为空: %+v", got)
 	}
 }
@@ -135,12 +139,13 @@ func TestHandlerReqLogOKAndIncrementalSince(t *testing.T) {
 	if e.Kind != LogKindOK || e.Status != 200 || e.Account != "acc1" || e.Model != "codely-flash" {
 		t.Fatalf("entry 不符: %+v", e)
 	}
-	if e.Method != "POST" || e.Path != "/v1/chat/completions" || e.Seq != 2 || e.DurationMs < 0 {
+	// 复审 2026-09-07 F8：Seq 为纳秒纪元基准，断言取两条间的相对关系（第二条 = 第一条+1）
+	if e.Method != "POST" || e.Path != "/v1/chat/completions" || e.Seq != entries[1].Seq+1 || e.DurationMs < 0 {
 		t.Fatalf("基础字段不符: %+v", e)
 	}
-	// since=1：只回第二条（seq 2）
-	if got, _, _ := h.RecentRequests(10, 1); len(got) != 1 || got[0].Seq != 2 {
-		t.Fatalf("since=1 应只含 seq 2: %+v", got)
+	// since=第一条的 seq：只回第二条（增量游标语义不变）
+	if got, _, _ := h.RecentRequests(10, entries[1].Seq); len(got) != 1 || got[0].Seq != entries[0].Seq {
+		t.Fatalf("since=首条 seq 应只含次条: %+v", got)
 	}
 }
 

@@ -53,6 +53,23 @@ func (b *Balancer) OnAccountRemoved(slug string) {
 	_ = saveConfig(snap)
 }
 
+// OnAccountSaved 同 slug 重登保存成功后的联动（复审 2026-09-07 F7/F10）：
+// 重登复用池内旧 AccountState——旧凭据失败的密钥负缓存（keyFailAt）不清除，会在凭据
+// 已修好后仍 fail-fast ≤keyFailTTL 的 502；SaveAccountAutoSlug 不传 reloader 时池可能
+// 缺号，借此补齐（syncPool 只补缺不覆盖既有状态）。锁序 r.mu（调用方 saveAccountLocked
+// 持有）→ b.mu → st.mu，与 ReloadPool 同向无环。
+func (b *Balancer) OnAccountSaved(slug string) {
+	b.syncPool()
+	st := b.state(slug)
+	if st == nil {
+		return
+	}
+	st.mu.Lock()
+	st.keyFailAt = 0
+	st.keyFailErr = ""
+	st.mu.Unlock()
+}
+
 // Preheat 启动预热（性能审计 P3）：为池内未禁用账号预热 sk- 密钥（key 文件命中零网络；
 // 缺失才走刷新链，失败无害）与 quota 快照（仅 LB 开启且 quota-first 时；否则冷启动首个
 // 请求会在 Pick 内串行吃满 30s×N 段的刷新链）。有界并发；阻塞调用方（main 以 goroutine 启动）。

@@ -450,6 +450,14 @@ func CredFingerprint(creds *oauth.Creds) string {
 // Go 用依赖注入接口（PoolReloader）解耦，见 GO_PORT.md §17.9。
 type PoolReloader interface{ ReloadPool() }
 
+// OnAccountSaved 任意账号凭据保存成功后的回调（slug 已定名、凭据文件与注册表均已提交）。
+// 复审 2026-09-07 F7/F10：同 slug 重登会复用 balancer 池内的旧 AccountState——其密钥
+// 负缓存（keyFailAt）与池缺号状态都基于旧凭据，保存方必须在此清信号/补池。account 不能
+// import balancer（会成环），经此倒置依赖由 main 接线（同 oauth.OnGlobalRefreshed 模式）。
+// 未注入时无操作。注意：回调在 r.mu 持有期间触发（saveAccountLocked 为锁内主体），
+// 实现方须沿用既有锁序 r.mu → b.mu → st.mu，不得反向加锁。
+var OnAccountSaved func(slug string)
+
 // SaveAccount 保存账号。activate 同时设为当前激活账号。
 func (r *Registry) SaveAccount(name string, creds *oauth.Creds, activate bool, pool PoolReloader) (slug string, savedAt string, err error) {
 	r.mu.Lock()
@@ -505,6 +513,10 @@ func (r *Registry) saveAccountLocked(slug string, creds *oauth.Creds, activate b
 	}
 	if pool != nil {
 		pool.ReloadPool()
+	}
+	// 复审 2026-09-07 F7：保存成功触发联动钩子（清重登账号的密钥负缓存/补池）
+	if OnAccountSaved != nil {
+		OnAccountSaved(slug)
 	}
 	return slug, ts.UTC().Format(time.RFC3339), nil
 }

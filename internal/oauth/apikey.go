@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -263,7 +265,7 @@ func ProbeBackends(aliases []string, opts ProbeOptions) []BackendProbeResult {
 
 	results := make([]BackendProbeResult, len(aliases))
 	next := 0
-	var mu sync.Mutex
+	var mu sync.Mutex // 仅护 next 游标分配
 
 	var wg sync.WaitGroup
 	for i := 0; i < concurrency; i++ {
@@ -278,38 +280,50 @@ func ProbeBackends(aliases []string, opts ProbeOptions) []BackendProbeResult {
 				if idx >= len(aliases) {
 					return
 				}
-				alias := aliases[idx]
-				seen := map[string]int{} // backend -> count
-				var lastErr string
-				for s := 0; s < samples; s++ {
-					backend, err := probeOnce(alias, b, direct, opts.APIKey, sessionID)
-					if err != nil {
-						lastErr = err.Error()
-					} else if backend != "" {
-						seen[backend]++
+				// 复审 2026-09-07 F12：per-alias recover——外层（models_handlers）的 recover
+				// 管不到本函数内部的嵌套 goroutine，探测路径 panic 会崩全进程（优化轮批次 2
+				// 堵的就是这类洞，此处是漏网点）。恢复后该 alias 记为错误结果，其余照常。
+				// results[idx] 的写入（正常与 recover 两路）均不取 mu：槽位由持 idx 的
+				// worker 独占写、wg.Wait() 前无并发读，idx 独占性即屏障；且若 panic 发生在
+				// mu 临界区内锁未被释放，取 mu 自救反而自死锁——results 写入因此不依赖 mu。
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("[oauth] 探测 %s panic 恢复: %v\n%s", aliases[idx], r, debug.Stack())
+							results[idx] = BackendProbeResult{Alias: aliases[idx], Error: fmt.Sprintf("探测 panic 恢复: %v", r)}
+						}
+					}()
+					alias := aliases[idx]
+					seen := map[string]int{} // backend -> count
+					var lastErr string
+					for s := 0; s < samples; s++ {
+						backend, err := probeOnce(alias, b, direct, opts.APIKey, sessionID)
+						if err != nil {
+							lastErr = err.Error()
+						} else if backend != "" {
+							seen[backend]++
+						}
+						time.Sleep(120 * time.Millisecond)
 					}
-					time.Sleep(120 * time.Millisecond)
-				}
-				// 取出现次数最多的后端
-				best := ""
-				bestCount := 0
-				for bk, cnt := range seen {
-					if cnt > bestCount {
-						best = bk
-						bestCount = cnt
+					// 取出现次数最多的后端
+					best := ""
+					bestCount := 0
+					for bk, cnt := range seen {
+						if cnt > bestCount {
+							best = bk
+							bestCount = cnt
+						}
 					}
-				}
-				mu.Lock()
-				if best != "" {
-					w, input := resolveBackendMeta(best)
-					results[idx] = BackendProbeResult{Alias: alias, Backend: best, ContextWindow: w, Input: input}
-				} else {
-					if lastErr == "" {
-						lastErr = "无法确定真实后端"
+					if best != "" {
+						w, input := resolveBackendMeta(best)
+						results[idx] = BackendProbeResult{Alias: alias, Backend: best, ContextWindow: w, Input: input}
+					} else {
+						if lastErr == "" {
+							lastErr = "无法确定真实后端"
+						}
+						results[idx] = BackendProbeResult{Alias: alias, Error: lastErr}
 					}
-					results[idx] = BackendProbeResult{Alias: alias, Error: lastErr}
-				}
-				mu.Unlock()
+				}()
 			}
 		}()
 	}
@@ -318,7 +332,9 @@ func ProbeBackends(aliases []string, opts ProbeOptions) []BackendProbeResult {
 }
 
 // probeOnce 发一个最小请求探测单个 alias 的真实后端名（resp.model）。
-func probeOnce(alias, base string, direct bool, apiKey, sessionID string) (string, error) {
+// 包级 var 仅为测试缝（复审 2026-09-07 F12：注入 panic 验证 per-alias recover），
+// 生产路径视作常量函数，勿在运行时替换。
+var probeOnce = func(alias, base string, direct bool, apiKey, sessionID string) (string, error) {
 	body := map[string]any{
 		"model":                alias,
 		"messages":             []map[string]string{{"role": "user", "content": "验证"}},

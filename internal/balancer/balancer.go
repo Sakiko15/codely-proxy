@@ -128,6 +128,17 @@ func (b *Balancer) state(slug string) *AccountState {
 	return b.pool[slug]
 }
 
+// AccountAPIKey 取指定账号的 sk- 密钥（完整 内存→文件→singleflight 刷新链路）。
+// 供 WebUI 模型探测使用：探测必须走与转发同源的取 key 路径——直读 key 文件会绕过
+// "过期前刷新"，陈旧 key 会造成探测假性 401（勿改为读文件）。
+func (b *Balancer) AccountAPIKey(slug string) (string, error) {
+	st := b.state(slug)
+	if st == nil {
+		return "", fmt.Errorf("账号 [%s] 不存在", slug)
+	}
+	return st.GetAPIKey()
+}
+
 // getAvailableCandidates 获取当前有效可用账号（排除禁用/冷却/已排除）。对标 getAvailableCandidates。
 // 仅由 Pick 调用（其入口已 syncPool），不再重复同步（性能审计 P2c）。
 func (b *Balancer) getAvailableCandidates(excluded map[string]bool) []*AccountState {

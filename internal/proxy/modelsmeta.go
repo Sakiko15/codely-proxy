@@ -23,6 +23,16 @@ var modelAliasContextWindow = map[string]int{
 	"codely-basic": 1048576,
 }
 
+// ModelContextWindows 返回 alias→真实上下文窗口静态表的拷贝（WebUI 模型页共用的
+// 单一数据源；后端名/模态等实测知识不在此表，只来自探测结果）。
+func ModelContextWindows() map[string]int {
+	out := make(map[string]int, len(modelAliasContextWindow))
+	for k, v := range modelAliasContextWindow {
+		out[k] = v
+	}
+	return out
+}
+
 // OverrideModelsMeta 覆写 GET /v1/models 200 响应中的虚标 max_model_len。仅改动表中
 // alias 且已携带该字段的条目（最小干预：修虚标，不新增字段）；解析失败/无 data/无命中
 // 原样返回（可能同一切片）。

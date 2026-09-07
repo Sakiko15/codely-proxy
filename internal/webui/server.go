@@ -30,6 +30,10 @@ type Server struct {
 	Logger   *log.Logger
 	// ProxyUpstream 用于 /healthz 展示。
 	ProxyUpstream string
+	// ProbeBase 模型探测直连 base（默认空 = 直连上游网关；测试注入 mock）。
+	ProbeBase string
+	// modelProbe 模型探测共享状态（models_handlers.go：结果缓存 10min + 防重入 409）。
+	modelProbe modelProbeState
 	// TrustProxy 为 true 时登录限速分桶取 X-Forwarded-For（CODELY_TRUST_PROXY=1，
 	// 反代部署形态；逻辑审查 P2）。默认 false = 用 RemoteAddr，不可伪造。
 	TrustProxy bool
@@ -72,6 +76,9 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/balancer/config", admin(s.handleBalancerConfig))
 	mux.HandleFunc("GET /api/security/status", admin(s.handleSecurityStatus))
 	mux.HandleFunc("POST /api/security/config", admin(s.handleSecurityConfig))
+	mux.HandleFunc("GET /api/logs", admin(s.handleAPILogs))
+	mux.HandleFunc("GET /api/models", admin(s.handleAPIModels))
+	mux.HandleFunc("POST /api/models/probe", admin(s.handleAPIModelsProbe))
 
 	// --- 健康检查（无需登录，供监控；超时兜底防慢客户端钉住 goroutine，稳定性审计 F7） ---
 	mux.Handle("GET /healthz", http.TimeoutHandler(http.HandlerFunc(s.handleHealthz), 10*time.Second, `{"ok":false,"error":"timeout"}`))

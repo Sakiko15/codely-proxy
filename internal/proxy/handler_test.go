@@ -394,3 +394,49 @@ func TestHandlerSSEFlushPerEvent(t *testing.T) {
 		t.Fatalf("SSE 应逐事件 Flush（≥4：1 头部 + 3 事件），got %d", rw.flushes)
 	}
 }
+func TestHandlerImageBlockEarlyReject(t *testing.T) {
+	// 2026-09-07 实测新增：/messages 图片块早拒——上游 Anthropic 端点图片链路整体损坏
+	//（base64/url 源→500，image_url→静默丢图），代理给明确 400 替代含混 500。
+	h, _, _, cleanup := buildHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("图片块请求不应到达上游")
+	})
+	defer cleanup()
+
+	body := `{"model":"codely-vl","max_tokens":100,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}},{"type":"text","text":"这是什么"}]}]}`
+	rw := doReq(t, h, "POST", "/v1/messages", body, nil)
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("图片块应早拒 400, got %d: %s", rw.Code, rw.Body.String())
+	}
+	// Anthropic 错误形状（路径含 /messages）
+	var j struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &j); err != nil {
+		t.Fatalf("错误体应为 JSON: %v", err)
+	}
+	if j.Type != "error" || j.Error.Type != "invalid_request_error" {
+		t.Fatalf("应为 Anthropic 形状 invalid_request_error, got: %s", rw.Body.String())
+	}
+	if !strings.Contains(j.Error.Message, "/v1/chat/completions") {
+		t.Fatalf("错误信息应指引 OpenAI 端点: %s", j.Error.Message)
+	}
+}
+
+func TestHandlerImageBlockNotRejectedOnChatPath(t *testing.T) {
+	// image 块只在 /messages 早拒；/chat/completions 走 OpenAI 格式，上游可用
+	h, _, _, cleanup := buildHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	})
+	defer cleanup()
+
+	body := `{"model":"codely-vl","max_tokens":100,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,aGk="}}]}]}`
+	rw := doReq(t, h, "POST", "/v1/chat/completions", body, nil)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("chat 路径不应拒图片, got %d: %s", rw.Code, rw.Body.String())
+	}
+}

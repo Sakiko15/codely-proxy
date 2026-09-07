@@ -429,3 +429,26 @@ func TestNumbersPreservedOnZeroCopy(t *testing.T) {
 		t.Fatalf("应零拷贝且字节不变: changed=%v out=%s", changed, payload)
 	}
 }
+func TestHasImageBlocks(t *testing.T) {
+	cases := []struct {
+		name   string
+		path   string
+		body   string
+		want   bool
+	}{
+		{"base64图片块", "/v1/messages", `{"model":"m","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}},{"type":"text","text":"这是什么"}]}]}`, true},
+		{"url源图片块", "/v1/messages", `{"model":"m","messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]}]}`, true},
+		{"tool_result内嵌图片", "/v1/messages", `{"model":"m","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}}]}]}]}`, true},
+		{"纯文本但正文提及image", "/v1/messages", `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"describe this image"}]}]}`, false},
+		{"string content", "/v1/messages", `{"model":"m","messages":[{"role":"user","content":"plain"}]}`, false},
+		{"OpenAI端点不适用", "/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}}]}]}`, false},
+		{"畸形body", "/v1/messages", `{not-json`, false},
+		{"空body", "/v1/messages", ``, false},
+		{"无image预检未命中", "/v1/messages", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, false},
+	}
+	for _, c := range cases {
+		if got := HasImageBlocks(c.path, []byte(c.body)); got != c.want {
+			t.Errorf("%s: HasImageBlocks = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

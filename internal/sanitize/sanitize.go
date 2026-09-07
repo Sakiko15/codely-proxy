@@ -313,6 +313,67 @@ func TransformBody(urlPath string, body []byte, sessionID string) (payload []byt
 	return out, model, true
 }
 
+// HasImageBlocks 检测 /messages 请求体是否携带图片块（message content 数组中的
+// `type:"image"` 块，含 tool_result 内嵌 content 数组）。
+//
+// 背景（2026-09-07 线上实测）：上游 Anthropic 兼容端点对图片整体不可用——
+//   - Anthropic base64 / url 源 image 块 → 上游 500「图片输入格式/解析错误」；
+//   - 改写为 OpenAI image_url 块 → 上游 200 但静默丢图（模型答"看不到图"）；
+//   - 根因：/v1/messages 侧 codely-vl 连纯文本都路由到纯文本 GLM 部署（glm-5.3-flash），
+//     与 /v1/chat/completions 侧（→ qwen3.5 视觉，实测返回正确颜色）不同源。
+// 代理翻译桥救不了路由，故检出即由 proxy 层给明确 400 并指引走 OpenAI 端点（分支 B）。
+//
+// 廉价预检 `"image"` 子串：误报（正文提及 image 一词）只多一次解码，无害。
+func HasImageBlocks(urlPath string, body []byte) bool {
+	if len(body) == 0 || !strings.Contains(urlPath, "/messages") {
+		return false
+	}
+	if !bytes.Contains(body, []byte(`"image"`)) {
+		return false
+	}
+	var j struct {
+		Messages []struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal(body, &j) != nil {
+		return false
+	}
+	for _, m := range j.Messages {
+		if contentHasImage(m.Content) {
+			return true
+		}
+	}
+	return false
+}
+
+// contentHasImage 检查单个 content（块数组）是否含 image 块（递归 tool_result 内嵌 content）。
+func contentHasImage(content json.RawMessage) bool {
+	if len(content) == 0 {
+		return false
+	}
+	var blocks []json.RawMessage
+	if json.Unmarshal(content, &blocks) != nil {
+		return false // string 形态/非数组：无块可言
+	}
+	for _, br := range blocks {
+		var probe struct {
+			Type    string          `json:"type"`
+			Content json.RawMessage `json:"content"` // tool_result 的内嵌 content 数组
+		}
+		if json.Unmarshal(br, &probe) != nil {
+			continue
+		}
+		if probe.Type == "image" {
+			return true
+		}
+		if probe.Type == "tool_result" && contentHasImage(probe.Content) {
+			return true
+		}
+	}
+	return false
+}
+
 // rawOf 序列化为 RawMessage（本包输入均为内置类型，不会失败；失败时以 null 占位防写入 nil）。
 func rawOf(v any) json.RawMessage {
 	b, err := json.Marshal(v)

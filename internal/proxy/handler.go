@@ -18,6 +18,7 @@ import (
 	"codely-proxy/internal/account"
 	"codely-proxy/internal/balancer"
 	"codely-proxy/internal/security"
+	"codely-proxy/internal/sanitize"
 	"codely-proxy/internal/sseguard"
 )
 
@@ -155,6 +156,20 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 			h.logf("proxy", "%s %s -> 401 (API Key 鉴权未通过)", req.Method, req.URL.Path)
 		}
 		WriteError(rw, req, http.StatusUnauthorized, "Incorrect API key provided.", "invalid_api_key")
+		return
+	}
+
+	// 1.5 /messages 图片块早拒（审查记录外·2026-09-07 实测新增）：上游 Anthropic 兼容端点
+	// 图片链路整体损坏（base64/url 源→500「图片输入格式/解析错误」，image_url 形态→静默丢图，
+	// 根因是该端点把 codely-vl 路由到纯文本 GLM 部署），翻译桥救不了路由——这里给明确 400
+	// 并指引走 OpenAI 端点，替代上游含混 500（视觉请求照旧走 /v1/chat/completions + image_url）。
+	if sanitize.HasImageBlocks(req.URL.Path, body) {
+		if !isProbe {
+			h.logf("proxy", "%s %s -> 400 (图片块在 Anthropic 端点不可用，见 HasImageBlocks 注释)", req.Method, req.URL.Path)
+		}
+		WriteError(rw, req, http.StatusBadRequest,
+			"image input is not supported on the Anthropic endpoint (upstream limitation); use /v1/chat/completions with image_url for vision",
+			"invalid_request_error")
 		return
 	}
 

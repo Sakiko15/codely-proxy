@@ -891,6 +891,7 @@ dsh 场景下它写 `~/.dsh/settings.yaml` + 插件装配——**VPS 网关不�
 - **`?beta=1` 精确路径** `[增强·偏离 JS]`：JS `includes("/messages")` 子串匹配会误伤 `/v1/messages/*` 子路径（如 count_tokens）；Go 版仅对路径恰为 `/v1/messages` 时注入。
 - **sseguard 宽松匹配与多块闭合** `[增强]`：事件 type 容忍 JSON 冒号后空白（上游 LiteLLM 为 Python，`json.dumps` 默认带空格，精确子串匹配会漏判而误合成）、`data:` 后空格可选；开放块按集合跟踪，断流时升序全部闭合（合成字节不变，`TestAnthropicSynthesizedBytesGolden` 字节级钉死）。上游 `error` 事件后仅补 `message_stop`，不再合成假 `end_turn`/`output_tokens:0`（有意偏离 JS：失败不应被美化成正常结束）。
 - **SSE 逐事件 Flush** `[增强]`：`flushWriter` 每次写入后立即 Flush，避免 Go http ~4KB 缓冲攒批小事件（§19.2-3）。
+- **`/messages` 图片块早拒** `[增强·2026-09-07 实测新增]`：上游 Anthropic 兼容端点图片链路整体损坏——Anthropic base64/url 源 image 块 → 500「图片输入格式/解析错误」；改写为 OpenAI image_url 块 → 200 但**静默丢图**；根因是 `/v1/messages` 侧 codely-vl 连纯文本都路由到纯文本 GLM 部署（`glm-5.3-flash`），与 `/v1/chat/completions` 侧（→ qwen3.5 视觉，实测正确识别）不同源，翻译桥救不了路由。代理在鉴权后检出 image 块（含 tool_result 内嵌 content）即早拒 `400 invalid_request_error` 并指引走 OpenAI 端点（`sanitize.HasImageBlocks`）。
 
 ### 19.4 WebUI（美观 + 实用）
 

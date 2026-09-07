@@ -218,6 +218,7 @@ type FlexContent struct {
 | 违禁文本清洗（`x-anthropic-billing-header` / `you are claude code`） | **仅 `system` 字段**（string 或 []block 的 text） | JS 版对全部 messages 也做 → **移植收紧为只 system**（PROTOCOL.md §2.2 实测只扫 system） |
 | 历史 thinking 块剔除 | `messages[]` 中 role=assistant 且 content 为数组 | 剔除 `thinking`/`redacted_thinking`；过滤后仅 1 个 text 块 → 折叠为 content=string；否则留数组（空则 `""`） |
 | model 提取 | 顶层 `model` | 原样取出用于日志/错误判定，**不修改** |
+| 图片块早拒（`HasImageBlocks`） | `/messages` 路径请求，message content 数组含 `type:"image"` 块（含 tool_result 内嵌） | **2026-09-07 实测新增**：上游 Anthropic 端点图片链路整体损坏（base64/url→500；image_url→静默丢图；codely-vl 在该端点路由到纯文本 GLM 部署），代理鉴权后早拒 400 并指引走 `/v1/chat/completions`；OpenAI 端点 image_url 不受影响 |
 
 ---
 

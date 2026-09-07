@@ -73,7 +73,6 @@ var dataPrefix = []byte("data:")
 // 优化轮 2026-09-07：trim 模式逐行热路径的包级常量——writeLine/writeDataLine/isEventLine
 // 的换行与前缀参数不再逐行分配（调用方只读，禁止改写内容）。
 var (
-	newlineByte     = []byte{'\n'}
 	dataLinePrefix  = []byte("data: ")
 	eventLinePrefix = []byte("event:")
 )
@@ -407,11 +406,13 @@ func (g *AnthropicGuard) synthStopSeq(w io.Writer, hit string) error {
 }
 
 // writeLine 原样写回一行（trim 模式透传路径；补回换行）。
+// 复审 2026-09-07：行与换行合并为单次 Write——包裹层 flushWriter 逐 Write flush，
+// 拆两次写会让停词流每行多付一次 flush/syscall（每行一次小分配换掉，输出字节不变）。
 func writeLine(w io.Writer, line []byte) error {
-	if _, err := w.Write(line); err != nil {
-		return err
-	}
-	_, err := w.Write(newlineByte)
+	b := make([]byte, 0, len(line)+1)
+	b = append(b, line...)
+	b = append(b, '\n')
+	_, err := w.Write(b)
 	return err
 }
 
@@ -450,8 +451,26 @@ func (g *AnthropicGuard) Finish(w io.Writer) error {
 		return nil // trim 模式已合成收尾，不重复
 	}
 	if len(g.lineBuffer) > 0 {
-		g.scan(g.lineBuffer)
-		g.lineBuffer = nil
+		if g.stops != nil {
+			// 复审 2026-09-07：trim 模式的残留半行从未写给客户端——不能只 scan（仅记
+			// 状态不发字节），否则截断的 message_stop 行会置位 sawMessageStop 而客户端
+			// 永远收不到，Finish 再跳过合成收尾 → 客户端挂死。走 trimLine 补发（与透传
+			// 模式"字节已先写"对齐）；畸形行经解析失败兜底原样写出，不会误置状态。
+			err := g.trimLine(g.lineBuffer, w)
+			g.lineBuffer = nil
+			if err != nil {
+				return err
+			}
+			if g.done {
+				// 残留 text_delta 命中停词：synthStopSeq 已合成完整收尾（块闭合/
+				// message_delta/message_stop 齐备），下方补发逻辑必须跳过防重复
+				return nil
+			}
+		} else {
+			// 透传模式：字节已在 Write 时先发给客户端，此处仅补状态供下方合成判定
+			g.scan(g.lineBuffer)
+			g.lineBuffer = nil
+		}
 	}
 	// trim 模式：冲出待定区文本（天然结束但残留在 holdback 的尾部；透传模式为空转 no-op）
 	if err := g.flushPend(w); err != nil {
@@ -575,6 +594,15 @@ func (g *OpenAIGuard) writeTrim(p []byte, w io.Writer) error {
 func (g *OpenAIGuard) trimLine(line []byte, w io.Writer) error {
 	trimmed := bytes.TrimSpace(line)
 	if isDoneLine(trimmed) {
+		// 复审 2026-09-07：[DONE] 前先冲出待定文本——上游无终止 chunk 直接 [DONE] 时，
+		// holdback 文本必须先于 [DONE] 发出，否则会滞留到 Finish 在 [DONE] 之后补发
+		if len(g.pend) > 0 {
+			b, _ := json.Marshal(string(g.pend))
+			if _, err := fmt.Fprintf(w, openAIFlushChunkFmt, b); err != nil {
+				return err
+			}
+			g.pend = g.pend[:0]
+		}
 		g.sawDone = true
 		return writeLine(w, line)
 	}
@@ -612,6 +640,17 @@ func (g *OpenAIGuard) trimChunk(line, data []byte, w io.Writer) error {
 		s := string(g.pend)
 		if i, _ := findStop(s, g.stops); i >= 0 {
 			return g.emitHit(data, s[:i], w)
+		}
+		// 复审 2026-09-07：终止 chunk 携带 content（如 content:"" + finish_reason:"stop"）
+		// 也必须先冲出待定文本——否则滞留到 Finish 在 [DONE] 之后补发（与下方无 content
+		// 分支同语义）
+		if hasFinish {
+			held := string(g.pend)
+			g.pend = g.pend[:0]
+			if out, ok := rewriteChunk(data, held, false); ok {
+				return writeDataLine(w, out)
+			}
+			return writeLine(w, line)
 		}
 		if keep := g.maxStopRunes - 1; len(g.pend) > keep {
 			flush := string(g.pend[:len(g.pend)-keep])
@@ -661,11 +700,14 @@ func (g *OpenAIGuard) emitHit(data []byte, prefix string, w io.Writer) error {
 }
 
 // writeDataLine 把（可能已改写的）data 载荷按 SSE data 行写出（补回 `data: ` 前缀）。
+// 复审 2026-09-07：前缀/载荷/换行合并为单次 Write（理由同 writeLine）。
 func writeDataLine(w io.Writer, data []byte) error {
-	if _, err := w.Write(dataLinePrefix); err != nil {
-		return err
-	}
-	return writeLine(w, data)
+	b := make([]byte, 0, len(dataLinePrefix)+len(data)+1)
+	b = append(b, dataLinePrefix...)
+	b = append(b, data...)
+	b = append(b, '\n')
+	_, err := w.Write(b)
+	return err
 }
 
 // isDoneLine 判断一行（可含首尾空白）是否为 [DONE] 标记。
@@ -685,12 +727,25 @@ func (g *OpenAIGuard) Finish(w io.Writer) error {
 		g.buf = nil
 		return nil // 已合成 [DONE]，不重复
 	}
-	// 残留行缓冲里也可能有 [DONE]
+	// 残留行缓冲：透传模式字节已先写，仅补状态；trim 模式残留从未发出，走 trimLine
+	// 补发（复审 2026-09-07：只置 sawDone 不写字节会让客户端收不到任何 [DONE]；
+	// 残留末 chunk 也会被整行丢弃）
 	if len(g.buf) > 0 {
-		if isDoneLine(g.buf) {
-			g.sawDone = true
+		if g.stops != nil {
+			err := g.trimLine(g.buf, w)
+			g.buf = nil
+			if err != nil {
+				return err
+			}
+			if g.done {
+				return nil // 残留 chunk 触发停词命中：emitHit 已写出 [DONE]
+			}
+		} else {
+			if isDoneLine(g.buf) {
+				g.sawDone = true
+			}
+			g.buf = nil
 		}
-		g.buf = nil
 	}
 	// trim 模式：异常 EOF（无终止 chunk）时冲出待定文本——兜底 chunk 无 id/created，
 	// 仅此降级路径出现（openAIFlushChunkFmt 注释）

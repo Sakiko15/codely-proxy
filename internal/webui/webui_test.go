@@ -293,6 +293,7 @@ func TestWebUIAssetsExist(t *testing.T) {
 		"assets/api.js", "assets/poller.js", "assets/router.js", "assets/ui.js",
 		"assets/icons.js", "assets/main.js",
 		"pages/overview.js", "pages/accounts.js", "pages/balancer.js", "pages/keys.js",
+		"pages/models.js", "pages/logs.js",
 	} {
 		if _, ok := staticAssets[name]; !ok {
 			t.Fatalf("预载资源缺失: %s", name)

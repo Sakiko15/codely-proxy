@@ -10,14 +10,18 @@ import { page as overview } from '../pages/overview.js';
 import { page as accounts } from '../pages/accounts.js';
 import { page as balancer } from '../pages/balancer.js';
 import { page as keys } from '../pages/keys.js';
+import { page as models } from '../pages/models.js';
+import { page as logs } from '../pages/logs.js';
 
-/* ---- 导航注册表（C5 增 models/logs 两项） ---- */
+/* ---- 导航注册表 ---- */
 
 const NAV = [
   { route: 'overview', label: '总览', icon: 'gauge' },
   { route: 'accounts', label: '账号', icon: 'users' },
   { route: 'balancer', label: '负载均衡', icon: 'layers' },
   { route: 'keys', label: 'API Keys', icon: 'key' },
+  { route: 'models', label: '模型', icon: 'cpu' },
+  { route: 'logs', label: '日志', icon: 'list' },
 ];
 
 function buildNav() {
@@ -43,6 +47,8 @@ registerRoute('overview', overview);
 registerRoute('accounts', accounts);
 registerRoute('balancer', balancer);
 registerRoute('keys', keys);
+registerRoute('models', models);
+registerRoute('logs', logs);
 
 /* ---- 主题：三态循环 auto → light → dark → auto ---- */
 

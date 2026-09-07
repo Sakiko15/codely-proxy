@@ -3,6 +3,8 @@ package balancer
 
 import (
 	"fmt"
+	"log"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -17,7 +19,7 @@ type Balancer struct {
 	mu      sync.Mutex
 	pool    map[string]*AccountState
 	config  Config
-	rrIndex atomic.Uint64 // round-robin 游标（§17.10：不再跨子集共享，见 pickQuotaTier）
+	rrIndex atomic.Uint64 // round-robin 游标（共享计数器 + 逐子集取模，§17.10：子集变化时仍均匀，见 pickQuotaTier）
 }
 
 // NewBalancer 创建调度器（同步当前账号注册表）。
@@ -83,10 +85,19 @@ func (b *Balancer) Preheat() {
 		go func() {
 			defer wg.Done()
 			for s := range next {
-				_, _ = s.GetAPIKey()
-				if preheatQuota {
-					s.FetchQuota(false) // 冷缓存会同步拉一轮，后台执行
-				}
+				func() {
+					// 优化轮 2026-09-07：recover 必须在 per-item 闭包内——放 worker 顶层时
+					// 单项 panic 会杀死 worker，生产者 next<-s 永久阻塞，Preheat 整体挂死
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("[balancer] ⚠️ 预热任务 panic 恢复（%s）: %v\n%s", s.Slug, r, debug.Stack())
+						}
+					}()
+					_, _ = s.GetAPIKey()
+					if preheatQuota {
+						s.FetchQuota(false) // 冷缓存会同步拉一轮，后台执行
+					}
+				}()
 			}
 		}()
 	}
@@ -101,8 +112,10 @@ func (b *Balancer) Preheat() {
 // 审查记录 2026-09-07 P2-I：NewAccountState 的构造（读/生成会话）留在 b.mu 内——保证
 // 单次构造与 Pick 的阻塞语义不变；新会话的 .session 落盘在释放 b.mu 后补做（锁内不做磁盘 IO）。
 func (b *Balancer) syncPool() {
-	b.mu.Lock()
+	// 优化轮 2026-09-07：ListSlugs 外提到 b.mu 之外——注册表自带 slugsMu 且返回私有
+	// 副本，b.mu→slugsMu 锁序边消失（锁序更简）；TOCTOU 微窗口由每请求 syncPool 自愈
 	slugs := b.reg.ListSlugs()
+	b.mu.Lock()
 	var created []*AccountState
 	for _, slug := range slugs {
 		if _, ok := b.pool[slug]; !ok {
@@ -251,6 +264,14 @@ func (b *Balancer) Pick(preferredSlug string, excluded map[string]bool) (*Accoun
 			wg.Add(1)
 			go func(i int, c *AccountState) {
 				defer wg.Done()
+				// 优化轮 2026-09-07：panic 兜底——单 worker 单项，panic 展开时上方
+				// defer wg.Done() 仍执行（不死者锁）；infos[i] 保持零值 → 该账号按
+				// 0 额度降权，安全有界退化
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[balancer] ⚠️ 额度探测 panic 恢复（%s）: %v\n%s", c.Slug, r, debug.Stack())
+					}
+				}()
 				q := c.FetchQuota(false) // 缓存优先，后台刷新
 				infos[i] = quotaInfo{acc: c, dailyRemaining: q.DailyRemaining(), billingRemain: q.BillingRemaining()}
 			}(i, c)

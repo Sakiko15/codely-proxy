@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -94,6 +95,13 @@ func main() {
 
 	// 启动预热（性能审计 P3）：后台补 key 文件缓存与 quota 快照，消除重启后首个请求的长尾
 	go func() {
+		// panic 兜底（优化轮 2026-09-07）：任一 goroutine panic 未捕获 = 全进程退出、
+		// 掐断所有在途 SSE——预热崩溃不应有此杀伤力
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Printf("[init] ❌ 预热 goroutine panic 恢复: %v\n%s", r, debug.Stack())
+			}
+		}()
 		b.Preheat()
 		if n := len(reg.ListSlugs()); n > 0 {
 			logger.Printf("[init] 账号池预热完成（%d 账号）", n)

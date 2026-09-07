@@ -11,6 +11,7 @@ package webui
 
 import (
 	"net/http"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -108,6 +109,15 @@ func (s *Server) handleAPIModelsProbe(rw http.ResponseWriter, req *http.Request)
 	sort.Strings(aliases)
 	go func() {
 		defer s.modelProbe.probing.Store(false)
+		// panic 兜底（优化轮 2026-09-07）：probing 复位由上方 defer 保证（panic 展开必然
+		// 执行），recover 保进程存活；注册在其后，LIFO 先捕获 panic 再执行复位
+		defer func() {
+			if r := recover(); r != nil {
+				if s.Logger != nil {
+					s.Logger.Printf("[models] ❌ 模型探测 panic 恢复: %v\n%s", r, debug.Stack())
+				}
+			}
+		}()
 		results := oauth.ProbeBackends(aliases, oauth.ProbeOptions{APIKey: key, Base: s.ProbeBase})
 		s.modelProbe.mu.Lock()
 		s.modelProbe.results = results

@@ -20,6 +20,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +49,13 @@ const cooldownDuration = 5 * time.Minute
 
 // quotaCacheTTL 配额缓存刷新间隔（对标 JS isStale 30s）。
 const quotaCacheTTL = 30 * time.Second
+
+// quotaRetryBackoff quota 后台刷新失败退避窗口（优化轮 2026-09-07：quotaCacheTTL 的 1/3）。
+// 缓存长期 stale 时（上游持续故障），原实现以 ≈ 请求率的频率向上游发 usage/summary。
+const quotaRetryBackoff = 10 * time.Second
+
+// keyFailTTL 密钥刷新失败负缓存时长（优化轮 2026-09-07，审查记录 P3-9 转修）。
+const keyFailTTL = 30 * time.Second
 
 // Config 负载均衡配置（balancer.json，PROTOCOL_SCHEMA.md §5）。
 type Config struct {
@@ -154,11 +162,14 @@ type AccountState struct {
 	mu             sync.Mutex
 	apiKey         string
 	sessionID      string
-	sessionDirty   bool // initSession 新生成（尚未落盘）标记，审查记录 2026-09-07 P2-I
+	sessionDirty   bool   // initSession 新生成（尚未落盘）标记，审查记录 2026-09-07 P2-I
 	cooldownUntil  time.Time
 	cooldownReason string
 	quotaCacheTs   int64
 	quotaCacheData *QuotaSnapshot
+	quotaAttemptAt int64  // 最近一次 quota 上游尝试时刻（UnixMilli，优化轮 2026-09-07 退避用）
+	keyFailAt      int64  // 密钥刷新失败时刻（UnixMilli，负缓存；0=无）
+	keyFailErr     string // 密钥刷新失败原因（负缓存命中时回给调用方）
 	metrics        Metrics
 	keyFlight      singleflight.Group
 	quotaFlight    singleflight.Group // 后台 quota 刷新去重（TTL 过期瞬间并发请求只刷一次）
@@ -258,6 +269,17 @@ func (s *AccountState) GetAPIKey() (string, error) {
 			return k, nil
 		}
 	}
+	// 负缓存 fail-fast（优化轮 2026-09-07，P3-9 转修）：凭据坏掉时原实现每请求都轰上游
+	// refresh。门在文件检查之后（外部新写的 key 文件可击穿负缓存）、RefreshAPIKey 之前；
+	// RefreshAPIKey 本身不加门（KindRetryKey 的显式刷新必须直达上游）。
+	// handler 对 GetAPIKey 错误的既有处置（MarkFailure + 漂移下一账号）照常成立。
+	s.mu.Lock()
+	if s.keyFailAt != 0 && time.Since(time.UnixMilli(s.keyFailAt)) < keyFailTTL {
+		err := fmt.Errorf("密钥刷新 %v 内已失败（负缓存）: %s", keyFailTTL, s.keyFailErr)
+		s.mu.Unlock()
+		return "", err
+	}
+	s.mu.Unlock()
 	return s.RefreshAPIKey()
 }
 
@@ -288,10 +310,20 @@ func (s *AccountState) RefreshAPIKey() (string, error) {
 			s.persistCreds(updated)
 		}
 		if err != nil {
+			// 负缓存唯一记录点（优化轮 2026-09-07）：仅 FetchAPIKey 失败处记录——
+			// creds==nil 不记（同名 slug 重登复用 AccountState 实例，记了会钉住重登
+			// 最长 keyFailTTL）；RefreshCreds 失败不单独记（携旧凭据继续 FetchAPIKey，
+			// 失败汇聚于此）
+			s.mu.Lock()
+			s.keyFailAt = time.Now().UnixMilli()
+			s.keyFailErr = err.Error()
+			s.mu.Unlock()
 			return "", err
 		}
 		s.mu.Lock()
 		s.apiKey = key
+		s.keyFailAt = 0 // 成功清负缓存（与 apiKey 赋值同临界区）
+		s.keyFailErr = ""
 		s.mu.Unlock()
 		// 写回 accounts/<slug>.key
 		keyFile := filepath.Join(account.AccountsDir, s.Slug+".key")
@@ -321,6 +353,13 @@ func (s *AccountState) RefreshCreds(creds *oauth.Creds) (*oauth.Creds, error) {
 
 // persistCreds 把刷新后的账号凭据写回 accounts/<slug>.json（不激活、不触发 ReloadPool，避免死锁）。
 func (s *AccountState) persistCreds(creds *oauth.Creds) {
+	// 入口无条件清密钥负缓存（优化轮 2026-09-07）：persistCreds 无返回值（错误仅日志），
+	// "落盘成功"不可探测——凭据轮换被上游接受即视为可清信号，覆盖 doFetch 401 刷新
+	// 重试的自愈场景（同一次 RefreshAPIKey 内后续 FetchAPIKey 失败会立刻重新记录）。
+	s.mu.Lock()
+	s.keyFailAt = 0
+	s.keyFailErr = ""
+	s.mu.Unlock()
 	// SyncRotatedCreds 只回写注册表现存账号（审查记录 2026-09-07 P2-G）：删除与在途轮换
 	// 竞态时不得把已删账号写回 index/凭据文件（旧 SaveAccount(false) 是无条件 upsert）
 	if err := s.registry.SyncRotatedCreds(s.Slug, creds); err != nil {
@@ -352,6 +391,11 @@ func (s *AccountState) FetchQuota(force bool) *QuotaSnapshot {
 	s.mu.Unlock()
 
 	doFetch := func() *QuotaSnapshot {
+		// 记录本次上游尝试时刻（优化轮 2026-09-07，退避窗口起点；force 失败也推进——
+		// 刚试过就不该再被重复 spawn 轰炸）
+		s.mu.Lock()
+		s.quotaAttemptAt = time.Now().UnixMilli()
+		s.mu.Unlock()
 		// 用外层锁内快照的 cache，而非直读 s.quotaCacheData——后台 goroutine 无锁读会构成数据竞争
 		creds := s.registry.LoadAccountCreds(s.Slug)
 		if creds == nil || creds.AccessToken == "" {
@@ -386,14 +430,29 @@ func (s *AccountState) FetchQuota(force bool) *QuotaSnapshot {
 	// 1. 有缓存且非强制 → 立即返回缓存（< 1ms 纯内存），后台异步刷新
 	if hasCache && !force {
 		if isStale {
-			// single-flight 去重：TTL 过期瞬间的并发请求只起一个后台刷新（否则并发 refresh 轮换竞争）
-			go func() {
-				_, _, _ = s.quotaFlight.Do("quota", func() (any, error) {
-					// 复审 P2：返回真实快照而非 (nil, nil)——合并进来的冷启动/force
-					// 调用方对 v.(*QuotaSnapshot) 断言，nil 接口会 panic
-					return doFetch(), nil
-				})
-			}()
+			// 退避门限（优化轮 2026-09-07）：quotaRetryBackoff 窗口内的重复 spawn 一律
+			// 跳过——上游持续故障时缓存永久 stale，原实现会以 ≈ 请求率的频率打上游。
+			// 仅此后台 spawn 分支受限：force/冷启动同步路径直达上游（显式动作不受限）。
+			s.mu.Lock()
+			blocked := time.Since(time.UnixMilli(s.quotaAttemptAt)) < quotaRetryBackoff
+			s.mu.Unlock()
+			if !blocked {
+				// single-flight 去重：TTL 过期瞬间的并发请求只起一个后台刷新（否则并发 refresh 轮换竞争）
+				go func() {
+					// panic 兜底（优化轮 2026-09-07）：singleflight 的 doCall 在完成
+					// wg.Done/map 清理后会无条件重抛 panic，必须在此捕获，防崩掉全进程
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("[balancer] ⚠️ quota 后台刷新 panic 恢复（%s）: %v\n%s", s.Slug, r, debug.Stack())
+						}
+					}()
+					_, _, _ = s.quotaFlight.Do("quota", func() (any, error) {
+						// 复审 P2：返回真实快照而非 (nil, nil)——合并进来的冷启动/force
+						// 调用方对 v.(*QuotaSnapshot) 断言，nil 接口会 panic
+						return doFetch(), nil
+					})
+				}()
+			}
 		}
 		return cache
 	}

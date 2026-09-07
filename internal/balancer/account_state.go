@@ -154,6 +154,7 @@ type AccountState struct {
 	mu             sync.Mutex
 	apiKey         string
 	sessionID      string
+	sessionDirty   bool // initSession 新生成（尚未落盘）标记，审查记录 2026-09-07 P2-I
 	cooldownUntil  time.Time
 	cooldownReason string
 	quotaCacheTs   int64
@@ -164,7 +165,7 @@ type AccountState struct {
 	refreshFlight  singleflight.Group // 按账号凭据刷新去重（refresh 轮换式返回，并发会互相作废）
 }
 
-// NewAccountState 创建账号运行时状态（初始化会话）。
+// NewAccountState 创建账号运行时状态（读/生成会话，不写盘——见 initSession）。
 func NewAccountState(slug string, reg *account.Registry) *AccountState {
 	s := &AccountState{Slug: slug, registry: reg}
 	s.initSession()
@@ -172,7 +173,10 @@ func NewAccountState(slug string, reg *account.Registry) *AccountState {
 }
 
 // initSession 会话 UUID（对标 balancer.js AccountState.initSession：
-// 优先读 accounts/<slug>.session 文件的持久化会话；否则生成并写回）。
+// 优先读 accounts/<slug>.session 文件的持久化会话；否则生成）。
+// 审查记录 2026-09-07 P2-I：此处只读/生成、**不写盘**——本构造在 syncPool 持 b.mu（常伴
+// r.mu）期间进行，锁内做磁盘 IO 会拖住 Pick 的全体调用方；落盘由 ensureSessionPersisted
+// 在构造方释放锁后补做。
 func (s *AccountState) initSession() {
 	sessionFile := filepath.Join(account.AccountsDir, s.Slug+".session")
 	if data, err := os.ReadFile(sessionFile); err == nil {
@@ -182,8 +186,26 @@ func (s *AccountState) initSession() {
 		}
 	}
 	s.sessionID = newUUID()
+	s.mu.Lock()
+	s.sessionDirty = true
+	s.mu.Unlock()
+}
+
+// ensureSessionPersisted 若 initSession 新生成了会话 UUID，补写 .session 文件落盘。
+// 必须在构造方释放 b.mu 之后调用（审查记录 2026-09-07 P2-I：写盘移出临界区）；
+// 写失败仅降级为会话不持久（重启后重开会话），不影响本进程内的会话粘性。
+func (s *AccountState) ensureSessionPersisted() {
+	s.mu.Lock()
+	dirty := s.sessionDirty
+	s.sessionDirty = false
+	sid := s.sessionID
+	s.mu.Unlock()
+	if !dirty {
+		return
+	}
+	sessionFile := filepath.Join(account.AccountsDir, s.Slug+".session")
 	_ = os.MkdirAll(account.AccountsDir, 0o755)
-	_ = atomicfile.Write(sessionFile, []byte(s.sessionID), 0o600)
+	_ = atomicfile.Write(sessionFile, []byte(sid), 0o600)
 }
 
 // SessionID 返回该账号的会话 UUID（线程安全读）。
@@ -299,12 +321,13 @@ func (s *AccountState) RefreshCreds(creds *oauth.Creds) (*oauth.Creds, error) {
 
 // persistCreds 把刷新后的账号凭据写回 accounts/<slug>.json（不激活、不触发 ReloadPool，避免死锁）。
 func (s *AccountState) persistCreds(creds *oauth.Creds) {
-	// SaveAccount 会 ReloadPool → 调 syncPool → 不碰已存在 account；此处用底层写，避免持锁回调
-	if _, _, err := s.registry.SaveAccount(s.Slug, creds, false, nil); err != nil {
+	// SyncRotatedCreds 只回写注册表现存账号（审查记录 2026-09-07 P2-G）：删除与在途轮换
+	// 竞态时不得把已删账号写回 index/凭据文件（旧 SaveAccount(false) 是无条件 upsert）
+	if err := s.registry.SyncRotatedCreds(s.Slug, creds); err != nil {
 		// 审查记录 P1-3：轮换式刷新下落盘失败 = 新 refresh_token 丢失（上游已作废旧 token），
 		// 账号将永久刷废——必须可见并重试一次，不得静默丢弃
 		log.Printf("[balancer] ⚠️ 账号 [%s] 轮换凭据落盘失败（将重试一次）: %v", s.Slug, err)
-		if _, _, err2 := s.registry.SaveAccount(s.Slug, creds, false, nil); err2 != nil {
+		if err2 := s.registry.SyncRotatedCreds(s.Slug, creds); err2 != nil {
 			log.Printf("[balancer] ❌ 账号 [%s] 轮换凭据落盘重试仍失败，下次刷新将失效（需重新登录）: %v", s.Slug, err2)
 		}
 	}

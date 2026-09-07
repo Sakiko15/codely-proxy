@@ -98,13 +98,17 @@ func (b *Balancer) Preheat() {
 }
 
 // syncPool 确保所有已注册账号在内存池中；清理已被物理删除的账号。对标 syncPool。
+// 审查记录 2026-09-07 P2-I：NewAccountState 的构造（读/生成会话）留在 b.mu 内——保证
+// 单次构造与 Pick 的阻塞语义不变；新会话的 .session 落盘在释放 b.mu 后补做（锁内不做磁盘 IO）。
 func (b *Balancer) syncPool() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	slugs := b.reg.ListSlugs()
+	var created []*AccountState
 	for _, slug := range slugs {
 		if _, ok := b.pool[slug]; !ok {
-			b.pool[slug] = NewAccountState(slug, b.reg)
+			st := NewAccountState(slug, b.reg)
+			b.pool[slug] = st
+			created = append(created, st)
 		}
 	}
 	for slug := range b.pool {
@@ -118,6 +122,10 @@ func (b *Balancer) syncPool() {
 		if !found {
 			delete(b.pool, slug)
 		}
+	}
+	b.mu.Unlock()
+	for _, st := range created {
+		st.ensureSessionPersisted()
 	}
 }
 

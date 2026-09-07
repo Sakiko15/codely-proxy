@@ -378,25 +378,15 @@ func (f *LoginFlow) complete(authorizationCode, suggestedName string) (*Account,
 	if base == "" {
 		base = Slugify(AutoName(creds))
 	}
-	f.mu.Lock()
-	idx := f.registry.currentIndex() // 锁内快照（避免与注册表写者并发的撕裂读）
-	finalSlug := base
-	n := 2
-	for {
-		existing, ok := idx.Accounts[finalSlug]
-		if !ok || (userId != "" && existing.UserID == userId) {
-			break // 未占用，或已占用且同属该 user（重建）；userId 为空串不得命中重建分支（P2：防静默覆盖）
-		}
-		finalSlug = fmt.Sprintf("%s-%d", base, n)
-		n++
-	}
-	f.mu.Unlock()
 
 	// 6. 保存 + 激活（以最终 slug 命名——Slugify 对已规范化名幂等）。
 	// 审查记录 P2 #12：SaveAccount(activate=true) 已完成激活语义（写 codely-creds.json +
 	// 提交 current），此前再调 ActivateAccount 属双重激活（预取冗余且其失败分支文案误导
 	// ——账号此时已是主账号）；sk- 密钥由代理下次请求经 GetAPIKey 的 singleflight 按需换取
-	slug, _, err := f.registry.SaveAccount(finalSlug, creds, true, nil)
+	// 审查记录 2026-09-07 P2-J：碰撞检查与保存合并进注册表锁（SaveAccountAutoSlug）——
+	// 此前检查在 f.mu、保存在 SaveAccount 自取的 r.mu，两锁之间的窗口里并发登录同名
+	// 会 check-then-act 双写
+	slug, _, err := f.registry.SaveAccountAutoSlug(base, creds, userId, nil)
 	if err != nil {
 		return nil, err
 	}

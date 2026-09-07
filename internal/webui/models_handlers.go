@@ -48,7 +48,8 @@ func (s *Server) handleAPIModels(rw http.ResponseWriter, req *http.Request) {
 	probedAt := s.modelProbe.probedAt
 	s.modelProbe.mu.Unlock()
 	byAlias := map[string]oauth.BackendProbeResult{}
-	if !probedAt.IsZero() && time.Since(probedAt) < modelProbeTTL {
+	fresh := !probedAt.IsZero() && time.Since(probedAt) < modelProbeTTL
+	if fresh {
 		for _, r := range results {
 			byAlias[r.Alias] = r
 		}
@@ -75,7 +76,9 @@ func (s *Server) handleAPIModels(rw http.ResponseWriter, req *http.Request) {
 		"models":  models,
 		"probing": s.modelProbe.probing.Load(),
 	}
-	if !probedAt.IsZero() {
+	if fresh {
+		// 审查记录 2026-09-07 P3-1：probedAt 与 probe 结果同门——超 TTL 一并置缺省，
+		// 防前端把过期时间戳误读为新鲜数据（结果体此前已按 TTL 过滤，仅此字段漏了）
 		resp["probedAt"] = probedAt.UTC().Format(time.RFC3339)
 	}
 	writeJSON(rw, http.StatusOK, resp)

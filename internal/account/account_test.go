@@ -50,21 +50,21 @@ func TestSlugify(t *testing.T) {
 		{"My Team", "my-team"},
 		{"Alice Studio", "alice-studio"},
 		{"aB_c.D-e", "ab_c.d-e"},
-		{"  你好  ", ""},             // 非 ASCII → 全替换为 '-' → 去空
-		{"!!!", ""},                 // 非法
-		{"", ""},                    // 空
-		{"-leading", "leading"},     // 去首尾 '-'
-		{"trailing-", "trailing"},   // 去首尾 '-'
-		{"a", "a"},                  // 单字符
+		{"  你好  ", ""},            // 非 ASCII → 全替换为 '-' → 去空
+		{"!!!", ""},               // 非法
+		{"", ""},                  // 空
+		{"-leading", "leading"},   // 去首尾 '-'
+		{"trailing-", "trailing"}, // 去首尾 '-'
+		{"a", "a"},                // 单字符
 		{"0123456789012345678901234567890123456789012345678901234567890123X", ""}, // 超 64
 		{"con", ""},  // 审查记录 P2 #13：Windows 保留设备名
 		{"COM1", ""}, // 大小写不敏感（Slugify 已 lowercase）
 		{"lpt9", ""},
 		{"nul", ""},
-		{"con.json", ""},   // 复审 P2：带点形态同样被 Win32 解析为设备
-		{"con.", ""},       // 复审 P2：尾点形态
-		{"con.work", ""},   // 复审 P2：任意扩展名
-		{"aux.tar.gz", ""}, // 复审 P2：首个点前 base 命中即可
+		{"con.json", ""},     // 复审 P2：带点形态同样被 Win32 解析为设备
+		{"con.", ""},         // 复审 P2：尾点形态
+		{"con.work", ""},     // 复审 P2：任意扩展名
+		{"aux.tar.gz", ""},   // 复审 P2：首个点前 base 命中即可
 		{"my.con", "my.con"}, // 点前 base 非保留名，不受影响
 		{"con-x", "con-x"},   // 非保留名不受影响
 	}
@@ -572,7 +572,9 @@ func TestRemoveAccountRemovesSidecarFiles(t *testing.T) {
 }
 
 func TestRemoveAccountFileRemoveWarn(t *testing.T) {
-	// 审查记录 P2 #15：主文件删除失败（占用/权限）并入 warning——半删除态不得静默
+	// 修订审查记录 2026-09-07 P2-G（原 P2 #15"removed 恒 true + warning"契约作废）：
+	// 主文件删不掉 → 删除未发生，index 回滚、removed=false（注册表与磁盘一致，重试即可）。
+	// 本例覆盖"删最后一个账号"（rest 为空）的回滚分支
 	r := setup(t)
 	if _, _, err := r.SaveAccount("a", fakeCreds("1", "A"), true, nil); err != nil {
 		t.Fatalf("SaveAccount: %v", err)
@@ -590,14 +592,14 @@ func TestRemoveAccountFileRemoveWarn(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(AccountsDir + "/a.json") })
 
 	removed, _, err := r.RemoveAccount("a", nil)
-	if !removed {
-		t.Fatalf("删除已成立，removed 不得为 false（谎报）")
+	if removed {
+		t.Fatalf("文件删不掉时删除未成立，不得谎报 removed=true")
 	}
 	if err == nil {
-		t.Fatalf("主文件删除失败应并入 warning")
+		t.Fatalf("文件删除失败应报错")
 	}
-	if got := r.GetCurrentName(); got == "a" {
-		t.Fatalf("index 中该账号应已移除")
+	if got := r.GetCurrentName(); got != "a" {
+		t.Fatalf("回滚后 Current 应仍为 a，got %q", got)
 	}
 }
 
@@ -968,5 +970,144 @@ func TestLoadIndexCorruptedFile(t *testing.T) {
 	idx := r.loadIndex()
 	if idx == nil || len(idx.Accounts) != 0 {
 		t.Fatalf("损坏 index 应返回空注册表, got %+v", idx)
+	}
+}
+
+// ------------- 审查记录 2026-09-07 批次 4（P2-G / P2-J / RemoveAccount 回滚） -------------
+
+// TestRemoveAccountRollbackOnCredsDeleteFailure（审查 2026-09-07 P2-G）：
+// 凭据文件删除失败（此处用"非空目录占位 <slug>.json"制造跨平台必败的 os.Remove）→
+// 删除未发生，index 提交必须回滚（removed=false、注册表保留该账号、Current 复原）。
+// 旧实现"removed 恒 true + 仅 warning"会让文件优先的 ReloadPool 复活已删账号。
+func TestRemoveAccountRollbackOnCredsDeleteFailure(t *testing.T) {
+	r := setup(t)
+	if _, _, err := r.SaveAccount("acc1", fakeCreds("u1", "T1"), true, nil); err != nil {
+		t.Fatalf("SaveAccount(acc1): %v", err)
+	}
+	if _, _, err := r.SaveAccount("acc2", fakeCreds("u2", "T2"), false, nil); err != nil {
+		t.Fatalf("SaveAccount(acc2): %v", err)
+	}
+	// 把 acc1.json 换成含内部文件的非空目录 → os.Remove 在所有平台必败
+	if err := os.Remove(accountFilePath("acc1")); err != nil {
+		t.Fatalf("移除凭据文件: %v", err)
+	}
+	if err := os.MkdirAll(accountFilePath("acc1"), 0o755); err != nil {
+		t.Fatalf("造目录: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(accountFilePath("acc1"), "inner"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("写内部文件: %v", err)
+	}
+
+	removed, next, err := r.RemoveAccount("acc1", noopPool{})
+	if removed {
+		t.Fatalf("文件删不掉时不得谎报 removed=true（next=%s err=%v）", next, err)
+	}
+	if err == nil {
+		t.Fatalf("文件删除失败应报错")
+	}
+
+	// index 必须回滚：acc1 仍在注册表且仍是 Current
+	var idx Index
+	data, readErr := os.ReadFile(IndexFile)
+	if readErr != nil {
+		t.Fatalf("读 index: %v", readErr)
+	}
+	if err := json.Unmarshal(data, &idx); err != nil {
+		t.Fatalf("解析 index: %v", err)
+	}
+	if _, ok := idx.Accounts["acc1"]; !ok {
+		t.Fatalf("回滚失败：acc1 应保留在注册表: %s", string(data))
+	}
+	if idx.Current != "acc1" {
+		t.Fatalf("回滚失败：Current 应复原为 acc1，got %q", idx.Current)
+	}
+	// 注册表内存视图一致（不因缓存脏读出现幽灵状态）
+	if name := r.GetCurrentName(); name != "acc1" {
+		t.Fatalf("GetCurrentName 应为 acc1，got %q", name)
+	}
+}
+
+// TestSyncRotatedCredsRefusesDeletedSlug（审查 2026-09-07 P2-G）：
+// 轮换回写对已删账号必须拒绝——不得把凭据文件/index 条目复活。
+func TestSyncRotatedCredsRefusesDeletedSlug(t *testing.T) {
+	r := setup(t)
+	if _, _, err := r.SaveAccount("acc1", fakeCreds("u1", "T1"), true, nil); err != nil {
+		t.Fatalf("SaveAccount: %v", err)
+	}
+	if _, _, err := r.RemoveAccount("acc1", noopPool{}); err != nil {
+		t.Fatalf("RemoveAccount: %v", err)
+	}
+
+	rotated := fakeCreds("u1", "T1")
+	rotated.RefreshToken = "ref-rotated"
+	if err := r.SyncRotatedCreds("acc1", rotated); err == nil {
+		t.Fatalf("已删账号的轮换回写应报错")
+	}
+	// 复活检查：凭据文件不得重建、index 不得出现该账号
+	if _, statErr := os.Stat(accountFilePath("acc1")); !os.IsNotExist(statErr) {
+		t.Fatalf("已删账号的凭据文件被复活")
+	}
+	var idx Index
+	data, err := os.ReadFile(IndexFile)
+	if err != nil {
+		t.Fatalf("读 index: %v", err)
+	}
+	if err := json.Unmarshal(data, &idx); err != nil {
+		t.Fatalf("解析 index: %v", err)
+	}
+	if _, ok := idx.Accounts["acc1"]; ok {
+		t.Fatalf("已删账号的 index 条目被复活: %s", string(data))
+	}
+	// 幂等再打一次（persistCreds 失败重试路径）同样拒绝
+	if err := r.SyncRotatedCreds("acc1", rotated); err == nil {
+		t.Fatalf("重试路径同样应报错")
+	}
+}
+
+// TestSyncRotatedCredsUpdatesExisting（审查 2026-09-07 P2-G 正向）：现存账号的轮换回写
+// 正常落盘并刷新注册表元信息。
+func TestSyncRotatedCredsUpdatesExisting(t *testing.T) {
+	r := setup(t)
+	if _, _, err := r.SaveAccount("acc1", fakeCreds("u1", "T1"), true, nil); err != nil {
+		t.Fatalf("SaveAccount: %v", err)
+	}
+	rotated := fakeCreds("u1", "T1")
+	rotated.RefreshToken = "ref-rotated"
+	if err := r.SyncRotatedCreds("acc1", rotated); err != nil {
+		t.Fatalf("SyncRotatedCreds: %v", err)
+	}
+	got := r.LoadAccountCreds("acc1")
+	if got == nil || got.RefreshToken != "ref-rotated" {
+		t.Fatalf("轮换凭据应落盘, got %+v", got)
+	}
+	if name := r.GetCurrentName(); name != "acc1" {
+		t.Fatalf("回写不得动 Current，got %q", name)
+	}
+}
+
+// TestSaveAccountAutoSlug（审查 2026-09-07 P2-J）：碰撞检查与保存同为注册表锁内原子操作。
+// 同名不同 user → -N 后缀；同名同 user（重建）→ 复用；user 为空串不命中重建分支。
+func TestSaveAccountAutoSlug(t *testing.T) {
+	r := setup(t)
+
+	s1, _, err := r.SaveAccountAutoSlug("team", fakeCreds("u1", "T1"), "u1", nil)
+	if err != nil || s1 != "team" {
+		t.Fatalf("首存应得 team, got %s err=%v", s1, err)
+	}
+	s2, _, err := r.SaveAccountAutoSlug("team", fakeCreds("u2", "T2"), "u2", nil)
+	if err != nil || s2 != "team-2" {
+		t.Fatalf("异 user 撞名应得 team-2, got %s err=%v", s2, err)
+	}
+	s3, _, err := r.SaveAccountAutoSlug("team", fakeCreds("u1", "T1"), "u1", nil)
+	if err != nil || s3 != "team" {
+		t.Fatalf("同 user 重建应复用 team, got %s err=%v", s3, err)
+	}
+	s4, _, err := r.SaveAccountAutoSlug("team", fakeCreds("u3", "T3"), "", nil)
+	if err != nil || s4 != "team-3" {
+		t.Fatalf("user 空串不得命中重建分支，应得 team-3, got %s err=%v", s4, err)
+	}
+	// 激活语义：AutoSlug 恒激活，Current 应为最后一次保存
+	if name := r.GetCurrentName(); name != s4 {
+		t.Fatalf("Current 应为 %s，got %q", s4, name)
 	}
 }

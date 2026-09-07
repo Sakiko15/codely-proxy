@@ -94,6 +94,13 @@ type Account struct {
 type Registry struct {
 	mu sync.Mutex
 
+	// index.json 的 mtime 校验缓存（审查记录 2026-09-07 P2-H：GetCurrentName/
+	// GetCurrentMeta 是每条 /v1 请求的热路径，此前每次 ReadFile+Unmarshal）。
+	// loadIndex 返回的是共享快照，**只读**；要改动必须先 cloneIndex。
+	idxCache *Index
+	idxMtime int64
+	idxHave  bool
+
 	// ListSlugs 的目录 mtime 缓存（性能审计 P2：每请求多次 ReadDir → 一次 stat）。
 	// ⚠️ 必须用独立锁而非 r.mu：SaveAccount/RemoveAccount 持 r.mu 期间会经
 	// ReloadPool → syncPool → ListSlugs 再入本方法（锁序 r.mu → b.mu → slugsMu，无反向）。
@@ -143,18 +150,52 @@ func writeJSON(path string, v any) error {
 	return atomicfile.Write(path, data, 0o600)
 }
 
-// loadIndex 读注册表（不存在返回空）。
+// loadIndex 读注册表（不存在返回空）。返回 mtime 校验的共享缓存快照，调用方**只读**；
+// 需要改动的写者（ensureLocked/SaveAccount/ActivateAccount/RemoveAccount）先 cloneIndex。
+// 缓存一致性：saveIndex 写后显式刷新（mtime 粒度粗，同 tick 双写会撞缓存）。
 func (r *Registry) loadIndex() *Index {
+	var mt int64
+	if st, err := os.Stat(IndexFile); err == nil {
+		mt = st.ModTime().UnixNano()
+	} else {
+		mt = -1 // 文件不存在
+	}
+	if r.idxHave && r.idxMtime == mt && r.idxCache != nil {
+		return r.idxCache
+	}
 	idx := &Index{Accounts: map[string]AccountIndexEntry{}}
 	readJSON(IndexFile, idx)
 	if idx.Accounts == nil {
 		idx.Accounts = map[string]AccountIndexEntry{}
 	}
+	r.idxCache = idx
+	r.idxMtime = mt
+	r.idxHave = true
 	return idx
 }
 
+// cloneIndex 深拷贝注册表快照（写者专用：loadIndex 返回共享缓存，直接改会污染后续读）。
+func cloneIndex(idx *Index) *Index {
+	cp := *idx
+	cp.Accounts = make(map[string]AccountIndexEntry, len(idx.Accounts))
+	for k, v := range idx.Accounts {
+		cp.Accounts[k] = v
+	}
+	return &cp
+}
+
 func (r *Registry) saveIndex(idx *Index) error {
-	return writeJSON(IndexFile, idx)
+	if err := writeJSON(IndexFile, idx); err != nil {
+		return err
+	}
+	// 写后显式刷新缓存：mtime 粒度可能吞掉同 tick 内的连续写，仅靠 stat 校验会读到旧值
+	cp := cloneIndex(idx)
+	r.idxCache = cp
+	if st, err := os.Stat(IndexFile); err == nil {
+		r.idxMtime = st.ModTime().UnixNano()
+	}
+	r.idxHave = true
+	return nil
 }
 
 // currentIndex 返回注册表快照（内部持 r.mu）。供 login flow 等同包调用方做碰撞检查，
@@ -255,11 +296,13 @@ func (r *Registry) ensureLocked() {
 	if len(idx.Accounts) > 0 {
 		return
 	}
+	// 走到导入分支会改动 idx → clone（loadIndex 是共享缓存，审查记录 2026-09-07 P2-H）
 	creds := oauth.LoadCreds()
 	if creds == nil {
 		return
 	}
 	name := AutoName(creds)
+	idx = cloneIndex(idx)
 	idx.Accounts[name] = metaFromCreds(creds, now())
 	idx.Current = name
 	_ = r.saveIndex(idx)
@@ -419,8 +462,16 @@ func (r *Registry) SaveAccount(name string, creds *oauth.Creds, activate bool, p
 	if slug == "" {
 		return "", "", errors.New("无法生成账号名")
 	}
-	r.ensureLocked() // 已持 r.mu（line 324），用无锁版避免死锁
-	idx := r.loadIndex()
+	return r.saveAccountLocked(slug, creds, activate, pool)
+}
+
+// saveAccountLocked 是 SaveAccount 的无锁主体（调用方必须已持 r.mu 且 slug 已定名）。
+// 抽取动机（审查记录 2026-09-07 P2-J）：登录 complete 的 slug 碰撞检查与保存必须同为
+// r.mu 临界区内的原子操作——此前检查（f.mu）与保存（SaveAccount 自取锁）之间锁已释放，
+// 并发登录同名会 check-then-act 双写。
+func (r *Registry) saveAccountLocked(slug string, creds *oauth.Creds, activate bool, pool PoolReloader) (string, string, error) {
+	r.ensureLocked() // 调用方已持 r.mu，用无锁版避免死锁
+	idx := cloneIndex(r.loadIndex())
 	prevCurrent := idx.Current
 	ts := time.Now()
 	// 写 accounts/<slug>.json（完整凭据）
@@ -456,6 +507,30 @@ func (r *Registry) SaveAccount(name string, creds *oauth.Creds, activate bool, p
 		pool.ReloadPool()
 	}
 	return slug, ts.UTC().Format(time.RFC3339), nil
+}
+
+// SaveAccountAutoSlug 在注册表锁内完成"碰撞检查 + 保存"的原子版本（登录 complete 专用，
+// 审查记录 2026-09-07 P2-J）。base 为期望名（内部再 Slugify 兜底）；同名槽位若属于同一
+// userID 视为重建、直接复用，否则追加 -N 后缀。userID 为空串时不命中重建分支（防静默覆盖）。
+func (r *Registry) SaveAccountAutoSlug(base string, creds *oauth.Creds, userID string, pool PoolReloader) (slug string, savedAt string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	baseSlug := Slugify(base)
+	if baseSlug == "" {
+		baseSlug = AutoName(creds)
+	}
+	finalSlug := baseSlug
+	n := 2
+	for {
+		existing, ok := r.loadIndex().Accounts[finalSlug]
+		if !ok || (userID != "" && existing.UserID == userID) {
+			break // 未占用，或已占用且同属该 user（重建）
+		}
+		finalSlug = fmt.Sprintf("%s-%d", baseSlug, n)
+		n++
+	}
+	return r.saveAccountLocked(finalSlug, creds, true, pool)
 }
 
 // restoreActivationLocked 把激活凭据回滚到 prevCurrent（SaveAccount 的 saveIndex 失败路径）。
@@ -547,6 +622,32 @@ func (r *Registry) SyncCredsByIdentity(creds *oauth.Creds) error {
 	return fmt.Errorf("未找到 user_id=%s 的账号，轮换凭据无法落盘", creds.UserID)
 }
 
+// SyncRotatedCreds 把轮换后的凭据回写到**已存在**账号的 per-slug 文件（池路径 persistCreds
+// 与激活预取共用）。与 SaveAccount(activate=false) 的差异：绝不无条件 upsert——账号若已被
+// 并发删除（注册表查无此 slug），轮换结果直接丢弃并报错，杜绝"复活窗口"（审查记录
+// 2026-09-07 P2-G：删除与在途轮换竞态时，旧路径会把 index 条目连同凭据文件写回）。
+func (r *Registry) SyncRotatedCreds(slug string, creds *oauth.Creds) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := Slugify(slug)
+	if s == "" {
+		return fmt.Errorf("非法账号名: %s", slug)
+	}
+	idx := r.loadIndex()
+	if _, ok := idx.Accounts[s]; !ok {
+		return fmt.Errorf("账号 %s 已不在注册表（并发删除？），跳过轮换凭据回写", s)
+	}
+	creds.SavedAt = time.Now().UTC().Format(time.RFC3339)
+	if err := writeJSON(accountFilePath(s), creds); err != nil {
+		return err
+	}
+	r.invalidateSlugsCache() // per-slug 文件可能由缺失变为存在（index 在而文件滞后的中间态）
+	// 同步注册表元信息（savedAt 刷新；身份字段不变，恒等替换）
+	cidx := cloneIndex(idx)
+	cidx.Accounts[s] = metaFromCreds(creds, now())
+	return r.saveIndex(cidx)
+}
+
 // LoadAccountCreds 读取某账号的完整凭据（不存在返回 nil）。对标 loadAccountCreds。
 func (r *Registry) LoadAccountCreds(name string) *oauth.Creds {
 	slug := Slugify(name)
@@ -582,7 +683,7 @@ func (r *Registry) ActivateAccount(name string, pool PoolReloader) (Account, str
 		r.mu.Unlock()
 		return Account{}, "", fmt.Errorf("账号不存在或凭据无效: %s（先在 WebUI 添加账号）", name)
 	}
-	idx := r.loadIndex()
+	idx := cloneIndex(r.loadIndex())
 	prevCurrent := idx.Current
 	idx.Accounts[slug] = metaFromCreds(creds, now())
 	// 删敏感缓存 + 写激活凭据 + 更新 current
@@ -611,8 +712,12 @@ func (r *Registry) ActivateAccount(name string, pool PoolReloader) (Account, str
 	updated, key, _ := oauth.FetchAPIKey(creds)
 	if updated != nil && updated.RefreshToken != creds.RefreshToken {
 		// 逻辑审查 P0：预取途中 401 刷新轮换了 refresh_token——激活态需同时回写
-		// accounts/<slug>.json 与 codely-creds.json（全局链路共用后者），best-effort
-		_, _, _ = r.SaveAccount(slug, updated, false, nil)
+		// accounts/<slug>.json 与 codely-creds.json（全局链路共用后者），best-effort。
+		// 用 SyncRotatedCreds 而非 SaveAccount：预取窗口（最长 30s+）内该账号可能已被
+		// 并发删除，不得借回写复活（审查记录 2026-09-07 P2-G）
+		if err := r.SyncRotatedCreds(slug, updated); err != nil {
+			log.Printf("[account] 预取轮换凭据回写 %s 跳过/失败: %v", slug, err)
+		}
 		// 审查记录 P1-2：回写激活文件前核验仍是当前账号——预取窗口（最长 30s+）内
 		// 已切换到其他账号时，旧账号的轮换结果不得覆盖新账号的激活凭据（串号且无自愈）
 		if r.GetCurrentName() == slug {
@@ -637,7 +742,7 @@ func (r *Registry) RemoveAccount(name string, pool PoolReloader) (removed bool, 
 	// 删除/更新注册表在锁内完成；级联激活（会重新取锁）放到锁外
 	r.mu.Lock()
 	slug := Slugify(name)
-	idx := r.loadIndex()
+	idx := cloneIndex(r.loadIndex())
 	if _, ok := idx.Accounts[slug]; !ok {
 		if _, statErr := os.Stat(accountFilePath(slug)); statErr != nil {
 			r.mu.Unlock()
@@ -645,6 +750,7 @@ func (r *Registry) RemoveAccount(name string, pool PoolReloader) (removed bool, 
 		}
 	}
 	wasCurrent := idx.Current == slug
+	removedMeta := idx.Accounts[slug] // 回滚用：凭据文件删除失败时恢复注册表条目
 	delete(idx.Accounts, slug)
 	rest := make([]string, 0, len(idx.Accounts))
 	for k := range idx.Accounts {
@@ -664,11 +770,24 @@ func (r *Registry) RemoveAccount(name string, pool PoolReloader) (removed bool, 
 		r.mu.Unlock()
 		return false, "", err
 	}
-	// 文件删除（index 已提交；失败不得静默——审查记录 P2 #15，并入 warning，removed 恒 true）
-	var removeWarn error
+	// 文件删除：凭据文件删不掉 → 删除未发生，回滚 index 提交并报错（removed=false）。
+	// 修订审查记录 2026-08-28 P2 #15 的"并入 warning、removed 恒 true"：文件优先的
+	// ReloadPool 会复活已删账号、在途轮换还会把 index 条目写回（复活窗口，审查
+	// 2026-09-07 P2-G）——回滚后注册表与磁盘一致（账号仍在），重试即可
 	if err := os.Remove(accountFilePath(slug)); err != nil && !os.IsNotExist(err) {
-		removeWarn = fmt.Errorf("账号文件删除失败: %v", err)
+		idx.Accounts[slug] = removedMeta
+		if wasCurrent {
+			idx.Current = slug
+		}
+		if serr := r.saveIndex(idx); serr != nil {
+			// 回滚也失败（磁盘故障）：index 已删而文件仍在的半删除态，显式暴露
+			r.mu.Unlock()
+			return false, "", fmt.Errorf("账号文件删除失败且回滚失败: %v / %v", err, serr)
+		}
+		r.mu.Unlock()
+		return false, "", fmt.Errorf("账号文件删除失败（注册表未变，可重试）: %v", err)
 	}
+	var removeWarn error
 	// 逻辑审查 P2：伴生文件一并清理——残留的 sk- key 会被同名重建的新账号静默复用
 	for _, side := range []string{slug + ".key", slug + ".session"} {
 		if err := os.Remove(filepath.Join(AccountsDir, side)); err != nil && !os.IsNotExist(err) && removeWarn == nil {

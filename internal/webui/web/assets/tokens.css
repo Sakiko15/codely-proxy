@@ -1,0 +1,95 @@
+/* 设计 token 全集（WebUI 重构 C4）：dark-first 低饱和控制台风。
+   组件样式只准取用这里的 token，禁止硬编码色值；[data-theme="light"] 为对等亮色集
+   （补齐旧版缺失的语义色底/遮罩/阴影档）。 */
+
+:root {
+  color-scheme: dark;
+
+  /* 背景层级：画布 → 卡面 → 卡面-2 → 内嵌 */
+  --bg-canvas: #0b0f17;
+  --bg-surface: #121927;
+  --bg-surface-2: #1a2333;
+  --bg-inset: #0d1320;
+
+  /* 边框 3 档 */
+  --border: #24304a;
+  --border-strong: #35426260;
+  --border-subtle: #1a2334;
+
+  /* 文本 4 档 */
+  --fg: #e7ecf5;
+  --fg-muted: #8d99b0;
+  --fg-faint: #5d6880;
+  --fg-on-accent: #ffffff;
+
+  /* 强调色 */
+  --accent: #4d8dfd;
+  --accent-hover: #6aa1ff;
+  --accent-subtle: rgba(77, 141, 253, 0.14);
+
+  /* 状态色：前景 + 低透明底 */
+  --success: #36d399;  --success-bg: rgba(54, 211, 153, 0.13);
+  --warning: #fbbd2e;  --warning-bg: rgba(251, 189, 46, 0.13);
+  --danger:  #f87272;  --danger-bg:  rgba(248, 114, 114, 0.13);
+  --info:    #3abdf8;  --info-bg:    rgba(58, 189, 248, 0.13);
+
+  /* 焦点 / 遮罩 / 阴影 */
+  --focus-ring: 0 0 0 3px rgba(77, 141, 253, 0.35);
+  --scrim: rgba(3, 7, 15, 0.72);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 6px 18px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 18px 44px rgba(0, 0, 0, 0.5);
+
+  /* 间距 4/8/12/16/24/32/48 */
+  --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px; --sp-4: 16px;
+  --sp-5: 24px; --sp-6: 32px; --sp-7: 48px;
+
+  /* 字号 + 表格数字 */
+  --fs-xs: 12px; --fs-sm: 13px; --fs-md: 14px; --fs-lg: 16px; --fs-xl: 18px;
+
+  /* 圆角 */
+  --radius-sm: 6px; --radius-md: 10px; --radius-lg: 14px; --radius-full: 999px;
+
+  /* 动效（只动 transform/opacity/color） */
+  --dur-fast: 120ms; --dur-base: 200ms; --dur-slow: 320ms;
+  --ease: cubic-bezier(0.33, 1, 0.68, 1);
+
+  /* 层级 */
+  --z-sticky: 10; --z-modal: 100; --z-toast: 200;
+
+  /* 布局 */
+  --sidebar-w: 220px; --rail-w: 56px; --content-w: 1100px;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  --bg-canvas: #f3f5f9;
+  --bg-surface: #ffffff;
+  --bg-surface-2: #edf0f6;
+  --bg-inset: #e8ecf3;
+
+  --border: #d9e0ec;
+  --border-strong: #b7c2d8;
+  --border-subtle: #e8ecf4;
+
+  --fg: #182238;
+  --fg-muted: #5b6880;
+  --fg-faint: #8b97ad;
+  --fg-on-accent: #ffffff;
+
+  --accent: #2563eb;
+  --accent-hover: #1d4fd7;
+  --accent-subtle: rgba(37, 99, 235, 0.10);
+
+  --success: #059669;  --success-bg: rgba(5, 150, 105, 0.10);
+  --warning: #b45309;  --warning-bg: rgba(180, 83, 9, 0.10);
+  --danger:  #dc2626;  --danger-bg:  rgba(220, 38, 38, 0.10);
+  --info:    #0369a1;  --info-bg:    rgba(3, 105, 161, 0.10);
+
+  --focus-ring: 0 0 0 3px rgba(37, 99, 235, 0.28);
+  --scrim: rgba(15, 23, 42, 0.45);
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.08);
+  --shadow-md: 0 6px 18px rgba(15, 23, 42, 0.10);
+  --shadow-lg: 0 18px 44px rgba(15, 23, 42, 0.16);
+}

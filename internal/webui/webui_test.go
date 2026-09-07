@@ -208,7 +208,7 @@ func TestIndexServed(t *testing.T) {
 	srv, cleanup := buildServer(t)
 	defer cleanup()
 	rw, _ := doJSON(t, srv, "GET", "/", "", "")
-	if rw.Code != 200 || !strings.Contains(rw.Body.String(), "Codely Bridge") {
+	if rw.Code != 200 || !strings.Contains(rw.Body.String(), "codely-proxy") {
 		t.Fatalf("index 应返回页面，got %d %s", rw.Code, rw.Body.String()[:min(50, rw.Body.Len())])
 	}
 }
@@ -271,36 +271,57 @@ func TestAuthGeneratedPassword(t *testing.T) {
 	}
 }
 
+// webSource 聚合全部预载静态资源文本（C4 重构后前端为多文件 ES modules，针刺
+// 需跨文件检查；遍历 staticAssets 同时证明各文件通过了预载白名单，防 go:embed
+// 静默排除（_/. 前缀）与未知扩展名 404）。
+func webSource(t *testing.T) string {
+	t.Helper()
+	var b strings.Builder
+	for name, f := range staticAssets {
+		b.WriteString("\n/* ==== " + name + " ==== */\n")
+		b.Write(f.data)
+	}
+	return b.String()
+}
+
+func TestWebUIAssetsExist(t *testing.T) {
+	// 资产存在性：核心文件必须通过预载白名单（go:embed 对 _/. 前缀静默排除，
+	// staticMIME 白名单外不服务——任一缺失运行时即 404，这里提前暴露）
+	for _, name := range []string{
+		"index.html",
+		"assets/theme.js", "assets/tokens.css", "assets/base.css", "assets/components.css",
+		"assets/api.js", "assets/poller.js", "assets/router.js", "assets/ui.js",
+		"assets/icons.js", "assets/main.js",
+		"pages/overview.js", "pages/accounts.js", "pages/balancer.js", "pages/keys.js",
+	} {
+		if _, ok := staticAssets[name]; !ok {
+			t.Fatalf("预载资源缺失: %s", name)
+		}
+	}
+}
+
 func TestWebUILoginURLCopyable(t *testing.T) {
 	// 逻辑审查：设备码登录的授权链接必须完整可见且可一键复制——
 	// 此前 URL 仅存在于 <a> 的 href 属性里（页面无文本展示、无复制按钮），
 	// 且 copyText 在非 HTTPS 部署下因 navigator.clipboard 缺失整体失效。
 	// 前端无自动化测试，以 embed 内容钉死复制能力防回归。
-	data, err := webFS.ReadFile("web/index.html")
-	if err != nil {
-		t.Fatalf("读取 embed: %v", err)
-	}
-	s := string(data)
+	s := webSource(t)
 	for _, needle := range []string{
-		"dev-url-text",     // 完整链接的可见展示区
-		"copyLoginUrl",     // 一键复制处理函数
-		"复制授权链接",       // 复制按钮
-		"execCommand",      // 非 HTTPS 降级复制
+		"dev-url-text",   // 完整链接的可见展示区
+		"复制授权链接",    // 复制按钮
+		"execCommand",    // 非 HTTPS 降级复制
+		"navigator.clipboard && window.isSecureContext", // 降级链前置条件
 		"verification_uri_complete",
 	} {
 		if !strings.Contains(s, needle) {
-			t.Fatalf("index.html 应包含 %q（登录链接复制能力回归）", needle)
+			t.Fatalf("静态资源应包含 %q（登录链接复制能力回归）", needle)
 		}
 	}
 }
 
 func TestWebUIFrontendStateFixes(t *testing.T) {
 	// 前端审查 F1-F7+S2：前端无自动化测试，以 embed 内容钉死关键修复标记防回归
-	data, err := webFS.ReadFile("web/index.html")
-	if err != nil {
-		t.Fatalf("读取 embed: %v", err)
-	}
-	s := string(data)
+	s := webSource(t)
 	for _, c := range []struct{ needle, why string }{
 		{"初始管理密码", "F1 首屏生成密码展示（登录弹窗内）"},
 		{"r.warning", "F2 删除结果 warning 透传"},
@@ -308,12 +329,13 @@ func TestWebUIFrontendStateFixes(t *testing.T) {
 		{"e.message === '未登录'", "F4 轮询会话过期终止"},
 		{"'/api/login'", "F6 登录 401 不触发 showLogin"},
 		{"备注名仅支持字母数字", "F7 备注名预校验"},
-		{"slug === 'index'", "P2 #34 备注名校验补全（index 保留字/长度上限）"},
+		{"=== 'index'", "P2 #34 备注名校验补全（index 保留字/长度上限）"},
 		{"/^https?:/i", "S2 授权链接 scheme 加固"},
 		{"加载失败", "F5 加载错误态"},
+		{"data-dirty", "轮询不覆写正在编辑的表单（脏检查）"},
 	} {
 		if !strings.Contains(s, c.needle) {
-			t.Fatalf("index.html 应包含 %q（%s 回归）", c.needle, c.why)
+			t.Fatalf("静态资源应包含 %q（%s 回归）", c.needle, c.why)
 		}
 	}
 }
@@ -321,18 +343,14 @@ func TestWebUIFrontendStateFixes(t *testing.T) {
 func TestWebUILoginPollFeedback(t *testing.T) {
 	// 登录轮询修复（授权后无限等待）：pending 分支必须消费后端 message
 	//（此前死文案"等待授权中"掩盖 slow_down/429），轮询为 setTimeout 链防在途叠加
-	data, err := webFS.ReadFile("web/index.html")
-	if err != nil {
-		t.Fatalf("读取 embed: %v", err)
-	}
-	s := string(data)
+	s := webSource(t)
 	for _, c := range []struct{ needle, why string }{
 		{"r.message || '等待授权中...'", "轮询 pending 显示真实原因"},
 		{"setTimeout(pollDevLogin", "轮询改为 setTimeout 链"},
 		{"clearTimeout(pollTimer)", "定时器清理用 clearTimeout"},
 	} {
 		if !strings.Contains(s, c.needle) {
-			t.Fatalf("index.html 应包含 %q（%s 回归）", c.needle, c.why)
+			t.Fatalf("静态资源应包含 %q（%s 回归）", c.needle, c.why)
 		}
 	}
 }

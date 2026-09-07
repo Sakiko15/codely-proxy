@@ -56,7 +56,7 @@ type ForwardResult struct {
 
 // Proxy 是转发器。
 type Proxy struct {
-	// UpstreamBase 上游 base URL（https://codely-litellm.tuanjie.cn/v1）。
+	// UpstreamBase 上游 base URL（https://codely-litellm.tuanjie.cn，host-only 不含 /v1）。
 	UpstreamBase string
 	// Client 复用连接池的 HTTP 客户端（keep-alive，对标 httpsAgent）。
 	Client *http.Client

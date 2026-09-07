@@ -43,8 +43,9 @@ type Config struct {
 	// KeepThinkingHistory 为 true 时保留 assistant 历史 thinking 块
 	//（KEEP_THINKING_HISTORY="1"/"true"；默认 false = 剔除，与 JS 一致，§19.3 [增强] 开关）。
 	KeepThinkingHistory bool
-	// TrustProxy 为 true 时登录限速的客户端 IP 取 X-Forwarded-For 首个地址
-	//（CODELY_TRUST_PROXY="1"/"true"；默认 false = 用 RemoteAddr，不可伪造，逻辑审查 P2）。
+	// TrustProxy 为 true 时登录限速的客户端 IP 取 X-Forwarded-For 最右地址
+	//（追加型反代把真实来源追加在末尾，最右段不可伪造；审查记录 P2 #28。
+	// CODELY_TRUST_PROXY="1"/"true"；默认 false = 用 RemoteAddr，不可伪造）。
 	TrustProxy bool
 }
 

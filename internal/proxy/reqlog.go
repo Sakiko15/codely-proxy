@@ -20,6 +20,7 @@ const (
 	LogKindError    = "error"    // 上游连接异常/全部账号失败 502
 	LogKindAuth     = "auth"     // 客户端 API key 鉴权未通过 401
 	LogKindRejected = "rejected" // 请求侧早拒（图片块 400 等）
+	LogKindAborted  = "aborted"  // 客户端断开中止（499 语义，非账号故障，审查记录 2026-09-07 P1-B）
 )
 
 // requestLogCapacity 环形容量：WebUI 日志页一屏足够，内存 ~百 KB 量级。

@@ -305,6 +305,17 @@ func (h *Handler) handle(ctx context.Context, rw *rwTracker, req *http.Request, 
 				return
 
 			case KindError:
+				// 客户端已断开（ESC 取消等）：ctx 取消会让 Client.Do 以错误返回，
+				// 这是断开的伴生结果而非账号/上游故障——绝不 MarkFailure（否则一次
+				// 中断会误标 1~3 个健康账号进 5min 冷却，单账号部署直接自锁）、
+				// 不 failover、不写 502（客户端已无人消费）。审查记录 2026-09-07 P1-B。
+				if ctx.Err() != nil {
+					if !isProbe {
+						h.logf("proxy", "[%s] 客户端已断开，中止重试（%v）", slug, ctx.Err())
+					}
+					logDone(LogKindAborted, slug, 499, r.Model, "客户端断开")
+					return
+				}
 				// 网络/上游错误：只在 headers 未发出时可 failover
 				lastErr = r.Err
 				if !isProbe {

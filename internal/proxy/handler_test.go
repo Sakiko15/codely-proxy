@@ -440,3 +440,47 @@ func TestHandlerImageBlockNotRejectedOnChatPath(t *testing.T) {
 		t.Fatalf("chat 路径不应拒图片, got %d: %s", rw.Code, rw.Body.String())
 	}
 }
+
+func TestHandlerClientAbortNotMarkFailure(t *testing.T) {
+	// 审查记录 2026-09-07 P1-B：客户端断开（ctx 取消）使 Client.Do 返回错误，
+	// 曾与真实上游故障一同归为 KindError → MarkFailure 误标健康账号进 5min 冷却
+	//（单账号部署一次 ESC 即自锁）。断开必须中止重试且不影响账号状态。
+	block := make(chan struct{})
+	h, _, _, cleanup := buildHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		<-block
+		// 不依赖 r.Context() 感知断连：handler 未读 body 时，服务端背景读会先吞掉
+		// 已缓冲的 body 字节，连接关闭探测不可靠（实测 ctx 恒不取消，srv.Close 死等）
+	})
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"codely-core","messages":[]}`))
+		rw := httptest.NewRecorder()
+		h.Handle(ctx, rw, req, []byte(`{"model":"codely-core","messages":[]}`))
+	}()
+	time.Sleep(50 * time.Millisecond) // 等请求到达上游并挂起
+	cancel()
+	<-done
+	close(block) // 放行上游 handler，让 cleanup 的 srv.Close() 能返回
+
+	st := h.Balancer.GetStatus()
+	if st.CoolingAccounts != 0 {
+		t.Fatalf("客户端断开不应冷却账号，got %d cooling", st.CoolingAccounts)
+	}
+	for _, a := range st.Accounts {
+		if a.Status != "active" {
+			t.Fatalf("账号 %s 应仍为 active，got %s", a.Slug, a.Status)
+		}
+	}
+	// 环形日志应记 aborted（499 语义）而非 error/502
+	entries := h.Log.Snapshot(10, 0)
+	if len(entries) != 1 {
+		t.Fatalf("应恰好一条日志，got %d", len(entries))
+	}
+	if entries[0].Kind != LogKindAborted {
+		t.Fatalf("客户端断开应记 %s，got %s (%d)", LogKindAborted, entries[0].Kind, entries[0].Status)
+	}
+}

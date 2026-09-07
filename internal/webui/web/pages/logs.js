@@ -33,6 +33,7 @@ export const page = {
     fullReload = true;
     lastSeq = 0;
     view = [];
+    kindFilter = ''; // 模块级过滤态随 mount 重置（审查记录 2026-09-07 P2-E：漏重置时下拉显示"全部"实际仍过滤）
     el.innerHTML =
       '<div class="page-head"><div><h1>请求日志</h1><div class="sub">最近请求（环形缓冲，按完成序）</div></div>' +
       '<div class="page-actions"><select class="input" id="log-kind">' +

@@ -29,7 +29,7 @@ Docker：多阶段 `Dockerfile`（golang:1.26-alpine → alpine:3.20，healthche
 
 入口 `cmd/codely-proxy/main.go`：`config.Load()`（env）→ flag 覆盖 → 依次调用 `account/oauth/balancer/security` 各包的 `SetDataDir`（**顺序敏感**，先于各 New* 构造）→ `atomicfile.CleanupTemp` 清扫 `*.tmp` 残留（数据目录与 `accounts/` 子目录各一次）→ 接线 oauth 钩子（`OnGlobalRefreshed = reg.SyncCurrentFromActivation`、`OnRotationRejected = reg.SyncCredsByIdentity`，全局刷新/轮换拒绝回同步到 per-slug 文件，勿断开）→ 构造注入 `Registry → Balancer → Security → Quota → LoginFlow → Proxy → Handler → WebUI` → 后台 `Preheat()` 预热 key 与额度快照。`http.Server` 的 `WriteTimeout: 0` 是刻意的（SSE 长流必需）；另有 ReadHeaderTimeout 10s / ReadTimeout 120s / IdleTimeout 90s，SIGTERM/SIGINT 15s 优雅退出、二次信号强制退出。
 
-路由集中在 `internal/webui/server.go` 的 `Routes()`：`/v1/*` → 代理 Handler；`/api/*` → WebUI 管理端（独立的 cookie 会话鉴权，与客户端 API key 是两套域）；`/healthz`；`go:embed` 单页静态 UI。admin API：账号 delete/switch、设备码登录 start/status/cancel、balancer/security 的 config+status、quota 查询——**无轮换/驱逐端点**。
+路由集中在 `internal/webui/server.go` 的 `Routes()`：`/v1/*` → 代理 Handler；`/api/*` → WebUI 管理端（独立的 cookie 会话鉴权，与客户端 API key 是两套域）；`/healthz`；`GET /{$}` 单页 shell + `GET /web/*` 静态资源（`static.go` 预载白名单 + 显式 MIME + sha256 ETag 协商 + CSP self-only）。admin API：账号 delete/switch、设备码登录 start/status/cancel、balancer/security 的 config+status、quota 查询、`GET /api/logs`（proxy 请求环形缓冲快照，`since` 游标增量）、`GET /api/models` + `POST /api/models/probe`（后端探测，显式管理员动作，前端确认框明示计费成本，**绝不自动触发**）——**无轮换/驱逐端点**。前端是多文件 ES modules（零依赖零构建链，`web/index.html` shell + `web/assets/*` + `web/pages/*` 六页，hash 路由），针刺测试（`webui_test.go`）以 `webSource` 聚合预载资源跨文件钉死前端修复契约，改前端后若测试挂优先核对契约语义而非删针刺。
 
 ### 代理请求生命周期
 

@@ -666,6 +666,60 @@ type SecurityStatus struct {
 > `/account/login/start` / `status` / `cancel` 响应：`{ok, login:{verification_uri_complete, user_code, expiresIn, interval}, name?}` /
 > `{ok, status: pending|authorized|denied|expired|error, account?, error?, message?}` / `{ok, status:"cancelled"}`。
 
+### 17.1 请求日志（`GET /api/logs`，WebUI 重构 C2/C5 新增）
+
+```go
+// GET /api/logs?limit=100&since=<seq> —— proxy 请求环形缓冲快照（每请求一条，最终结果）
+type LogsResponse struct {
+    OK      bool             `json:"ok"`
+    Entries []RequestLogEntry `json:"entries"` // 新→旧倒序
+    Total   uint64           `json:"total"`   // 入环累计（含已逐出）
+    Dropped uint64           `json:"dropped"` // 环满逐出条数
+}
+
+type RequestLogEntry struct {
+    Seq        uint64    `json:"seq"`                  // 完成序，单调递增；增量拉取游标
+    TS         time.Time `json:"ts"`                   // 请求开始时间
+    Method     string    `json:"method"`
+    Path       string    `json:"path"`
+    Model      string    `json:"model,omitempty"`
+    Account    string    `json:"account,omitempty"`    // 路由到的账号 slug
+    Status     int       `json:"status"`
+    Kind       string    `json:"kind"`                 // ok|quota|denied|error|auth|rejected
+    DurationMs int64     `json:"durationMs"`
+    Error      string    `json:"error,omitempty"`      // 截断 ≤256 字节的失败原因
+}
+```
+
+> `limit` 默认 100（>0 才生效），`since=<seq>` 只回比游标新的条目；`x-codely-probe: 1`
+> 的内部探测请求不入环。SSE 长流在流结束时才入环（实时性以完成序为准）。
+
+### 17.2 模型列表与后端探测（`GET /api/models`、`POST /api/models/probe`，C2/C5 新增）
+
+```go
+// GET /api/models —— alias+窗口 ← 代理静态映射表（proxy.ModelContextWindows，
+// 与 OverrideModelsMeta 同源）；backend/backendWindow/input ← 探测缓存（TTL 10min），未探测时省略
+type ModelsResponse struct {
+    OK      bool         `json:"ok"`
+    Probing bool         `json:"probing"`         // 探测进行中
+    ProbedAt string      `json:"probedAt,omitempty"` // RFC3339 UTC，最近一次成功探测
+    Models  []ModelInfo  `json:"models"`          // 按 alias 字典序
+}
+
+type ModelInfo struct {
+    Alias         string `json:"alias"`
+    ContextWindow int    `json:"contextWindow"`
+    Backend       string `json:"backend,omitempty"`       // 实际路由的后端名
+    BackendWindow int    `json:"backendWindow,omitempty"` // 后端实测窗口
+    Input         []string `json:"input,omitempty"`       // 输入模态
+    ProbeError    string `json:"probeError,omitempty"`
+}
+```
+
+> `POST /api/models/probe`：显式管理员动作（约 15 次真实计费请求，前端确认框明示，
+> **绝不自动触发**）。202 异步受理；进行中再调 409；无可用账号/取 key 失败 400。
+> key 走 `Balancer.AccountAPIKey`（内存→文件→singleflight 刷新完整链路，勿直读 key 文件）。
+
 ---
 
 ## 18. 覆盖核对（移植自检清单）

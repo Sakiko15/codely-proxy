@@ -78,8 +78,10 @@ codely-proxy/
   internal/config/                # 配置加载（env + args → Config）
     env.go                        #   PORT / BIND / DATA_DIR / WEBUI_USER / WEBUI_PASS / PROXY_API_KEY
   internal/logging/               # 标签化日志（stdout，对标 log(tag, msg)）
-  web/                            # 前端静态资源（构建时 go:embed）
-    index.html                    #   WebUI 单页（账号/配额/负载均衡/客户端 Key 管理）
+  web/                            # 前端静态资源（构建时 go:embed；重构后多文件 ES modules，见 §19.4）
+    index.html                    #   WebUI shell（侧边栏 + outlet + 弹窗挂载点）
+    assets/                       #   theme/tokens/base/components + api/poller/router/ui/icons/main
+    pages/                        #   overview/accounts/balancer/keys/models/logs 六页
   Dockerfile                      # 多阶段构建 → 单二进制
   docker-compose.yml              #   volume: ./data:/app/data
   test/
@@ -902,15 +904,15 @@ dsh 场景下它写 `~/.dsh/settings.yaml` + 插件装配——**VPS 网关不�
 - **`/v1/models` 虚标 `max_model_len` 覆写** `[增强·2026-09-07 实测新增]`：上游对 `codely-core` 声明 `max_model_len:1048576`（1M），真实后端是 128K 窗口的 `glm-5-fp8-128k`（PROTOCOL.md §4.0：窗口以 backend-probe 实测为准，上游声明不可信）。代理对 `GET /v1/models` 200 响应按 alias→真实窗口静态表覆写该字段（`proxy.OverrideModelsMeta`：core/vl=131072，flash/air/basic=1048576，值取自 `oauth.BackendMeta`）；仅覆写表中 alias 已携带该字段的条目（修虚标不新增字段），解析失败/无命中原样透传。上游若改 alias→后端映射需同步静态表。
 - **思考等级参数不生效与隐藏思考计费** `[已知限制·2026-09-07 实测，代理无法修复]`：全部思考控制参数被上游接受（不报 400）但对后端思考量**零调制**——OpenAI 侧 `reasoning_effort` minimal/low/medium/high 同题对比（minimal 三次复测 403/262/403 思考 token 反而最重度；codely-flash 上 minimal 148 vs high 139 同样无差异），GLM/Qwen 系 `enable_thinking:false` 也被忽略（仍输出 200 思考 token）；Anthropic 侧 `thinking:{enabled,budget_tokens}`/`{adaptive}`/`output_config.effort` 全形态同理，且思考**从不呈现**（无 `thinking_delta` 块）却**照常计费**（10 字回答 341 output_tokens）。客户端须自适应：① 不要依赖思考参数控制成本/时延；② GLM-5 系默认即混合推理，`max_tokens` 需留 ≥1.5k 余量给隐形思考，否则拿到空文本 + `stop_reason:max_tokens`；③ OpenAI 侧思考经 `reasoning_content` 可见（`completion_tokens_details.reasoning_tokens` 计数），Anthropic 侧完全不可见。
 
-### 19.4 WebUI（美观 + 实用）
+### 19.4 WebUI（美观 + 实用）——已实现（2026-09 重构，六页）
 
-- **形态**：单页应用（vanilla JS，**零外部请求**——字体/图标走系统栈/内联），`go:embed`；**暗/亮双主题**（跟随系统 + 手动切换）；响应式（移动可用）。
-- **页面结构**：
-  1. **总览**：活跃账号数、聚合每日赠送/充值余额（进度条）、冷却账号警示、配额快照。
-  2. **账号**：卡片列表（team/user/额度/池化开关/冷却/删除）、切换主账号、「添加账号」→ 设备码登录弹窗（验证链接+用户码+轮询状态）。
-  3. **负载均衡**：开关、模式（quota-first/round-robin）、每账号日额度/充值点数。
-  4. **API Keys**：客户端 Key 列表（脱敏）、增删、免密模式提示。
-  5. **模型**：`/v1/models` + 探测结果（alias → 真实后端 → 窗口/模态）。
-  6. **日志**（Step 2 可选）：最近请求过滤。
-- **交互**：Toast 反馈、加载/空/错误三态、聚焦页 15s 轮询、危险操作确认。
-- **实施**：加载 `frontend-design` skill 校准设计投入，再动手写页面前端。
+- **形态**：多文件 ES modules 单页应用（vanilla JS，**零外部请求、零构建链、零第三方依赖**——字体/图标走系统栈/内联 SVG），`go:embed` 递归嵌入 `internal/webui/web/`（shell `index.html` + `assets/` 11 文件 + `pages/` 6 文件）；静态服务显式 MIME 白名单 + sha256 ETag 协商缓存 + CSP self-only（`static.go`）。**暗/亮双主题**（auto/light/dark 三态，跟随系统 + localStorage，tokens.css 设计 token 全集）；响应式（≤1024px 图标栏、≤640px 底部 tabbar + 模态降级底部抽屉）。
+- **路由**：hash 路由 `#/{overview,accounts,balancer,keys,models,logs}`（`handleIndex` 只注册 `GET /{$}`，History API 深链接会 404，hash 零后端改动）；按页注册轮询加载器（默认 15s，setTimeout 链防在途叠加，`document.hidden` 暂停）。
+- **页面结构**（全部已实现）：
+  1. **总览**：活跃/冷却账号数统计卡、池聚合额度（数值）、冷却警示条、当前账号配额快照（进度条 + 强刷按钮）。
+  2. **账号**：列表 + 主激活切换/删除（自绘确认框）、「发起授权」→ 设备码登录弹窗（链接展示+复制降级链+用户码+轮询状态机，F1-F7/S2/P2#34 契约全保留，针刺测试钉死）。
+  3. **负载均衡**：开关、模式（quota-first/round-robin）、池内账号 toggle（toggleSlug 即时生效）；表单脏检查防轮询覆写。
+  4. **API Keys**：鉴权状态、脱敏 key 列表、设置/清空（已启用鉴权保护/已恢复免密）；`FirstKey` 明文是 §17.8 已知待办，前端不展示。
+  5. **模型**：别名→窗口静态表（`OverrideModelsMeta` 同源）+ 后端探测（显式动作，确认框明示约 15 次计费请求；202 异步 + 409 防重入，完成后刷新一次，不轮询）。
+  6. **日志**：proxy 请求环形缓冲（kind 徽章/状态/模型/账号/耗时/失败原因），`since` 游标增量前插 + kind 过滤，5s 轮询。
+- **交互**：Toast 堆叠（≤3）、自绘确认框（替代原生 confirm）、复制降级链（clipboard API → execCommand）、加载/空/错误三态（错误可重试）、聚焦页轮询、401 全局接管（停轮询 + 弹登录框）。

@@ -4,7 +4,10 @@
 
 const DEFAULT_MS = 15000;
 
-class Poller {
+// 类名不得与下方导出名相同：同模块作用域 `class Poller` + `export const Poller`
+// 是重复声明，ESM 编译期 SyntaxError——main.js 起的整张静态模块图在所有浏览器
+// 拒绝执行，整站白屏（2026-09-08 线上事故；此前被弹窗恒显回归掩盖）。
+class PollerService {
   constructor() {
     this.loaders = [];
     this.timer = null;
@@ -62,4 +65,4 @@ class Poller {
   }
 }
 
-export const Poller = new Poller();
+export const Poller = new PollerService();

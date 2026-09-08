@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -358,6 +360,31 @@ func TestWebUIFrontendReviewFixes20260907(t *testing.T) {
 	// 其余页面均用 isDirty(body) 不计入）
 	if got := strings.Count(s, "if (isDirty(form)) return;"); got != 2 {
 		t.Fatalf("isDirty(form) 守卫应恰 2 处（load 错误路径 + 成功路径，复审 F9），got %d", got)
+	}
+}
+
+func TestWebUIJSAssetsParseAsESM(t *testing.T) {
+	// 线上白屏 2026-09-08：poller.js 顶层 `class Poller` 与 `export const Poller`
+	// 同一模块作用域重复声明，ESM 编译期 SyntaxError——main.js 起的整张静态模块图
+	// 在所有浏览器拒绝执行，整站白屏（此前被弹窗恒显回归掩盖，弹窗是 CSS 恒可见，
+	// 看不出 JS 死活）。针刺只验字符串存在、不解析 JS；有 node 时把每个 JS 资产
+	// 按 ES module 全量编译一遍堵住此类回归。node 不在 PATH 的环境跳过
+	//（CI runner 自带 node，门禁在 CI 实际生效）。
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node 不在 PATH，跳过 JS 语法门禁（CI 自带 node 会执行）")
+	}
+	for name, f := range staticAssets {
+		if !strings.HasSuffix(name, ".js") {
+			continue
+		}
+		// stdin + --input-type=module：按浏览器实际加载语义（ESM）编译，能捕获
+		// 重复声明等编译期错误（裸 `node --check` 默认按脚本语义，验不住 export）
+		cmd := exec.Command(node, "--input-type=module", "--check")
+		cmd.Stdin = bytes.NewReader(f.data)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("静态资源 %s 不是合法 ES module：%v\n%s", name, err, out)
+		}
 	}
 }
 

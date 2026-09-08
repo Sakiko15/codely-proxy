@@ -11,6 +11,13 @@
   margin: 0;
 }
 
+/* hidden 属性全局兜底（2026-09-08 线上回归）：作者 display 规则（.modal-scrim/.app/
+   .banner 等）会压掉 UA 默认的 [hidden]{display:none}，致弹窗/骨架恒显——specificity
+   相同时作者层仍胜，故必须 !important。 */
+[hidden] {
+  display: none !important;
+}
+
 html {
   -webkit-text-size-adjust: 100%;
 }

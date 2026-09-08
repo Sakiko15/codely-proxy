@@ -66,7 +66,9 @@ export function wireDevLogin() {
     btn.disabled = true; // F3：防双击
 
     try {
-      const r = await apiPost('/api/account/login/start', { name });
+      // 超时对齐服务器上限：设备码 initiate 走 oauth.HTTPClient（30s 上限），默认
+      // 10s 必抢跑 abort、以"请求超时"掩盖服务器真实错误（2026-09-08 线上排障）
+      const r = await apiPost('/api/account/login/start', { name }, { timeoutMs: 35_000 });
       openDevModal(modal, r.login);
       pollDevLogin();
     } catch (e) {

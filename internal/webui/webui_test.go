@@ -361,6 +361,24 @@ func TestWebUIFrontendReviewFixes20260907(t *testing.T) {
 	}
 }
 
+func TestWebUIHiddenAttrGuard20260908(t *testing.T) {
+	// 线上回归 2026-09-08（adb7618 重写引入）：.modal-scrim/.app/.banner 的作者
+	// display 规则压掉 UA 默认 [hidden]{display:none}，登录框/设备码弹窗/应用骨架/
+	// 登录错误条自页面加载起恒显——用户未输密码即见空态设备码弹窗。修复为全局
+	// [hidden] 兜底（!important 必要：specificity 相同时作者层仍胜）。
+	// 前端无自动化测试，以 embed 内容钉死契约防回归。
+	s := webSource(t)
+	for _, c := range []struct{ needle, why string }{
+		{"[hidden] {", "base.css 全局 hidden 兜底规则存在"},
+		{"display: none !important", "兜底必须 !important（否则被 .modal-scrim 等作者规则压掉）"},
+		{"timeoutMs: 35_000", "start 超时对齐服务器 initiate 30s 上限（默认 10s 抢跑 abort 掩盖真实错误）"},
+	} {
+		if !strings.Contains(s, c.needle) {
+			t.Fatalf("静态资源应包含 %q（%s 回归）", c.needle, c.why)
+		}
+	}
+}
+
 func TestWebUILoginPollFeedback(t *testing.T) {
 	// 登录轮询修复（授权后无限等待）：pending 分支必须消费后端 message
 	//（此前死文案"等待授权中"掩盖 slow_down/429），轮询为 setTimeout 链防在途叠加

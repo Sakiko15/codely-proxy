@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -79,6 +80,9 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/balancer/config", admin(s.handleBalancerConfig))
 	mux.HandleFunc("GET /api/security/status", admin(s.handleSecurityStatus))
 	mux.HandleFunc("POST /api/security/config", admin(s.handleSecurityConfig))
+	mux.HandleFunc("POST /api/security/keys/add", admin(s.handleSecurityKeyAdd))
+	mux.HandleFunc("POST /api/security/keys/delete", admin(s.handleSecurityKeyDelete))
+	mux.HandleFunc("GET /api/security/keys/reveal", admin(s.handleSecurityKeyReveal))
 	mux.HandleFunc("GET /api/logs", admin(s.handleAPILogs))
 	mux.HandleFunc("GET /api/models", admin(s.handleAPIModels))
 	mux.HandleFunc("POST /api/models/probe", admin(s.handleAPIModelsProbe))
@@ -420,4 +424,104 @@ func (s *Server) handleSecurityConfig(rw http.ResponseWriter, req *http.Request)
 		return
 	}
 	writeJSON(rw, http.StatusOK, s.Security.GetStatus())
+}
+
+// handleSecurityKeyAdd POST /api/security/keys/add：追加一个客户端 Key（2026-09-08
+// 多 key 管理）。body {key?: string}——key 留空即自动生成（sk- 前缀 crypto/rand，
+// 免手动输入）；响应携带新增 key 明文供首显/复制（调用方刚创建的显式动作响应，
+// 与 status 常态只回脱敏不冲突；FirstKey §17.8 待办保持不变）。日志不打明文。
+func (s *Server) handleSecurityKeyAdd(rw http.ResponseWriter, req *http.Request) {
+	data, ok := readBody(rw, req, 0)
+	if !ok {
+		return
+	}
+	var body struct {
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal(data, &body); err != nil {
+		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid json"})
+		return
+	}
+	key := strings.TrimSpace(body.Key)
+	if key == "" {
+		gen, err := security.GenerateKey()
+		if err != nil {
+			writeJSON(rw, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		key = gen
+	}
+	keys, err := s.Security.AddProxyKey(key)
+	if err != nil {
+		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	s.Logger.Printf("[webui] 新增客户端 key，现有 %d 把", len(keys))
+	writeJSON(rw, http.StatusOK, map[string]any{
+		"ok":                  true,
+		"key":                 key,
+		"configuredKeysCount": len(keys),
+		"authRequired":        true,
+	})
+}
+
+// handleSecurityKeyDelete POST /api/security/keys/delete：按索引移除客户端 Key
+//（索引 = status.maskedKeys 数组序，与 ValidKeys 顺序一致）。删空即恢复免密模式
+//（文件随删，trust mode 是设计态）。
+func (s *Server) handleSecurityKeyDelete(rw http.ResponseWriter, req *http.Request) {
+	data, ok := readBody(rw, req, 0)
+	if !ok {
+		return
+	}
+	var body struct {
+		Index int `json:"index"`
+	}
+	if err := json.Unmarshal(data, &body); err != nil {
+		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid json"})
+		return
+	}
+	keys, err := s.Security.ValidKeys()
+	if err != nil {
+		writeJSON(rw, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if body.Index < 0 || body.Index >= len(keys) {
+		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false,
+			"error": "索引超出范围（现有 " + strconv.Itoa(len(keys)) + " 把 key）"})
+		return
+	}
+	rest, err := s.Security.RemoveProxyKey(keys[body.Index])
+	if err != nil {
+		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	s.Logger.Printf("[webui] 删除客户端 key，剩余 %d 把", len(rest))
+	writeJSON(rw, http.StatusOK, map[string]any{
+		"ok":                  true,
+		"authRequired":        len(rest) > 0,
+		"configuredKeysCount": len(rest),
+	})
+}
+
+// handleSecurityKeyReveal GET /api/security/keys/reveal?index=N：按需取回第 N 把
+// key 明文（前端复制按钮用）。status 常态只回脱敏（§17.8 脱敏方向不变），明文仅在
+// 显式动作时按索引单把取回；no-store 防中间缓存落盘（对齐 handleAccountExport）。
+func (s *Server) handleSecurityKeyReveal(rw http.ResponseWriter, req *http.Request) {
+	idx, err := strconv.Atoi(req.URL.Query().Get("index"))
+	if err != nil || idx < 0 {
+		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "index 必须为非负整数"})
+		return
+	}
+	keys, err := s.Security.ValidKeys()
+	if err != nil {
+		writeJSON(rw, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if idx >= len(keys) {
+		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false,
+			"error": "索引超出范围（现有 " + strconv.Itoa(len(keys)) + " 把 key）"})
+		return
+	}
+	rw.Header().Set("Cache-Control", "no-store")
+	writeJSON(rw, http.StatusOK, map[string]any{"ok": true, "key": keys[idx]})
 }

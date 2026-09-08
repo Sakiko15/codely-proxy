@@ -892,3 +892,110 @@ func TestLoginFlowEndpoints(t *testing.T) {
 }
 
 func min(a, b int) int { if a < b { return a }; return b }
+func TestSecurityKeysAddDeleteReveal(t *testing.T) {
+	// 2026-09-08 多 key 管理：自动生成（空 key）/手动添加/按需明文/按索引删除 全链路
+	srv, cleanup := buildServer(t)
+	defer cleanup()
+	cookie := login(t, srv)
+
+	// 未登录 → 401
+	rw, _ := doJSON(t, srv, "POST", "/api/security/keys/add", `{}`, "")
+	if rw.Code != http.StatusUnauthorized {
+		t.Fatalf("未登录应 401，got %d", rw.Code)
+	}
+	rw, _ = doJSON(t, srv, "GET", "/api/security/keys/reveal?index=0", "", "")
+	if rw.Code != http.StatusUnauthorized {
+		t.Fatalf("reveal 未登录应 401，got %d", rw.Code)
+	}
+
+	// 自动生成：空 key → sk- 前缀
+	rw, _ = doJSON(t, srv, "POST", "/api/security/keys/add", `{}`, cookie)
+	if rw.Code != 200 {
+		t.Fatalf("自动生成应 200，got %d: %s", rw.Code, rw.Body.String())
+	}
+	var add map[string]any
+	_ = json.Unmarshal(rw.Body.Bytes(), &add)
+	genKey, _ := add["key"].(string)
+	if !strings.HasPrefix(genKey, "sk-") || len(genKey) != 51 {
+		t.Fatalf("生成 key 格式异常: %q", genKey)
+	}
+	if add["configuredKeysCount"] != float64(1) {
+		t.Fatalf("count = %v", add["configuredKeysCount"])
+	}
+
+	// 手动追加第二把
+	rw, _ = doJSON(t, srv, "POST", "/api/security/keys/add", `{"key":"sk-manual-2"}`, cookie)
+	if rw.Code != 200 {
+		t.Fatalf("手动添加应 200，got %d: %s", rw.Code, rw.Body.String())
+	}
+	// 重复添加 → 400
+	rw, _ = doJSON(t, srv, "POST", "/api/security/keys/add", `{"key":"sk-manual-2"}`, cookie)
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("重复 key 应 400，got %d", rw.Code)
+	}
+
+	// reveal：索引 1 返回明文 manual key；越界 → 400；非法 index → 400
+	rw, _ = doJSON(t, srv, "GET", "/api/security/keys/reveal?index=1", "", cookie)
+	if rw.Code != 200 || !strings.Contains(rw.Body.String(), "sk-manual-2") {
+		t.Fatalf("reveal 应返回明文，got %d %s", rw.Code, rw.Body.String())
+	}
+	if rw.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("reveal 应 no-store")
+	}
+	rw, _ = doJSON(t, srv, "GET", "/api/security/keys/reveal?index=9", "", cookie)
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("reveal 越界应 400，got %d", rw.Code)
+	}
+	rw, _ = doJSON(t, srv, "GET", "/api/security/keys/reveal?index=abc", "", cookie)
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("reveal 非法 index 应 400，got %d", rw.Code)
+	}
+
+	// 按索引删除：删掉生成的第一把 → 剩 manual-2 且仍鉴权；删空 → 免密
+	rw, _ = doJSON(t, srv, "POST", "/api/security/keys/delete", `{"index":0}`, cookie)
+	if rw.Code != 200 {
+		t.Fatalf("delete 应 200，got %d: %s", rw.Code, rw.Body.String())
+	}
+	rw, _ = doJSON(t, srv, "GET", "/api/security/status", "", cookie)
+	var st struct {
+		ConfiguredKeysCount int `json:"configuredKeysCount"`
+	}
+	_ = json.Unmarshal(rw.Body.Bytes(), &st)
+	if st.ConfiguredKeysCount != 1 {
+		t.Fatalf("删后应剩 1 把，got %d", st.ConfiguredKeysCount)
+	}
+	rw, _ = doJSON(t, srv, "POST", "/api/security/keys/delete", `{"index":9}`, cookie)
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("delete 越界应 400，got %d", rw.Code)
+	}
+	rw, _ = doJSON(t, srv, "POST", "/api/security/keys/delete", `{"index":0}`, cookie)
+	if rw.Code != 200 {
+		t.Fatalf("delete 最后一把应 200，got %d: %s", rw.Code, rw.Body.String())
+	}
+	rw, _ = doJSON(t, srv, "GET", "/api/security/status", "", cookie)
+	_ = json.Unmarshal(rw.Body.Bytes(), &st)
+	if st.ConfiguredKeysCount != 0 {
+		t.Fatalf("删空应为 0，got %d", st.ConfiguredKeysCount)
+	}
+}
+
+func TestWebUIKeysPageMultiKeyUI(t *testing.T) {
+	// 2026-09-08 功能钉死：API Keys 页多 key 管理（自动生成免手动输入、逐把复制/删除、
+	// env 来源禁用在线增删）
+	s := webSource(t)
+	for _, c := range []struct{ needle, why string }{
+		{"自动生成 Key</button>", "生成按钮文案（免手动输入入口）"},
+		{"'/api/security/keys/add'", "生成/手动添加共用追加端点"},
+		{"/api/security/keys/reveal?index=", "复制按钮按需取回明文（status 常态只回脱敏）"},
+		{"'/api/security/keys/delete'", "逐把删除端点"},
+		{"copyText(r.key || '')", "取回明文后走统一复制工具（含降级）"},
+		{"confirmDialog({", "删除 key 前必须确认（立即 401 不可恢复）"},
+		{"st.source === 'env'", "env 管理时禁用在线增删（P2 #38 前端对齐）"},
+		{"data-act=\"copy\"", "行内复制按钮"},
+		{"data-act=\"del\"", "行内删除按钮"},
+	} {
+		if !strings.Contains(s, c.needle) {
+			t.Fatalf("静态资源应包含 %q（%s）", c.needle, c.why)
+		}
+	}
+}

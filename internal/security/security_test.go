@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -245,5 +246,116 @@ func TestProxyKeyFilePersists(t *testing.T) {
 	// 文件确实存在
 	if _, err := os.Stat(ProxyKeyFile); err != nil {
 		t.Fatalf("proxy-key.txt 未写入: %v", err)
+	}
+}
+
+func TestGenerateKeyFormat(t *testing.T) {
+	// 2026-09-08 多 key 管理：sk- 前缀 + 48 位 hex（crypto/rand 24 字节），可复现验证
+	seen := make(map[string]bool, 64)
+	for i := 0; i < 64; i++ {
+		k, err := GenerateKey()
+		if err != nil {
+			t.Fatalf("GenerateKey: %v", err)
+		}
+		if !strings.HasPrefix(k, "sk-") {
+			t.Fatalf("应带 sk- 前缀: %q", k)
+		}
+		if len(k) != len("sk-")+48 {
+			t.Fatalf("长度应 51: %q", k)
+		}
+		for _, r := range k[3:] {
+			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+				t.Fatalf("应为小写 hex: %q", k)
+			}
+		}
+		if seen[k] {
+			t.Fatalf("64 次生成出现重复: %q", k)
+		}
+		seen[k] = true
+	}
+}
+
+func TestAddRemoveProxyKeyRoundTrip(t *testing.T) {
+	// 2026-09-08 多 key 管理：追加/删除/删空恢复免密，全部落盘且 Validate 即刻生效
+	s := setup(t)
+	k1, err := GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	got, err := s.AddProxyKey(k1)
+	if err != nil || len(got) != 1 || got[0] != k1 {
+		t.Fatalf("追加第一把: %v %v", got, err)
+	}
+	k2 := "sk-manual-2"
+	if _, err := s.AddProxyKey(k2); err != nil {
+		t.Fatalf("追加第二把: %v", err)
+	}
+	// 文件为逗号分隔两把；新实例（重读文件）两把都能过 Validate
+	raw, err := os.ReadFile(ProxyKeyFile)
+	if err != nil {
+		t.Fatalf("读文件: %v", err)
+	}
+	if got := parseKeys(string(raw)); len(got) != 2 {
+		t.Fatalf("文件应含 2 把 key: %q", raw)
+	}
+	if !New().Validate(makeReq("Bearer " + k1)) || !New().Validate(makeReq("Bearer " + k2)) {
+		t.Fatalf("两把 key 均应通过 Validate")
+	}
+	// 重复添加显式报错
+	if _, err := s.AddProxyKey(k1); err == nil {
+		t.Fatalf("重复 key 应报错")
+	}
+	// 删除一把 → 剩一把
+	rest, err := s.RemoveProxyKey(k1)
+	if err != nil || len(rest) != 1 || rest[0] != k2 {
+		t.Fatalf("删除一把: %v %v", rest, err)
+	}
+	if New().Validate(makeReq("Bearer " + k1)) {
+		t.Fatalf("已删 key 应立即失效")
+	}
+	// 删除不存在 → 报错
+	if _, err := s.RemoveProxyKey("sk-nope"); err == nil {
+		t.Fatalf("删除不存在 key 应报错")
+	}
+	// 删空 → 文件移除，恢复免密
+	if _, err := s.RemoveProxyKey(k2); err != nil {
+		t.Fatalf("删空: %v", err)
+	}
+	if _, err := os.Stat(ProxyKeyFile); !os.IsNotExist(err) {
+		t.Fatalf("删空后文件应移除")
+	}
+	if s.AuthRequired() {
+		t.Fatalf("删空应恢复免密")
+	}
+	if !s.Validate(makeReq("Bearer anything")) {
+		t.Fatalf("免密模式应放行")
+	}
+}
+
+func TestAddProxyKeyValidation(t *testing.T) {
+	// 校验对齐 SetProxyKey，另拒逗号（逗号分隔契约无法往返含逗号 key）
+	s := setup(t)
+	for _, bad := range []string{"", "  ", "sk-a,b", "sk-a\nb"} {
+		if _, err := s.AddProxyKey(bad); err == nil {
+			t.Fatalf("非法 key %q 应被拒绝", bad)
+		}
+	}
+	if _, err := os.Stat(ProxyKeyFile); !os.IsNotExist(err) {
+		t.Fatalf("被拒的 key 不得落盘")
+	}
+}
+
+func TestAddRemoveProxyKeyEnvManaged(t *testing.T) {
+	// P2 #38 对齐：env 管理时在线增删必须显式报错而非静默 no-op
+	s := setup(t)
+	t.Setenv("CODELY_PROXY_API_KEY", "sk-env") // setup 会清空 env，须在其后设置
+	if _, err := s.AddProxyKey("sk-file"); err == nil {
+		t.Fatalf("env 管理时追加应报错")
+	}
+	if _, err := s.RemoveProxyKey("sk-env"); err == nil {
+		t.Fatalf("env 管理时删除应报错")
+	}
+	if _, err := os.Stat(ProxyKeyFile); !os.IsNotExist(err) {
+		t.Fatalf("env 管理时不得落盘")
 	}
 }

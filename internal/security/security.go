@@ -10,7 +10,9 @@
 package security
 
 import (
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net/http"
@@ -171,6 +173,77 @@ func (s *Security) SetProxyKey(rawKeyString string) error {
 	s.cachedKeys = parseKeys(val)
 	s.mu.Unlock()
 	return nil
+}
+
+// GenerateKey 生成新客户端 Key：sk- 前缀 + crypto/rand 24 字节 hex（共 51 字符，
+// 熵 192 位）。与既有 sk- 约定一致，供 WebUI"自动生成"使用（2026-09-08 多 key 管理）。
+func GenerateKey() (string, error) {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("生成随机 key 失败: %w", err)
+	}
+	return "sk-" + hex.EncodeToString(b), nil
+}
+
+// AddProxyKey 追加一个客户端 Key（WebUI 在线新增；key 为空请用 GenerateKey 生成后传入）。
+// 多 Key 沿用 proxy-key.txt 逗号分隔既有契约（parseKeys），旧版读写同一文件互不破坏。
+// 校验对齐 SetProxyKey：去空白、限长、拒换行/控制字符；另拒逗号（本格式以逗号为
+// 分隔符，含逗号的 key 无法往返）与重复添加。env 管理（P2 #38）时显式报错。
+// 返回追加后的 Key 列表。
+func (s *Security) AddProxyKey(key string) ([]string, error) {
+	if strings.TrimSpace(os.Getenv("CODELY_PROXY_API_KEY")) != "" {
+		return nil, fmt.Errorf("客户端 Key 当前由环境变量 CODELY_PROXY_API_KEY 管理，无法在线增删")
+	}
+	val := strings.TrimSpace(key)
+	if val == "" {
+		return nil, fmt.Errorf("key 不能为空")
+	}
+	if strings.Contains(val, ",") {
+		return nil, fmt.Errorf("key 不能包含逗号（多 key 请逐个添加）")
+	}
+	keys, err := s.ValidKeys()
+	if err != nil {
+		return nil, fmt.Errorf("读取现有 key 失败: %w", err)
+	}
+	for _, k := range keys {
+		if k == val {
+			return nil, fmt.Errorf("key 已存在")
+		}
+	}
+	keys = append(keys, val)
+	if err := s.SetProxyKey(strings.Join(keys, ",")); err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
+// RemoveProxyKey 按精确匹配移除一个客户端 Key。删空即移除 proxy-key.txt 恢复免密
+// 模式（与 SetProxyKey("") 同语义，文件不存在才是免密设计态）。env 管理（P2 #38）
+// 时显式报错。返回移除后的 Key 列表。
+func (s *Security) RemoveProxyKey(key string) ([]string, error) {
+	if strings.TrimSpace(os.Getenv("CODELY_PROXY_API_KEY")) != "" {
+		return nil, fmt.Errorf("客户端 Key 当前由环境变量 CODELY_PROXY_API_KEY 管理，无法在线增删")
+	}
+	keys, err := s.ValidKeys()
+	if err != nil {
+		return nil, fmt.Errorf("读取现有 key 失败: %w", err)
+	}
+	rest := make([]string, 0, len(keys))
+	found := false
+	for _, k := range keys {
+		if k == key {
+			found = true
+			continue
+		}
+		rest = append(rest, k)
+	}
+	if !found {
+		return nil, fmt.Errorf("key 不存在")
+	}
+	if err := s.SetProxyKey(strings.Join(rest, ",")); err != nil {
+		return nil, err
+	}
+	return rest, nil
 }
 
 // Validate 校验客户端请求是否合法。对标 validateRequestAuth。

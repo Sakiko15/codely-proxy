@@ -13,6 +13,7 @@ import (
 
 	"codely-proxy/internal/account"
 	"codely-proxy/internal/balancer"
+	"codely-proxy/internal/oauth"
 	"codely-proxy/internal/proxy"
 	"codely-proxy/internal/quota"
 	"codely-proxy/internal/security"
@@ -69,6 +70,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/accounts", admin(s.handleAccounts))
 	mux.HandleFunc("POST /api/account/delete", admin(s.handleAccountDelete))
 	mux.HandleFunc("POST /api/account/switch", admin(s.handleAccountSwitch))
+	mux.HandleFunc("POST /api/account/import", admin(s.handleAccountImport))
+	mux.HandleFunc("GET /api/account/export", admin(s.handleAccountExport))
 	mux.HandleFunc("POST /api/account/login/start", admin(s.handleLoginStart))
 	mux.HandleFunc("GET /api/account/login/status", admin(s.handleLoginPoll))
 	mux.HandleFunc("POST /api/account/login/cancel", admin(s.handleLoginCancel))
@@ -289,6 +292,66 @@ func (s *Server) handleAccountSwitch(rw http.ResponseWriter, req *http.Request) 
 		return
 	}
 	writeJSON(rw, http.StatusOK, map[string]any{"ok": true, "account": acct})
+}
+
+// handleAccountImport POST /api/account/import：从 JSON 凭据导入账号——设备码登录之外的
+// 入池通道（备份恢复/跨部署迁移/旧版 codely-creds.json 升级导入）。
+// 复用 SaveAccountAutoSlug（碰撞检查+保存同锁原子，2026-09-07 P2-J）：同 user_id 重建
+// 复用槽位，不同用户追加 -N 后缀；导入即激活为主账号（与设备码登录语义一致），并经
+// OnAccountSaved 钩子联动清密钥负缓存/补池。凭据结构即 accounts/<slug>.json 原样
+//（user_id 走 FlexString 容忍 number/string 混发，PROTOCOL_SCHEMA 契约勿收紧）。
+// ⚠️ 凭据含完整 OAuth 令牌：仅管理员会话可导（与数据目录同信任级），响应永不回显凭据。
+func (s *Server) handleAccountImport(rw http.ResponseWriter, req *http.Request) {
+	data, ok := readBody(rw, req, 0)
+	if !ok {
+		return
+	}
+	var body struct {
+		Name  string       `json:"name"`
+		Creds *oauth.Creds `json:"creds"`
+	}
+	if err := json.Unmarshal(data, &body); err != nil || body.Creds == nil {
+		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid json"})
+		return
+	}
+	if body.Creds.AccessToken == "" {
+		writeJSON(rw, http.StatusBadRequest, map[string]any{"ok": false, "error": "凭据缺少 access_token，无法导入"})
+		return
+	}
+	slug, _, err := s.Registry.SaveAccountAutoSlug(body.Name, body.Creds, string(body.Creds.UserID), s.Balancer)
+	if err != nil {
+		writeJSON(rw, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	s.Logger.Printf("[webui] 导入账号 %q 入池（JSON 凭据导入）", slug)
+	writeJSON(rw, http.StatusOK, map[string]any{"ok": true, "slug": slug})
+}
+
+// handleAccountExport GET /api/account/export?name=<slug>：下载账号完整凭据 JSON——
+// 与 accounts/<slug>.json 同构，可原样再导入（跨部署搬家）。⚠️ 明文凭据，仅管理员
+// 会话可取（与数据目录同信任级）；Content-Disposition attachment + no-store：
+// 浏览器端即下载而非展示，且不落任何中间缓存。
+func (s *Server) handleAccountExport(rw http.ResponseWriter, req *http.Request) {
+	name := req.URL.Query().Get("name")
+	creds := s.Registry.LoadAccountCreds(name)
+	if creds == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]any{"ok": false, "error": "账号不存在或凭据无效"})
+		return
+	}
+	out, err := json.Marshal(creds)
+	if err != nil {
+		writeJSON(rw, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	filename := account.Slugify(name)
+	if filename == "" {
+		filename = "account"
+	}
+	rw.Header().Set("Content-Type", "application/json")
+	rw.Header().Set("Content-Disposition", `attachment; filename="`+filename+`.json"`)
+	rw.Header().Set("Cache-Control", "no-store")
+	rw.WriteHeader(http.StatusOK)
+	_, _ = rw.Write(out)
 }
 
 // handleBalancerStatus GET /api/balancer/status。

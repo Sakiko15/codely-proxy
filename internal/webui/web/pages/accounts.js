@@ -90,6 +90,45 @@ function validateName(name) {
   return '';
 }
 
+// wireImport 绑定 JSON 凭据导入（按钮在 outlet 内随 mount 重建，每次 mount 重绑）。
+// 校验在发请求前做：JSON 可解析 + 含 access_token（与后端 handleAccountImport 同门槛），
+// 避免明显坏输入打一次往返。
+function wireImport() {
+  const btn = document.getElementById('import-btn');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    const ta = document.getElementById('import-json');
+    const name = (document.getElementById('import-name').value || '').trim();
+    let creds;
+    try {
+      creds = JSON.parse(ta.value);
+    } catch {
+      showToast('JSON 解析失败：请粘贴完整的凭据 JSON（可先用行内「导出」取得样例）', 'err');
+      return;
+    }
+    if (!creds || typeof creds !== 'object' || Array.isArray(creds) || !creds.access_token) {
+      showToast('凭据缺少 access_token 字段，无法导入', 'err');
+      return;
+    }
+    const vErr = name ? validateName(name) : '';
+    if (vErr) {
+      showToast(vErr, 'err');
+      return;
+    }
+    btn.disabled = true;
+    try {
+      const r = await apiPost('/api/account/import', { name, creds });
+      ta.value = '';
+      showToast('已导入并入池：' + (r.slug || name || '(自动命名)'));
+      loadAccounts();
+    } catch (err) {
+      showToast(err.message || '导入失败', 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
 function openDevModal(modal, login) {
   // S2：授权链接只接受 http(s)，防 start 异常注入其他 scheme
   const rawUrl = (login && login.verification_uri_complete) || '';
@@ -154,9 +193,17 @@ export const page = {
       '<div class="copy-field">' +
       '<input class="input" id="dev-name" placeholder="备注名（字母数字，可选）" maxlength="64">' +
       '<button type="button" class="btn btn-primary" id="dev-start-btn">发起授权</button>' +
-      '</div><div class="field"><span class="desc">发起后将在新窗口打开 Codely 授权页，确认后账号自动入池。</span></div></div>';
+      '</div><div class="field"><span class="desc">发起后将在新窗口打开 Codely 授权页，确认后账号自动入池。</span></div></div>' +
+      // 2026-09-08：JSON 凭据导入通道（备份恢复/跨部署迁移/旧版 codely-creds.json 升级导入）
+      '<div class="card" id="acc-import-card"><div class="card-title">' + icon('upload') + '导入账号（JSON 凭据）</div>' +
+      '<div class="field"><textarea class="input" id="import-json" rows="7" placeholder=\'粘贴凭据 JSON（导出文件 accounts/<slug>.json 或旧版 codely-creds.json 内容）\'></textarea></div>' +
+      '<div class="copy-field">' +
+      '<input class="input" id="import-name" placeholder="备注名（可选，缺省自动命名）" maxlength="64">' +
+      '<button type="button" class="btn btn-primary" id="import-btn">导入入池</button>' +
+      '</div><div class="field"><span class="desc">导入后自动激活为主账号；同名同用户重复导入视为重建。导出按钮在账号列表行内，导出文件可直接再导入。</span></div></div>';
 
     wireDevLogin();
+    wireImport();
     loadAccounts();
 
     // 委托：切换/删除
@@ -237,6 +284,8 @@ async function loadAccounts() {
         : '<span class="badge badge-muted">备用</span>') + '</td>' +
       '<td data-label="操作">' +
       (a.isCurrent ? '' : '<button type="button" class="btn btn-sm" data-act="switch" data-name="' + esc(a.name) + '">激活</button> ') +
+      // 导出：直链 GET（cookie 鉴权 + Content-Disposition attachment，浏览器直接下载）
+      '<a class="btn btn-sm" href="/api/account/export?name=' + esc(a.name) + '" download>' + icon('download', 'icon icon-sm') + '导出</a> ' +
       '<button type="button" class="btn btn-sm btn-danger" data-act="delete" data-name="' + esc(a.name) + '">' + icon('trash', 'icon icon-sm') + '删除</button>' +
       '</td></tr>'
     )).join('') +

@@ -363,6 +363,107 @@ func TestWebUIFrontendReviewFixes20260907(t *testing.T) {
 	}
 }
 
+func TestAccountImportExport20260908(t *testing.T) {
+	// 2026-09-08 功能：JSON 凭据导入/导出——设备码登录之外的入池通道
+	//（备份恢复/跨部署迁移/旧版 codely-creds.json 升级导入）。
+	// 语义对齐设备码登录：SaveAccountAutoSlug 同 user_id 重建复用槽位、不同用户 -N
+	// 后缀；导入即激活为主账号（OnAccountSaved 钩子联动）。
+	srv, cleanup := buildServer(t)
+	defer cleanup()
+	cookie := login(t, srv)
+
+	// 未鉴权一律 401（凭据通道是明文 OAuth 令牌，绝不能裸奔）
+	rw, _ := doJSON(t, srv, "POST", "/api/account/import", `{"creds":{"access_token":"t"}}`, "")
+	if rw.Code != http.StatusUnauthorized {
+		t.Fatalf("未鉴权导入应 401，got %d", rw.Code)
+	}
+	rw, _ = doJSON(t, srv, "GET", "/api/account/export?name=web-org", "", "")
+	if rw.Code != http.StatusUnauthorized {
+		t.Fatalf("未鉴权导出应 401，got %d", rw.Code)
+	}
+
+	// 正常导入：200 + slug + 激活为主账号
+	rw, _ = doJSON(t, srv, "POST", "/api/account/import",
+		`{"name":"imported-one","creds":{"access_token":"tok-imp","refresh_token":"ref-imp","user_id":"2","team_name":"Imp Org","expires_in":3600}}`, cookie)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("导入应 200，got %d: %s", rw.Code, rw.Body.String())
+	}
+	var ir struct {
+		Ok   bool
+		Slug string
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &ir); err != nil || !ir.Ok || ir.Slug != "imported-one" {
+		t.Fatalf("导入响应异常: %s", rw.Body.String())
+	}
+	if got := srv.Registry.GetCurrentName(); got != "imported-one" {
+		t.Fatalf("导入应激活为主账号，got current=%q", got)
+	}
+
+	// 同名同用户重复导入 = 重建（复用槽位，不追加后缀）
+	rw, _ = doJSON(t, srv, "POST", "/api/account/import",
+		`{"name":"imported-one","creds":{"access_token":"tok-imp2","user_id":"2"}}`, cookie)
+	var rr struct {
+		Ok   bool
+		Slug string
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &rr); err != nil || !rr.Ok || rr.Slug != "imported-one" {
+		t.Fatalf("同名同用户导入应重建复用槽位: %s", rw.Body.String())
+	}
+	// 同名不同用户 = 追加 -N 后缀（防静默覆盖）
+	rw, _ = doJSON(t, srv, "POST", "/api/account/import",
+		`{"name":"imported-one","creds":{"access_token":"tok-3","user_id":"3"}}`, cookie)
+	var cr struct {
+		Ok   bool
+		Slug string
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &cr); err != nil || !cr.Ok || cr.Slug != "imported-one-2" {
+		t.Fatalf("同名不同用户导入应 -2 后缀: %s", rw.Body.String())
+	}
+
+	// FlexString 契约：user_id 数字形态容忍（PROTOCOL_SCHEMA 勿收紧），自动命名 user-42
+	rw, _ = doJSON(t, srv, "POST", "/api/account/import",
+		`{"creds":{"access_token":"tok-42","user_id":42}}`, cookie)
+	var fr struct {
+		Ok   bool
+		Slug string
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &fr); err != nil || !fr.Ok || fr.Slug != "user-42" {
+		t.Fatalf("user_id 数字形态应容忍并自动命名 user-42: %s", rw.Body.String())
+	}
+
+	// 校验门槛：缺 access_token → 400；坏 JSON → 400
+	rw, _ = doJSON(t, srv, "POST", "/api/account/import", `{"creds":{"refresh_token":"r"}}`, cookie)
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("缺 access_token 应 400，got %d", rw.Code)
+	}
+	rw, _ = doJSON(t, srv, "POST", "/api/account/import", `{not-json`, cookie)
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("坏 JSON 应 400，got %d", rw.Code)
+	}
+
+	// 导出：200 + attachment + 凭据回读一致（重建后的 tok-imp2 应覆盖初版 tok-imp）
+	rw, _ = doJSON(t, srv, "GET", "/api/account/export?name=imported-one", "", cookie)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("导出应 200，got %d: %s", rw.Code, rw.Body.String())
+	}
+	if cd := rw.Header().Get("Content-Disposition"); !strings.Contains(cd, "attachment") || !strings.Contains(cd, "imported-one.json") {
+		t.Fatalf("导出应带 attachment 文件名，got %q", cd)
+	}
+	var exp oauth.Creds
+	if err := json.Unmarshal(rw.Body.Bytes(), &exp); err != nil || exp.AccessToken != "tok-imp2" {
+		t.Fatalf("导出凭据应与最近导入一致: %s", rw.Body.String())
+	}
+	// 导出未知/空名 → 404
+	rw, _ = doJSON(t, srv, "GET", "/api/account/export?name=no-such", "", cookie)
+	if rw.Code != http.StatusNotFound {
+		t.Fatalf("导出未知账号应 404，got %d", rw.Code)
+	}
+	rw, _ = doJSON(t, srv, "GET", "/api/account/export", "", cookie)
+	if rw.Code != http.StatusNotFound {
+		t.Fatalf("导出空名应 404，got %d", rw.Code)
+	}
+}
+
 func TestWebUIJSAssetsParseAsESM(t *testing.T) {
 	// 线上白屏 2026-09-08：poller.js 顶层 `class Poller` 与 `export const Poller`
 	// 同一模块作用域重复声明，ESM 编译期 SyntaxError——main.js 起的整张静态模块图
@@ -402,6 +503,25 @@ func TestWebUIHiddenAttrGuard20260908(t *testing.T) {
 	} {
 		if !strings.Contains(s, c.needle) {
 			t.Fatalf("静态资源应包含 %q（%s 回归）", c.needle, c.why)
+		}
+	}
+}
+
+func TestWebUIAccountImportExportUI(t *testing.T) {
+	// 2026-09-08 功能钉死：JSON 凭据导入/导出入口（前端无自动化测试，以 embed 内容
+	// 钉死契约——导入 textarea+预校验、行内导出直链、备注名复用同一可选校验规则）
+	s := webSource(t)
+	for _, c := range []struct{ needle, why string }{
+		{"'/api/account/import'", "导入调用走管理端点（带会话 cookie）"},
+		{"api/account/export?name=", "行内导出直链（Content-Disposition 由后端下发，浏览器直下）"},
+		{"import-json", "导入凭据 textarea"},
+		{"creds.access_token", "前端预校验最小字段（与后端 handleAccountImport 同门槛）"},
+		{"const vErr = name ? validateName(name) : '';", "导入备注名与设备码登录共用同一可选校验（留空不校验）"},
+		{"icon('upload')", "导入卡片图标"},
+		{"icon('download', 'icon icon-sm')", "行内导出按钮图标"},
+	} {
+		if !strings.Contains(s, c.needle) {
+			t.Fatalf("静态资源应包含 %q（%s）", c.needle, c.why)
 		}
 	}
 }

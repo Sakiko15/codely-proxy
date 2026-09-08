@@ -24,6 +24,8 @@ const defs = {
   external: '<path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M18 13.5V19a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5.5"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>',
   home: '<path d="m3 11 9-8 9 8"/><path d="M5 10v10h5v-6h4v6h5V10"/>',
+  download: '<path d="M12 3v11"/><path d="m7 10 5 5 5-5"/><path d="M4 20h16"/>',
+  upload: '<path d="M12 14V3"/><path d="m7 7 5-5 5 5"/><path d="M4 20h16"/>',
 };
 
 export function icon(name, cls = 'icon') {

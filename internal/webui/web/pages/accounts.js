@@ -127,6 +127,39 @@ function wireImport() {
       btn.disabled = false;
     }
   });
+
+  // 2026-09-08 文件导入：从磁盘选择凭据 JSON 填入 textarea（与粘贴共用同一校验/提交
+  // 路径）。文件名可预填备注名——导出文件名即 slug（<slug>.json），再导入同名同用户
+  // 命中"重建槽位"语义；预填仅当输入框为空且通过 validateName 时进行。
+  const fileBtn = document.getElementById('import-file-btn');
+  const fileInput = document.getElementById('import-file');
+  if (!fileBtn || !fileInput) return;
+  fileBtn.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', async () => {
+    const f = fileInput.files && fileInput.files[0];
+    if (!f) return;
+    fileInput.value = ''; // 允许重选同一文件再次触发 change
+    if (f.size > 1024 * 1024) {
+      showToast('文件过大（>1MB），后端请求体上限 1MB', 'err');
+      return;
+    }
+    let text;
+    try {
+      text = await f.text();
+      JSON.parse(text); // 预检：坏文件早报错，不污染 textarea
+    } catch {
+      showToast('读取失败：' + f.name + ' 不是有效的 JSON', 'err');
+      return;
+    }
+    const ta = document.getElementById('import-json');
+    if (ta) ta.value = text;
+    const nameEl = document.getElementById('import-name');
+    const base = f.name.replace(/\.[^.]+$/, '');
+    if (nameEl && !nameEl.value && validateName(base) === '') {
+      nameEl.value = base;
+    }
+    showToast('已读取 ' + f.name + '，点击「导入入池」完成导入');
+  });
 }
 
 function openDevModal(modal, login) {
@@ -195,8 +228,13 @@ export const page = {
       '<button type="button" class="btn btn-primary" id="dev-start-btn">发起授权</button>' +
       '</div><div class="field"><span class="desc">发起后将在新窗口打开 Codely 授权页，确认后账号自动入池。</span></div></div>' +
       // 2026-09-08：JSON 凭据导入通道（备份恢复/跨部署迁移/旧版 codely-creds.json 升级导入）
+      // 两种入料方式：粘贴 / 从文件读取（同填下方 textarea，共用一次「导入入池」提交）
       '<div class="card" id="acc-import-card"><div class="card-title">' + icon('upload') + '导入账号（JSON 凭据）</div>' +
-      '<div class="field"><textarea class="input" id="import-json" rows="7" placeholder=\'粘贴凭据 JSON（导出文件 accounts/<slug>.json 或旧版 codely-creds.json 内容）\'></textarea></div>' +
+      '<div class="field"><textarea class="input" id="import-json" rows="7" placeholder=\'粘贴凭据 JSON，或点「从文件读取」选择 accounts/<slug>.json / codely-creds.json\'></textarea></div>' +
+      '<div class="copy-field">' +
+      '<button type="button" class="btn" id="import-file-btn">' + icon('upload', 'icon icon-sm') + '从文件读取</button>' +
+      '<input type="file" id="import-file" accept=".json,application/json,text/plain" hidden>' +
+      '</div>' +
       '<div class="copy-field">' +
       '<input class="input" id="import-name" placeholder="备注名（可选，缺省自动命名）" maxlength="64">' +
       '<button type="button" class="btn btn-primary" id="import-btn">导入入池</button>' +

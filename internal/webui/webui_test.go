@@ -519,6 +519,12 @@ func TestWebUIAccountImportExportUI(t *testing.T) {
 		{"const vErr = name ? validateName(name) : '';", "导入备注名与设备码登录共用同一可选校验（留空不校验）"},
 		{"icon('upload')", "导入卡片图标"},
 		{"icon('download', 'icon icon-sm')", "行内导出按钮图标"},
+		{"id=\"import-file-btn\"", "文件导入入口按钮（2026-09-08 文件导入方式）"},
+		{"accept=\".json,application/json,text/plain\"", "文件选择器只收 JSON"},
+		{"await f.text()", "文件内容读取（File.text()）"},
+		{"JSON.parse(text); // 预检", "坏文件早报错，不污染 textarea"},
+		{"fileInput.value = ''", "清空选择值，允许重选同一文件再触发"},
+		{"validateName(base) === ''", "文件名预填备注名复用同一校验（导出文件名即 slug）"},
 	} {
 		if !strings.Contains(s, c.needle) {
 			t.Fatalf("静态资源应包含 %q（%s）", c.needle, c.why)
